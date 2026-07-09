@@ -81,7 +81,9 @@ export class SessionManager {
   }
 
   private async createSession(cwd: string, model?: string): Promise<void> {
-    const adapter = new GrokAcpAdapter();
+    const adapter = new GrokAcpAdapter({
+      autoApprove: this.permissionMode !== "ask" && this.permissionMode !== "default",
+    });
     adapter.onEvent((e) => {
       // Remap: adapter already uses domain session id
       this.publish(e);

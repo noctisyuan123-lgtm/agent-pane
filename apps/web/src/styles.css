@@ -1,35 +1,36 @@
 :root {
+  /* Closer to Cursor Agents: cool charcoal, soft blue accent, near-opaque glass */
   color-scheme: dark;
-  --bg-deep: #0a0a0c;
+  --bg-deep: #141414;
   --bg-glow: radial-gradient(
-      1200px 600px at 50% 30%,
-      rgba(80, 90, 140, 0.18),
-      transparent 55%
+      900px 480px at 55% 28%,
+      rgba(55, 65, 90, 0.22),
+      transparent 58%
     ),
     radial-gradient(
-      800px 500px at 20% 80%,
-      rgba(40, 50, 80, 0.12),
-      transparent 50%
+      700px 420px at 15% 90%,
+      rgba(30, 36, 50, 0.2),
+      transparent 55%
     ),
-    var(--bg-deep);
-  --glass: rgba(22, 22, 26, 0.62);
-  --glass-strong: rgba(18, 18, 22, 0.82);
-  --glass-border: rgba(255, 255, 255, 0.07);
+    #0f0f0f;
+  --glass: rgba(30, 30, 30, 0.78);
+  --glass-strong: rgba(24, 24, 24, 0.9);
+  --glass-border: rgba(255, 255, 255, 0.08);
   --glass-border-hi: rgba(255, 255, 255, 0.12);
-  --text: #ececec;
-  --text-muted: #8b8b93;
-  --text-dim: #5c5c66;
-  --accent: #5b8def;
-  --accent-soft: rgba(91, 141, 239, 0.18);
-  --green: #4ade80;
-  --red: #f87171;
-  --amber: #fbbf24;
-  --sidebar-w: 260px;
-  --radius: 14px;
-  --radius-lg: 18px;
+  --text: #e4e4e4;
+  --text-muted: #9b9b9b;
+  --text-dim: #6b6b6b;
+  --accent: #4d7cff;
+  --accent-soft: rgba(77, 124, 255, 0.16);
+  --green: #3dd68c;
+  --red: #f07178;
+  --amber: #e6b450;
+  --sidebar-w: 248px;
+  --radius: 12px;
+  --radius-lg: 16px;
   --font: "Inter", system-ui, -apple-system, "SF Pro Text", sans-serif;
   --mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
-  --blur: blur(28px) saturate(160%);
+  --blur: blur(40px) saturate(140%);
 }
 
 * {
@@ -70,7 +71,7 @@ select {
   flex-direction: column;
   gap: 4px;
   padding: 12px 10px;
-  background: rgba(12, 12, 14, 0.72);
+  background: rgba(18, 18, 18, 0.88);
   backdrop-filter: var(--blur);
   -webkit-backdrop-filter: var(--blur);
   border-right: 1px solid var(--glass-border);
@@ -471,6 +472,35 @@ select {
   max-height: 140px;
   overflow: auto;
   opacity: 0.85;
+}
+
+.thought-fold {
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 6px 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.thought-fold summary {
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+
+.thought-fold summary::-webkit-details-marker {
+  display: none;
+}
+
+.thought-fold[open] .thought-body {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--glass-border);
+  white-space: pre-wrap;
+  max-height: 160px;
+  overflow: auto;
+  line-height: 1.45;
 }
 
 .tools {

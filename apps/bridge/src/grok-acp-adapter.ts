@@ -1,18 +1,26 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
+import fs from "node:fs";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ContextRef, DomainEvent } from "@agent-pane/shared";
 import { nowIso } from "@agent-pane/shared";
 import type { AgentProvider } from "./provider-api.js";
 
-type JsonRpc =
-  | { jsonrpc: "2.0"; id: number; method: string; params?: unknown }
-  | { jsonrpc: "2.0"; id: number; result?: unknown; error?: unknown }
-  | { jsonrpc: "2.0"; method: string; params?: unknown };
+type JsonRpcMsg = {
+  jsonrpc?: string;
+  id?: number | string;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+  error?: unknown;
+};
 
 /**
  * Grok ACP adapter — only place that speaks ACP.
- * Emits provider-agnostic DomainEvents via onEvent.
+ * CRITICAL: when we advertise fs/terminal capabilities, we MUST answer
+ * agent→client requests (fs/read_text_file, session/request_permission, …)
+ * or the tool loop hangs forever.
  */
 export class GrokAcpAdapter implements AgentProvider {
   readonly id = "grok-acp";
@@ -20,7 +28,7 @@ export class GrokAcpAdapter implements AgentProvider {
   private rl: readline.Interface | null = null;
   private nextId = 1;
   private pending = new Map<
-    number,
+    number | string,
     { resolve: (v: unknown) => void; reject: (e: Error) => void }
   >();
   private handlers: Array<(e: DomainEvent) => void> = [];
@@ -30,16 +38,20 @@ export class GrokAcpAdapter implements AgentProvider {
   private model?: string;
   private grokBin: string;
   private closed = false;
-  private permissionWaiters = new Map<
+  private autoApprove: boolean;
+  private pendingPermissions = new Map<
     string,
-    { resolve: (allow: boolean) => void }
+    { rpcId: number | string; options: Array<{ optionId: string; kind?: string }> }
   >();
 
-  constructor(grokBin?: string) {
+  constructor(opts?: { grokBin?: string; autoApprove?: boolean }) {
     this.grokBin =
-      grokBin ??
+      opts?.grokBin ??
       process.env.GROK_BIN ??
       `${process.env.HOME}/.grok/bin/grok`;
+    this.autoApprove =
+      opts?.autoApprove ??
+      process.env.AGENT_PANE_PERMISSION !== "ask";
   }
 
   onEvent(handler: (e: DomainEvent) => void): void {
@@ -47,85 +59,227 @@ export class GrokAcpAdapter implements AgentProvider {
   }
 
   private emit(event: DomainEvent): void {
-    for (const h of this.handlers) h(event);
+    for (const h of this.handlers) {
+      try {
+        h(event);
+      } catch (e) {
+        console.error("[adapter] handler error", e);
+      }
+    }
+  }
+
+  private write(obj: unknown): void {
+    if (!this.proc?.stdin) return;
+    this.proc.stdin.write(JSON.stringify(obj) + "\n");
   }
 
   private send(method: string, params?: unknown): Promise<unknown> {
     if (!this.proc?.stdin) return Promise.reject(new Error("Agent not started"));
     const id = this.nextId++;
-    const msg = { jsonrpc: "2.0", id, method, params };
-    this.proc.stdin.write(JSON.stringify(msg) + "\n");
+    this.write({ jsonrpc: "2.0", id, method, params });
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
     });
   }
 
+  private reply(id: number | string, result: unknown): void {
+    this.write({ jsonrpc: "2.0", id, result });
+  }
+
+  private replyError(id: number | string, message: string, code = -32000): void {
+    this.write({
+      jsonrpc: "2.0",
+      id,
+      error: { code, message },
+    });
+  }
+
   private handleLine(line: string): void {
-    let msg: JsonRpc;
+    let msg: JsonRpcMsg;
     try {
-      msg = JSON.parse(line) as JsonRpc;
+      msg = JSON.parse(line) as JsonRpcMsg;
     } catch {
       return;
     }
 
-    if ("id" in msg && msg.id != null && (msg as { result?: unknown }).result !== undefined) {
-      const p = this.pending.get(msg.id as number);
+    // Client←Agent response to our request
+    if (msg.id != null && msg.method == null) {
+      const p = this.pending.get(msg.id);
       if (p) {
-        this.pending.delete(msg.id as number);
-        p.resolve((msg as { result: unknown }).result);
-      }
-      return;
-    }
-    if ("id" in msg && msg.id != null && (msg as { error?: unknown }).error) {
-      const p = this.pending.get(msg.id as number);
-      if (p) {
-        this.pending.delete(msg.id as number);
-        p.reject(new Error(JSON.stringify((msg as { error: unknown }).error)));
+        this.pending.delete(msg.id);
+        if (msg.error) p.reject(new Error(JSON.stringify(msg.error)));
+        else p.resolve(msg.result);
       }
       return;
     }
 
-    if ("method" in msg && msg.method) {
-      this.handleNotification(msg.method, (msg as { params?: unknown }).params);
+    // Agent→Client request (must reply) or notification
+    if (msg.method) {
+      if (msg.id != null) {
+        void this.handleServerRequest(msg.id, msg.method, msg.params);
+      } else {
+        this.handleNotification(msg.method, msg.params);
+      }
     }
   }
 
-  private handleNotification(method: string, params: unknown): void {
-    const p = params as Record<string, unknown>;
+  private async handleServerRequest(
+    id: number | string,
+    method: string,
+    params: unknown
+  ): Promise<void> {
+    const p = (params ?? {}) as Record<string, unknown>;
 
-    // Permission requests — shape may vary; handle common ACP forms
-    if (
-      method === "session/request_permission" ||
-      method === "request_permission" ||
-      method.endsWith("/request_permission")
-    ) {
-      const requestId = String(p?.requestId ?? p?.id ?? randomUUID());
-      const tool = String(
-        (p?.toolCall as { title?: string })?.title ??
-          p?.tool ??
-          p?.title ??
-          "tool"
+    try {
+      if (method === "fs/read_text_file") {
+        const filePath = String(p.path ?? "");
+        const content = this.readTextFile(
+          filePath,
+          p.line as number | undefined,
+          p.limit as number | undefined
+        );
+        this.reply(id, { content });
+        return;
+      }
+
+      if (method === "fs/write_text_file") {
+        const filePath = String(p.path ?? "");
+        const content = String(p.content ?? "");
+        this.writeTextFile(filePath, content);
+        this.reply(id, null);
+        this.emit({
+          type: "ToolProgress",
+          sessionId: this.domainSessionId,
+          toolId: "fs-write",
+          detail: `wrote ${filePath}`,
+          at: nowIso(),
+        });
+        return;
+      }
+
+      if (
+        method === "session/request_permission" ||
+        method.endsWith("/request_permission")
+      ) {
+        const options = (p.options as Array<{ optionId: string; kind?: string }>) ?? [];
+        const toolCall = (p.toolCall ?? {}) as Record<string, unknown>;
+        const tool = String(
+          toolCall.title ?? toolCall.kind ?? p.tool ?? "tool"
+        );
+        const requestId = String(
+          toolCall.toolCallId ?? p.requestId ?? id ?? randomUUID()
+        );
+
+        this.emit({
+          type: "PermissionRequested",
+          sessionId: this.domainSessionId,
+          requestId,
+          tool,
+          summary: JSON.stringify(p).slice(0, 500),
+          at: nowIso(),
+        });
+
+        if (this.autoApprove) {
+          const optionId =
+            options.find((o) => o.kind === "allow_always")?.optionId ??
+            options.find((o) => o.kind === "allow_once")?.optionId ??
+            options[0]?.optionId ??
+            "allow-once";
+          this.reply(id, {
+            outcome: { outcome: "selected", optionId },
+          });
+          this.emit({
+            type: "PermissionResolved",
+            sessionId: this.domainSessionId,
+            requestId,
+            allow: true,
+            at: nowIso(),
+          });
+        } else {
+          this.pendingPermissions.set(requestId, { rpcId: id, options });
+        }
+        return;
+      }
+
+      // Unknown server request — don't hang the agent
+      console.warn("[adapter] unhandled server request", method);
+      this.replyError(id, `Unsupported method: ${method}`, -32601);
+    } catch (e) {
+      this.replyError(
+        id,
+        e instanceof Error ? e.message : String(e)
       );
-      const summary = JSON.stringify(p).slice(0, 500);
-      this.emit({
-        type: "PermissionRequested",
-        sessionId: this.domainSessionId,
-        requestId,
-        tool,
-        summary,
-        at: nowIso(),
-      });
-      // auto-resolve via waiter when UI responds — store for respondPermission
-      this.permissionWaiters.set(requestId, {
-        resolve: () => {},
-      });
-      // Try to reply if protocol expects immediate response with id
+    }
+  }
+
+  private readTextFile(
+    filePath: string,
+    line?: number,
+    limit?: number
+  ): string {
+    if (!filePath) throw new Error("path required");
+    // basic path safety: must exist
+    const resolved = path.resolve(filePath);
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`File not found: ${resolved}`);
+    }
+    let text = fs.readFileSync(resolved, "utf8");
+    if (line != null || limit != null) {
+      const lines = text.split("\n");
+      const start = Math.max(0, (line ?? 1) - 1);
+      const end =
+        limit != null ? start + limit : lines.length;
+      text = lines.slice(start, end).join("\n");
+    }
+    // cap huge files
+    if (text.length > 2_000_000) {
+      text = text.slice(0, 2_000_000) + "\n/* truncated */";
+    }
+    return text;
+  }
+
+  private writeTextFile(filePath: string, content: string): void {
+    if (!filePath) throw new Error("path required");
+    const resolved = path.resolve(filePath);
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    fs.writeFileSync(resolved, content, "utf8");
+  }
+
+  private handleNotification(method: string, params: unknown): void {
+    const p = (params ?? {}) as Record<string, unknown>;
+
+    if (method === "session/update") {
+      const update = (p.update ?? p) as Record<string, unknown>;
+      this.mapSessionUpdate(update);
       return;
     }
 
-    if (method === "session/update") {
-      const update = (p?.update ?? p) as Record<string, unknown>;
-      this.mapSessionUpdate(update);
+    // xAI extension notifications — log tool deltas into timeline
+    if (method === "_x.ai/session_notification" || method === "x.ai/session_notification") {
+      const update = (p.update ?? p) as Record<string, unknown>;
+      const kind = String(update.sessionUpdate ?? "");
+      if (kind === "tool_call_delta_chunk") {
+        const toolId = String(update.tool_call_id ?? update.toolCallId ?? "delta");
+        const name = String(update.name ?? "");
+        const argDelta = update.arguments_delta;
+        if (name) {
+          this.emit({
+            type: "ToolProgress",
+            sessionId: this.domainSessionId,
+            toolId,
+            detail: name + (argDelta ? ` ${String(argDelta).slice(0, 120)}` : ""),
+            at: nowIso(),
+          });
+        }
+      } else if (kind === "pending_interaction") {
+        this.emit({
+          type: "ToolProgress",
+          sessionId: this.domainSessionId,
+          toolId: String(update.tool_call_id ?? "interaction"),
+          detail: `pending: ${update.kind ?? "interaction"}`,
+          at: nowIso(),
+        });
+      }
     }
   }
 
@@ -159,12 +313,14 @@ export class GrokAcpAdapter implements AgentProvider {
       }
       case "tool_call": {
         const toolId = String(update.toolCallId ?? update.id ?? randomUUID());
+        const title = String(update.title ?? update.kind ?? "tool");
+        const toolKind = String(update.kind ?? "other");
         this.emit({
           type: "ToolStarted",
           sessionId: sid,
           toolId,
-          title: String(update.title ?? update.kind ?? "tool"),
-          kind: String(update.kind ?? "other"),
+          title,
+          kind: toolKind,
           inputSummary: summarize(update.rawInput ?? update.input ?? update.arguments),
           at,
         });
@@ -172,13 +328,19 @@ export class GrokAcpAdapter implements AgentProvider {
       }
       case "tool_call_update": {
         const toolId = String(update.toolCallId ?? update.id ?? "unknown");
-        const status = String(update.status ?? "");
+        const status = String(update.status ?? "").toLowerCase();
+        const title = update.title != null ? String(update.title) : undefined;
+        const detail =
+          summarize(update.content ?? update.rawOutput ?? update.output) ||
+          title ||
+          summarize(update);
+
         if (status === "failed" || status === "error") {
           this.emit({
             type: "ToolFailed",
             sessionId: sid,
             toolId,
-            error: summarize(update.error ?? update.content ?? update),
+            error: detail || "failed",
             at,
           });
         } else if (status === "completed" || status === "success") {
@@ -186,25 +348,32 @@ export class GrokAcpAdapter implements AgentProvider {
             type: "ToolFinished",
             sessionId: sid,
             toolId,
-            outputSummary: summarize(update.content ?? update.rawOutput ?? update.output),
+            outputSummary: detail,
             at,
           });
         } else {
+          // pending / in_progress / missing status
           this.emit({
             type: "ToolProgress",
             sessionId: sid,
             toolId,
-            detail: summarize(update),
+            detail: detail || title,
             at,
           });
+          // If update carries a nicer title, re-emit as progress label
+          if (title && !status) {
+            // some streams only send kind+title without status then complete later
+          }
         }
         break;
       }
       case "plan": {
-        const entries = (update.entries ?? update.tasks ?? update.plan ?? []) as Array<{
+        const entries = (update.entries ??
+          update.tasks ??
+          update.plan ??
+          []) as Array<{
           id?: string;
           content?: string;
-          priority?: string;
           status?: string;
         }>;
         const tasks = entries.map((e, i) => ({
@@ -230,13 +399,15 @@ export class GrokAcpAdapter implements AgentProvider {
     this.model = opts.model;
     this.closed = false;
     this.domainSessionId = randomUUID();
+    if (opts.permissionMode === "default" || opts.permissionMode === "ask") {
+      this.autoApprove = false;
+    } else {
+      this.autoApprove = true;
+    }
 
-    // grok agent [--model] [--always-approve] stdio
     const agentArgs = ["agent"];
     if (opts.model) agentArgs.push("--model", opts.model);
-    if (opts.permissionMode === "bypassPermissions" || opts.permissionMode === "auto") {
-      agentArgs.push("--always-approve");
-    }
+    if (this.autoApprove) agentArgs.push("--always-approve");
     agentArgs.push("stdio");
 
     this.proc = spawn(this.grokBin, agentArgs, {
@@ -246,9 +417,8 @@ export class GrokAcpAdapter implements AgentProvider {
     });
 
     this.proc.stderr?.on("data", (buf: Buffer) => {
-      const s = buf.toString();
       if (process.env.AGENT_PANE_DEBUG) {
-        console.error("[grok stderr]", s.slice(0, 500));
+        console.error("[grok stderr]", buf.toString().slice(0, 500));
       }
     });
 
@@ -270,12 +440,11 @@ export class GrokAcpAdapter implements AgentProvider {
       protocolVersion: 1,
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
-        terminal: true,
+        // Don't claim terminal until we implement terminal/* RPC
       },
-      clientInfo: { name: "agent-pane", version: "0.1.0" },
+      clientInfo: { name: "agent-pane", version: "0.1.1" },
     });
 
-    // Some agents require authenticated session; try session/new
     const result = (await this.send("session/new", {
       cwd: opts.cwd,
       mcpServers: [],
@@ -294,7 +463,6 @@ export class GrokAcpAdapter implements AgentProvider {
     return { providerSessionId: this.providerSessionId };
   }
 
-  /** Domain session id used in events */
   getSessionId(): string {
     return this.domainSessionId;
   }
@@ -350,11 +518,12 @@ export class GrokAcpAdapter implements AgentProvider {
     try {
       await this.send("session/cancel", { sessionId: this.providerSessionId });
     } catch {
-      /* optional method */
+      /* optional */
     }
   }
 
   async respondPermission(requestId: string, allow: boolean): Promise<void> {
+    const pending = this.pendingPermissions.get(requestId);
     this.emit({
       type: "PermissionResolved",
       sessionId: this.domainSessionId,
@@ -362,22 +531,20 @@ export class GrokAcpAdapter implements AgentProvider {
       allow,
       at: nowIso(),
     });
-    // ACP permission response shapes vary; try common ones
-    try {
-      await this.send("session/request_permission_response", {
-        requestId,
-        outcome: allow ? { outcome: "selected", optionId: "allow" } : { outcome: "cancelled" },
-      });
-    } catch {
-      try {
-        await this.send("session/allow", { requestId, allow });
-      } catch {
-        /* best effort */
-      }
-    }
-    const w = this.permissionWaiters.get(requestId);
-    w?.resolve(allow);
-    this.permissionWaiters.delete(requestId);
+    if (!pending) return;
+    this.pendingPermissions.delete(requestId);
+    const optionId = allow
+      ? pending.options.find((o) => o.kind === "allow_once")?.optionId ??
+        pending.options.find((o) => o.kind?.startsWith("allow"))?.optionId ??
+        "allow-once"
+      : pending.options.find((o) => o.kind === "reject_once")?.optionId ??
+        pending.options.find((o) => o.kind?.startsWith("reject"))?.optionId ??
+        "reject-once";
+    this.reply(pending.rpcId, {
+      outcome: allow
+        ? { outcome: "selected", optionId }
+        : { outcome: "selected", optionId },
+    });
   }
 
   async stop(): Promise<void> {

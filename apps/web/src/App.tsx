@@ -293,9 +293,10 @@ export function App() {
                 }
                 if (m.kind === "thought") {
                   return (
-                    <div className="thought" key={m.id}>
-                      {m.text}
-                    </div>
+                    <details className="thought-fold" key={m.id}>
+                      <summary>Thinking · {m.text.length} chars</summary>
+                      <div className="thought-body">{m.text}</div>
+                    </details>
                   );
                 }
                 return (
