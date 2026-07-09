@@ -723,11 +723,12 @@ export class GrokAcpAdapter implements AgentProvider {
 
 function summarize(v: unknown): string {
   if (v == null) return "";
-  if (typeof v === "string") return v.slice(0, 400);
+  if (typeof v === "string") return v.slice(0, 12_000);
   try {
-    return JSON.stringify(v).slice(0, 400);
+    // 保留足够长度以便前端解析 diff content[]
+    return JSON.stringify(v).slice(0, 12_000);
   } catch {
-    return String(v).slice(0, 400);
+    return String(v).slice(0, 12_000);
   }
 }
 

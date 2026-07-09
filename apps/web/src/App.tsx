@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { useBridge } from "./useBridge";
+import { ToolTimeline } from "./ToolTimeline";
 import {
   fetchProjects,
   fetchRecent,
@@ -51,7 +52,7 @@ export function App() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [b.messages, b.tools, b.diffs, b.tasks]);
+  }, [b.messages, b.diffs, b.tasks]);
 
   const selectCwd = async (path: string) => {
     b.setCwd(path);
@@ -331,38 +332,26 @@ export function App() {
                 }
                 if (m.kind === "thought") {
                   return (
-                    <details className="thought-fold" key={m.id}>
-                      <summary>Thinking · {m.text.length} chars</summary>
-                      <div className="thought-body">{m.text}</div>
+                    <details className="tl-thought" key={m.id}>
+                      <summary>
+                        <span className="tl-chev">▸</span>
+                        Thought briefly
+                      </summary>
+                      <div className="tl-thought-body">{m.text}</div>
                     </details>
                   );
                 }
+                if (m.kind === "tools") {
+                  return <ToolTimeline key={m.id} tools={m.tools} />;
+                }
                 return (
                   <div className="msg assistant" key={m.id}>
-                    <div className="label">Agent</div>
-                    <div className="bubble">
+                    <div className="assistant-text">
                       <ReactMarkdown>{m.text}</ReactMarkdown>
                     </div>
                   </div>
                 );
               })}
-
-              {b.tools.length > 0 && (
-                <div className="tools">
-                  {b.tools.map((t) => (
-                    <div
-                      key={t.toolId}
-                      className={`tool ${t.status === "done" ? "done" : ""} ${
-                        t.status === "fail" ? "fail" : ""
-                      }`}
-                    >
-                      <span className="dot" />
-                      <span className="title">{t.title}</span>
-                      <span className="meta">{t.detail}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
 
               {b.tasks.length > 0 && (
                 <div className="todos">

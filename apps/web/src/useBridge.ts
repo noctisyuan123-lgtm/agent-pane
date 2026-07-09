@@ -6,19 +6,20 @@ import type {
   ServerMessage,
   Task,
 } from "@agent-pane/shared";
+import {
+  formatToolFailed,
+  formatToolFinished,
+  formatToolStarted,
+  type ToolRow,
+} from "./toolFormat";
 
 export type ChatItem =
   | { kind: "user"; text: string; id: string }
   | { kind: "assistant"; text: string; id: string }
-  | { kind: "thought"; text: string; id: string };
+  | { kind: "thought"; text: string; id: string }
+  | { kind: "tools"; id: string; tools: ToolRow[] };
 
-export type ToolRow = {
-  toolId: string;
-  title: string;
-  kind: string;
-  status: "running" | "done" | "fail";
-  detail?: string;
-};
+export type { ToolRow };
 
 export type PermissionReq = {
   requestId: string;
@@ -27,6 +28,23 @@ export type PermissionReq = {
 };
 
 const WS_URL = import.meta.env.VITE_BRIDGE_WS ?? "ws://127.0.0.1:8787";
+
+function sealAssistant(
+  messages: ChatItem[],
+  buf: string,
+  liveId: string
+): ChatItem[] {
+  if (!buf.trim()) {
+    return messages.filter((m) => m.id !== liveId);
+  }
+  const next = messages.filter((m) => m.id !== liveId);
+  next.push({
+    kind: "assistant",
+    text: buf,
+    id: `${liveId}-sealed-${Date.now()}`,
+  });
+  return next;
+}
 
 export function useBridge() {
   const wsRef = useRef<WebSocket | null>(null);
@@ -38,14 +56,15 @@ export function useBridge() {
     localStorage.getItem("agent-pane-model") || ""
   );
   const [messages, setMessages] = useState<ChatItem[]>([]);
-  const [tools, setTools] = useState<ToolRow[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [diffs, setDiffs] = useState<DiffFileMeta[]>([]);
   const [permissions, setPermissions] = useState<PermissionReq[]>([]);
   const [busy, setBusy] = useState(false);
-  /** 撤回后回填输入框 */
   const [restoredDraft, setRestoredDraft] = useState<string | null>(null);
   const assistantBuf = useRef("");
+  const assistantLiveId = useRef("a-live");
+  const thoughtLiveId = useRef("t-live");
+  const toolsGroupId = useRef("tools-live");
 
   const send = useCallback((cmd: ClientCommand) => {
     const ws = wsRef.current;
@@ -64,11 +83,15 @@ export function useBridge() {
         if (event.model) setModel(event.model);
         setError(null);
         setMessages([]);
-        setTools([]);
         setTasks([]);
         setDiffs([]);
         setBusy(false);
+        assistantBuf.current = "";
+        assistantLiveId.current = `a-${event.sessionId}-live`;
+        thoughtLiveId.current = `t-${event.sessionId}-live`;
+        toolsGroupId.current = `tools-${event.sessionId}-live`;
         break;
+
       case "UserMessageAppended":
         setMessages((m) => [
           ...m,
@@ -76,11 +99,21 @@ export function useBridge() {
         ]);
         setBusy(true);
         assistantBuf.current = "";
+        // new live assistant id each user turn
+        assistantLiveId.current = `a-${event.sessionId}-${event.seq ?? Date.now()}`;
+        thoughtLiveId.current = `t-${event.sessionId}-${event.seq ?? Date.now()}`;
+        toolsGroupId.current = `tools-${event.sessionId}-${event.seq ?? Date.now()}`;
         break;
-      case "MessageChunk":
-        assistantBuf.current += event.text;
+
+      case "MessageChunk": {
+        // 若当前时间线末尾是 tools 组，说明中间插了工具——开新 assistant 气泡
         setMessages((m) => {
-          const id = `a-${event.sessionId}-live`;
+          const last = m[m.length - 1];
+          if (last?.kind === "tools" && assistantBuf.current === "") {
+            assistantLiveId.current = `a-${event.sessionId}-after-tools-${event.seq ?? Date.now()}`;
+          }
+          assistantBuf.current += event.text;
+          const id = assistantLiveId.current;
           const next = [...m];
           const idx = next.findIndex((x) => x.id === id);
           if (idx >= 0) {
@@ -99,9 +132,11 @@ export function useBridge() {
           return next;
         });
         break;
+      }
+
       case "ThoughtChunk":
         setMessages((m) => {
-          const id = `t-${event.sessionId}-live`;
+          const id = thoughtLiveId.current;
           const next = [...m];
           const idx = next.findIndex((x) => x.id === id && x.kind === "thought");
           if (idx >= 0 && next[idx].kind === "thought") {
@@ -116,52 +151,123 @@ export function useBridge() {
           return next;
         });
         break;
+
       case "MessageDone":
+        // seal live assistant
+        if (assistantBuf.current.trim()) {
+          const sealed = assistantBuf.current;
+          const liveId = assistantLiveId.current;
+          assistantBuf.current = "";
+          setMessages((m) => sealAssistant(m, sealed, liveId));
+        }
         setBusy(false);
         break;
-      case "ToolStarted":
-        setTools((t) => [
-          ...t.filter((x) => x.toolId !== event.toolId),
-          {
-            toolId: event.toolId,
-            title: event.title,
-            kind: event.kind,
-            status: "running",
-            detail: event.inputSummary,
-          },
-        ]);
+
+      case "ToolStarted": {
+        // seal any in-progress assistant text before tools
+        const sealedBuf = assistantBuf.current;
+        const liveId = assistantLiveId.current;
+        if (sealedBuf.trim()) {
+          assistantBuf.current = "";
+          setMessages((m) => sealAssistant(m, sealedBuf, liveId));
+        }
+
+        const row = formatToolStarted({
+          toolId: event.toolId,
+          title: event.title,
+          kind: event.kind,
+          inputSummary: event.inputSummary,
+        });
+
+        setMessages((m) => {
+          const gid = toolsGroupId.current;
+          const next = [...m];
+          const idx = next.findIndex((x) => x.id === gid && x.kind === "tools");
+          if (idx >= 0 && next[idx].kind === "tools") {
+            const tools = [
+              ...next[idx].tools.filter((t) => t.toolId !== row.toolId),
+              row,
+            ];
+            next[idx] = { kind: "tools", id: gid, tools };
+          } else {
+            // new tools group after sealed text
+            toolsGroupId.current = `tools-${event.sessionId}-${event.seq ?? Date.now()}`;
+            next.push({
+              kind: "tools",
+              id: toolsGroupId.current,
+              tools: [row],
+            });
+          }
+          return next;
+        });
         break;
+      }
+
       case "ToolProgress":
-        setTools((t) =>
-          t.map((x) =>
-            x.toolId === event.toolId
-              ? { ...x, detail: event.detail ?? x.detail }
-              : x
-          )
+        setMessages((m) =>
+          m.map((item) => {
+            if (item.kind !== "tools") return item;
+            return {
+              ...item,
+              tools: item.tools.map((t) => {
+                if (t.toolId !== event.toolId) return t;
+                const d = event.detail ?? "";
+                // ACP 常在 update 里给人类可读 title：Read `path`
+                const human =
+                  d &&
+                  !d.startsWith("{") &&
+                  !d.startsWith("[") &&
+                  d.length < 120
+                    ? d.replace(/^Read\s+`([^`]+)`/, (_, p) => `Read ${p.split("/").pop()}`)
+                    : null;
+                return {
+                  ...t,
+                  label: human || t.label,
+                  detailLines:
+                    d && d.length < 200 && (d.startsWith("{") || d.startsWith("["))
+                      ? t.detailLines
+                      : d
+                        ? [d]
+                        : t.detailLines,
+                };
+              }),
+            };
+          })
         );
         break;
+
       case "ToolFinished":
-        setTools((t) =>
-          t.map((x) =>
-            x.toolId === event.toolId
-              ? {
-                  ...x,
-                  status: "done",
-                  detail: event.outputSummary ?? x.detail,
-                }
-              : x
-          )
+        setMessages((m) =>
+          m.map((item) => {
+            if (item.kind !== "tools") return item;
+            return {
+              ...item,
+              tools: item.tools.map((t) =>
+                t.toolId === event.toolId
+                  ? formatToolFinished(t, event.outputSummary)
+                  : t
+              ),
+            };
+          })
         );
         break;
+
       case "ToolFailed":
-        setTools((t) =>
-          t.map((x) =>
-            x.toolId === event.toolId
-              ? { ...x, status: "fail", detail: event.error }
-              : x
-          )
+        setMessages((m) =>
+          m.map((item) => {
+            if (item.kind !== "tools") return item;
+            return {
+              ...item,
+              tools: item.tools.map((t) =>
+                t.toolId === event.toolId
+                  ? formatToolFailed(t, event.error)
+                  : t
+              ),
+            };
+          })
         );
         break;
+
       case "TasksReplaced":
         setTasks(event.tasks);
         break;
@@ -191,11 +297,9 @@ export function useBridge() {
         setPermissions((p) => p.filter((x) => x.requestId !== event.requestId));
         break;
       case "DiffProposed":
-        // 全量替换；Accept 后服务端会发空列表，卡片消失
         setDiffs(event.files);
         break;
       case "DiffResolved":
-        // 乐观移除；随后的 DiffProposed 会校正
         if (event.filePath === "*") setDiffs([]);
         else setDiffs((d) => d.filter((f) => f.path !== event.filePath));
         break;
@@ -207,7 +311,6 @@ export function useBridge() {
         setBusy(false);
         break;
       case "SessionRewound": {
-        // 砍掉最后一条用户消息及其后的所有内容
         setMessages((m) => {
           let lastUser = -1;
           for (let i = m.length - 1; i >= 0; i--) {
@@ -219,7 +322,6 @@ export function useBridge() {
           if (lastUser < 0) return m;
           return m.slice(0, lastUser);
         });
-        setTools([]);
         setTasks([]);
         setPermissions([]);
         setBusy(false);
@@ -291,7 +393,6 @@ export function useBridge() {
     localStorage.setItem("agent-pane-cwd", cwd.trim());
     if (model) localStorage.setItem("agent-pane-model", model);
     setMessages([]);
-    setTools([]);
     setTasks([]);
     setDiffs([]);
     send({
@@ -315,7 +416,6 @@ export function useBridge() {
 
   const cancel = useCallback(() => {
     if (sessionId) send({ type: "session.cancel", sessionId });
-    // 乐观脱 busy；adapter 会丢弃残留 chunk
     setBusy(false);
   }, [send, sessionId]);
 
@@ -362,7 +462,6 @@ export function useBridge() {
     model,
     setModel,
     messages,
-    tools,
     tasks,
     diffs,
     permissions,
