@@ -444,14 +444,26 @@ export function useBridge() {
   const openHistorySession = useCallback(
     async (histSessionId: string, histCwd: string) => {
       try {
+        setError(null);
+        setBusy(true);
         const { fetchSessionEvents } = await import("./api");
-        const events = (await fetchSessionEvents(histSessionId)) as DomainEvent[];
+        // 强制拉盘 + 清空去重表，否则二次打开会被 seenSeq 全滤掉
+        const events = (await fetchSessionEvents(
+          histSessionId,
+          true
+        )) as DomainEvent[];
+        if (!events.length) {
+          setBusy(false);
+          setError("该会话没有可回放的记录（events 为空）");
+          return;
+        }
         setMessages([]);
         setTasks([]);
         setDiffs([]);
         setPermissions([]);
-        setBusy(false);
         assistantBuf.current = "";
+        thoughtBufMap.current.clear();
+        seenSeq.current.clear();
         setSessionId(histSessionId);
         setCwd(histCwd);
         localStorage.setItem("agent-pane-cwd", histCwd);
@@ -464,6 +476,7 @@ export function useBridge() {
         setBusy(false);
       } catch (e) {
         replayingRef.current = false;
+        setBusy(false);
         setError(e instanceof Error ? e.message : String(e));
       }
     },

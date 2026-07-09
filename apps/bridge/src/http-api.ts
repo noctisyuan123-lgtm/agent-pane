@@ -8,6 +8,9 @@ import {
   listHistory,
   loadSessionEvents,
   invalidateHistoryListCache,
+  patchMeta,
+  deleteSession,
+  forkSession,
 } from "./history-index.js";
 
 const execFileAsync = promisify(execFile);
@@ -17,7 +20,7 @@ export type RecentEntry = { path: string; name: string; at: string };
 
 function cors(res: ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
@@ -160,14 +163,61 @@ export async function handleHttp(
   );
   if (histMatch && req.method === "GET") {
     const sessionId = decodeURIComponent(histMatch[1]!);
-    const force = url.searchParams.get("force") === "1";
+    // 默认 force 读盘：打开历史必须最新，不能被脏 cache 挡住
+    const force = url.searchParams.get("force") !== "0";
     const events = loadSessionEvents(sessionId, force);
     cors(res);
-    res.setHeader("Cache-Control", "private, max-age=30");
+    res.setHeader("Cache-Control", "no-store");
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(
       JSON.stringify({ sessionId, events, count: events.length })
     );
+    return true;
+  }
+
+  // PATCH /api/history/:sessionId  { title?, pinned?, unread?, archived? }
+  const patchMatch = url.pathname.match(/^\/api\/history\/([^/]+)$/);
+  if (patchMatch && req.method === "PATCH") {
+    const sessionId = decodeURIComponent(patchMatch[1]!);
+    try {
+      const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+      const meta = patchMeta(sessionId, {
+        title: typeof body.title === "string" ? body.title : undefined,
+        pinned: typeof body.pinned === "boolean" ? body.pinned : undefined,
+        unread: typeof body.unread === "boolean" ? body.unread : undefined,
+        archived: typeof body.archived === "boolean" ? body.archived : undefined,
+      });
+      if (!meta) {
+        json(res, 404, { error: "session not found" });
+        return true;
+      }
+      json(res, 200, { meta });
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    return true;
+  }
+
+  // POST /api/history/:sessionId/fork
+  const forkMatch = url.pathname.match(/^\/api\/history\/([^/]+)\/fork$/);
+  if (forkMatch && req.method === "POST") {
+    const sessionId = decodeURIComponent(forkMatch[1]!);
+    const meta = forkSession(sessionId);
+    if (!meta) {
+      json(res, 404, { error: "cannot fork" });
+      return true;
+    }
+    json(res, 200, { meta });
+    return true;
+  }
+
+  // DELETE /api/history/:sessionId
+  if (patchMatch && req.method === "DELETE") {
+    const sessionId = decodeURIComponent(patchMatch[1]!);
+    const ok = deleteSession(sessionId);
+    json(res, ok ? 200 : 404, { ok });
     return true;
   }
 

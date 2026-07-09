@@ -10,6 +10,9 @@ export type SessionMeta = {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  pinned?: boolean;
+  unread?: boolean;
+  archived?: boolean;
 };
 
 export type HistoryGroup = {
@@ -46,21 +49,71 @@ export function peekHistoryCache(): HistoryGroup[] | null {
 
 export async function fetchSessionEvents(
   sessionId: string,
-  force = false
+  force = true
 ): Promise<unknown[]> {
+  // 打开历史默认强制拉盘，避免脏缓存「加载不出来」
   const hit = eventsMem.get(sessionId);
   if (!force && hit && Date.now() - hit.at < EVENTS_TTL) {
     return hit.events;
   }
-  const q = force ? "?force=1" : "";
   const res = await fetch(
-    `${BRIDGE_HTTP}/api/history/${encodeURIComponent(sessionId)}/events${q}`
+    `${BRIDGE_HTTP}/api/history/${encodeURIComponent(sessionId)}/events?force=1`
   );
-  if (!res.ok) return hit?.events ?? [];
+  if (!res.ok) {
+    // 失败时才回退缓存
+    if (hit?.events?.length) return hit.events;
+    throw new Error(`加载历史失败 HTTP ${res.status}`);
+  }
   const data = (await res.json()) as { events: unknown[] };
   const events = data.events ?? [];
   eventsMem.set(sessionId, { at: Date.now(), events });
   return events;
+}
+
+export function invalidateHistoryClientCache(sessionId?: string): void {
+  historyMem = null;
+  if (sessionId) eventsMem.delete(sessionId);
+  else eventsMem.clear();
+}
+
+export async function patchSessionMeta(
+  sessionId: string,
+  patch: Partial<
+    Pick<SessionMeta, "title" | "pinned" | "unread" | "archived">
+  >
+): Promise<SessionMeta> {
+  const res = await fetch(
+    `${BRIDGE_HTTP}/api/history/${encodeURIComponent(sessionId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }
+  );
+  if (!res.ok) throw new Error(await res.text());
+  const data = (await res.json()) as { meta: SessionMeta };
+  invalidateHistoryClientCache(sessionId);
+  return data.meta;
+}
+
+export async function forkSessionApi(sessionId: string): Promise<SessionMeta> {
+  const res = await fetch(
+    `${BRIDGE_HTTP}/api/history/${encodeURIComponent(sessionId)}/fork`,
+    { method: "POST" }
+  );
+  if (!res.ok) throw new Error(await res.text());
+  const data = (await res.json()) as { meta: SessionMeta };
+  invalidateHistoryClientCache();
+  return data.meta;
+}
+
+export async function deleteSessionApi(sessionId: string): Promise<void> {
+  const res = await fetch(
+    `${BRIDGE_HTTP}/api/history/${encodeURIComponent(sessionId)}`,
+    { method: "DELETE" }
+  );
+  if (!res.ok) throw new Error(await res.text());
+  invalidateHistoryClientCache(sessionId);
 }
 
 export function formatRelTime(iso: string): string {

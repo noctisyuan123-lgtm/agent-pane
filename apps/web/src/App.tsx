@@ -3,15 +3,20 @@ import ReactMarkdown from "react-markdown";
 import { useBridge } from "./useBridge";
 import { ToolTimeline } from "./ToolTimeline";
 import {
+  deleteSessionApi,
   fetchHistory,
   fetchProjects,
   fetchRecent,
+  forkSessionApi,
   formatRelTime,
+  invalidateHistoryClientCache,
+  patchSessionMeta,
   peekHistoryCache,
   pickFolder,
   rememberPath,
   type HistoryGroup,
   type ProjectEntry,
+  type SessionMeta,
 } from "./api";
 
 function shortPath(p: string): string {
@@ -48,6 +53,11 @@ export function App() {
   const [manualPath, setManualPath] = useState("");
   const [picking, setPicking] = useState(false);
   const [showJumpBottom, setShowJumpBottom] = useState(false);
+  const [menu, setMenu] = useState<{
+    session: SessionMeta;
+    x: number;
+    y: number;
+  } | null>(null);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const chatRef = useRef<HTMLElement | null>(null);
@@ -123,12 +133,48 @@ export function App() {
     setShowJumpBottom(false);
   };
 
-  const selectCwd = async (path: string) => {
+  const selectCwd = async (path: string, opts?: { expand?: boolean }) => {
     b.setCwd(path);
     localStorage.setItem("agent-pane-cwd", path);
     await rememberPath(path);
     await refreshLists(false);
-    setExpandedCwd((m) => ({ ...m, [path]: true }));
+    // 不要强行展开，否则点文件夹折叠会被 selectCwd 再打开
+    if (opts?.expand) {
+      setExpandedCwd((m) => ({ ...m, [path]: true }));
+    }
+  };
+
+  const runSessionAction = async (
+    action: "pin" | "rename" | "unread" | "fork" | "archive",
+    session: SessionMeta
+  ) => {
+    setMenu(null);
+    try {
+      if (action === "pin") {
+        await patchSessionMeta(session.sessionId, { pinned: !session.pinned });
+      } else if (action === "rename") {
+        const t = window.prompt("重命名会话", session.title);
+        if (t == null || !t.trim()) return;
+        await patchSessionMeta(session.sessionId, { title: t.trim() });
+      } else if (action === "unread") {
+        await patchSessionMeta(session.sessionId, { unread: !session.unread });
+      } else if (action === "fork") {
+        const meta = await forkSessionApi(session.sessionId);
+        await refreshLists(true);
+        await openHist(meta.sessionId, meta.cwd);
+        return;
+      } else if (action === "archive") {
+        await patchSessionMeta(session.sessionId, { archived: true });
+        if (b.sessionId === session.sessionId) {
+          // 当前正在看的被归档：清空主区
+          b.createSession();
+        }
+      }
+      invalidateHistoryClientCache();
+      await refreshLists(true);
+    } catch (e) {
+      b.setError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   const onBrowse = async () => {
@@ -294,17 +340,20 @@ export function App() {
             </div>
           )}
           {history.map((g) => {
-            const open = expandedCwd[g.cwd] ?? g.cwd === b.cwd;
+            // 显式 false 也算折叠；仅 undefined 时默认展开当前 cwd
+            const open =
+              expandedCwd[g.cwd] !== undefined
+                ? !!expandedCwd[g.cwd]
+                : g.cwd === b.cwd;
             return (
               <div key={g.cwd} className="hist-group">
                 <button
                   type="button"
                   className={`side-item folder ${b.cwd === g.cwd ? "active" : ""}`}
                   onClick={() => {
-                    setExpandedCwd((m) => ({
-                      ...m,
-                      [g.cwd]: !open,
-                    }));
+                    const next = !open;
+                    setExpandedCwd((m) => ({ ...m, [g.cwd]: next }));
+                    // 只切换 cwd，不强制 expand
                     void selectCwd(g.cwd);
                   }}
                   title={g.cwd}
@@ -315,18 +364,42 @@ export function App() {
                 </button>
                 {open &&
                   g.sessions.map((s) => (
-                    <button
+                    <div
                       key={s.sessionId}
-                      type="button"
-                      className={`side-item session ${
+                      className={`side-item session row ${
                         b.sessionId === s.sessionId ? "active" : ""
                       }`}
-                      onClick={() => void openHist(s.sessionId, s.cwd)}
-                      title={s.title}
                     >
-                      <span className="name">{s.title || "Untitled"}</span>
-                      <span className="meta">{formatRelTime(s.updatedAt)}</span>
-                    </button>
+                      <button
+                        type="button"
+                        className="session-main"
+                        onClick={() => void openHist(s.sessionId, s.cwd)}
+                        title={s.title}
+                      >
+                        {s.pinned && <span className="pin-mark">📌</span>}
+                        {s.unread && <span className="unread-dot" />}
+                        <span className="name">{s.title || "Untitled"}</span>
+                        <span className="meta">{formatRelTime(s.updatedAt)}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="more-btn"
+                        title="更多"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const r = (
+                            e.currentTarget as HTMLButtonElement
+                          ).getBoundingClientRect();
+                          setMenu({
+                            session: s,
+                            x: r.right,
+                            y: r.bottom + 4,
+                          });
+                        }}
+                      >
+                        ⋮
+                      </button>
+                    </div>
                   ))}
               </div>
             );
@@ -577,6 +650,54 @@ export function App() {
           </>
         )}
       </div>
+
+      {menu && (
+        <>
+          <div
+            className="menu-backdrop"
+            onClick={() => setMenu(null)}
+            onKeyDown={() => undefined}
+          />
+          <div
+            className="ctx-menu"
+            style={{ top: menu.y, left: Math.max(8, menu.x - 180) }}
+          >
+            <button
+              type="button"
+              onClick={() => void runSessionAction("pin", menu.session)}
+            >
+              <span>📌</span> {menu.session.pinned ? "Unpin" : "Pin"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void runSessionAction("rename", menu.session)}
+            >
+              <span>✎</span> Rename
+            </button>
+            <button
+              type="button"
+              onClick={() => void runSessionAction("unread", menu.session)}
+            >
+              <span>◎</span>{" "}
+              {menu.session.unread ? "Mark as Read" : "Mark as Unread"}
+            </button>
+            <div className="ctx-sep" />
+            <button
+              type="button"
+              onClick={() => void runSessionAction("fork", menu.session)}
+            >
+              <span>⑂</span> Fork Chat
+            </button>
+            <button
+              type="button"
+              className="danger"
+              onClick={() => void runSessionAction("archive", menu.session)}
+            >
+              <span>▤</span> Archive
+            </button>
+          </div>
+        </>
+      )}
 
       {manualOpen && (
         <div

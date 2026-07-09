@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { DomainEvent } from "@agent-pane/shared";
 
 export type SessionMeta = {
@@ -10,6 +11,9 @@ export type SessionMeta = {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  pinned?: boolean;
+  unread?: boolean;
+  archived?: boolean;
 };
 
 export type HistoryGroup = {
@@ -182,11 +186,24 @@ export function listHistory(force = false): HistoryGroup[] {
   );
 
   const byCwd = new Map<string, SessionMeta[]>();
-  for (const s of sessions) {
+  // 默认不展示已归档（可用 includeArchived）
+  const active = sessions.filter((s) => !s.archived);
+
+  for (const s of active) {
     const key = s.cwd || "(unknown)";
     const list = byCwd.get(key) ?? [];
     list.push(s);
     byCwd.set(key, list);
+  }
+
+  // pin 置顶
+  for (const list of byCwd.values()) {
+    list.sort((a, b) => {
+      if (!!b.pinned !== !!a.pinned) return a.pinned ? -1 : 1;
+      return (
+        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+      );
+    });
   }
 
   const groups: HistoryGroup[] = [];
@@ -240,4 +257,62 @@ export function loadSessionEvents(sessionId: string, force = false): DomainEvent
   }
   eventsCache.set(sessionId, { at: Date.now(), mtimeMs, events });
   return events;
+}
+
+/** Patch flags / title without bumping message count */
+export function patchMeta(
+  sessionId: string,
+  patch: Partial<
+    Pick<SessionMeta, "title" | "pinned" | "unread" | "archived" | "cwd">
+  >
+): SessionMeta | null {
+  let prev = readMeta(sessionId);
+  if (!prev) {
+    prev = deriveMetaFromEvents(sessionId) ?? null;
+  }
+  if (!prev) return null;
+  const next: SessionMeta = {
+    ...prev,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  if (patch.title != null) next.title = String(patch.title).slice(0, 80);
+  writeMeta(next);
+  return next;
+}
+
+export function deleteSession(sessionId: string): boolean {
+  const dir = path.join(ROOT, sessionId);
+  if (!fs.existsSync(dir)) return false;
+  fs.rmSync(dir, { recursive: true, force: true });
+  invalidateHistoryListCache();
+  invalidateSessionEventsCache(sessionId);
+  return true;
+}
+
+/** Fork = copy events.jsonl + meta under new id */
+export function forkSession(sessionId: string): SessionMeta | null {
+  const events = loadSessionEvents(sessionId, true);
+  if (!events.length) return null;
+  const prev = readMeta(sessionId) ?? deriveMetaFromEvents(sessionId);
+  if (!prev) return null;
+  const newId = randomUUID();
+  const dir = path.join(ROOT, newId);
+  fs.mkdirSync(dir, { recursive: true });
+  const lines = events.map((e) =>
+    JSON.stringify({ ...e, sessionId: newId })
+  );
+  fs.writeFileSync(path.join(dir, "events.jsonl"), lines.join("\n") + "\n", "utf8");
+  const meta: SessionMeta = {
+    ...prev,
+    sessionId: newId,
+    title: `${prev.title} (fork)`,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    pinned: false,
+    unread: false,
+    archived: false,
+  };
+  writeMeta(meta);
+  return meta;
 }
