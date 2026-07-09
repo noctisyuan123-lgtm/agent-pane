@@ -191,9 +191,11 @@ export function useBridge() {
         setPermissions((p) => p.filter((x) => x.requestId !== event.requestId));
         break;
       case "DiffProposed":
+        // 全量替换；Accept 后服务端会发空列表，卡片消失
         setDiffs(event.files);
         break;
       case "DiffResolved":
+        // 乐观移除；随后的 DiffProposed 会校正
         if (event.filePath === "*") setDiffs([]);
         else setDiffs((d) => d.filter((f) => f.path !== event.filePath));
         break;

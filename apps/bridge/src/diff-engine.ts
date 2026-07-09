@@ -1,4 +1,7 @@
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { createHash } from "node:crypto";
 import type { DiffFileMeta } from "@agent-pane/shared";
 import type { SnapshotInfo } from "./workspace-snapshot.js";
 
@@ -26,13 +29,26 @@ function countDiffStats(patch: string): { additions: number; deletions: number }
   return { additions, deletions };
 }
 
+/** Fingerprint of current on-disk content for Accept tracking. */
+export function fileFingerprint(cwd: string, relPath: string): string {
+  const abs = path.join(cwd, relPath);
+  try {
+    if (!fs.existsSync(abs)) return "missing";
+    const st = fs.statSync(abs);
+    if (st.isDirectory()) return `dir:${st.mtimeMs}`;
+    const buf = fs.readFileSync(abs);
+    return createHash("sha256").update(buf).digest("hex");
+  } catch {
+    return "error";
+  }
+}
+
 /**
- * Diff Engine: truth = worktree vs session baseline (HEAD for clean git sessions,
- * or full porcelain status with patches). Provider-agnostic.
+ * Diff Engine: truth = worktree vs git HEAD (dirty tree).
+ * Caller may filter with Accept fingerprints so Keep 后不再弹出同内容 diff。
  */
 export class DiffEngine {
   compute(cwd: string, _snapshot: SnapshotInfo | undefined): DiffFileMeta[] {
-    // Prefer git
     try {
       execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
         cwd,
@@ -60,12 +76,10 @@ export class DiffEngine {
 
       let patch = "";
       if (xy === "??") {
-        // untracked: show as all additions via empty vs file is expensive; use git diff --no-index
         patch = git(cwd, ["diff", "--no-index", "--", "/dev/null", filePath]);
       } else {
         patch = git(cwd, ["diff", "HEAD", "--", filePath]);
         if (!patch.trim()) {
-          // staged only
           patch = git(cwd, ["diff", "--cached", "HEAD", "--", filePath]);
         }
       }

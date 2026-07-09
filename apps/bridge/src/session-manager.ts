@@ -3,7 +3,7 @@ import { nowIso } from "@agent-pane/shared";
 import { EventStore, type StoredEvent } from "./event-store.js";
 import { GrokAcpAdapter } from "./grok-acp-adapter.js";
 import { WorkspaceSnapshotService } from "./workspace-snapshot.js";
-import { DiffEngine } from "./diff-engine.js";
+import { DiffEngine, fileFingerprint } from "./diff-engine.js";
 
 export type Broadcast = (msg: unknown) => void;
 
@@ -12,6 +12,11 @@ type LiveSession = {
   cwd: string;
   model?: string;
   adapter: GrokAcpAdapter;
+  /**
+   * Accept 过的文件指纹。内容没变则不再展示 Diff。
+   * 文件再被改动后指纹变化，会重新出现在 Diff 里。
+   */
+  acceptedFp: Map<string, string>;
 };
 
 export class SessionManager {
@@ -58,7 +63,6 @@ export class SessionManager {
           break;
         }
         try {
-          // SessionRewound 由 adapter 自己 emit → publish
           await live.adapter.undoLastTurn();
         } catch (e) {
           this.broadcast({
@@ -102,10 +106,8 @@ export class SessionManager {
       autoApprove: this.permissionMode !== "ask" && this.permissionMode !== "default",
     });
     adapter.onEvent((e) => {
-      // Remap: adapter already uses domain session id
       this.publish(e);
       if (e.type === "ToolFinished" || e.type === "MessageDone") {
-        // refresh diffs after tools / turn
         const sid = e.sessionId;
         setTimeout(() => this.refreshDiff(sid), 300);
       }
@@ -131,9 +133,9 @@ export class SessionManager {
       cwd,
       model,
       adapter,
+      acceptedFp: new Map(),
     });
 
-    // Snapshot baseline
     try {
       const snap = this.snapshots.take(domainSessionId, cwd);
       this.publish({
@@ -171,7 +173,16 @@ export class SessionManager {
     const live = this.live.get(sessionId);
     if (!live) return;
     const snap = this.snapshots.get(sessionId);
-    const files = this.diffEngine.compute(live.cwd, snap);
+    let files = this.diffEngine.compute(live.cwd, snap);
+
+    // 过滤已 Accept 且内容未再变的文件
+    files = files.filter((f) => {
+      const accepted = live.acceptedFp.get(f.path);
+      if (!accepted) return true;
+      const now = fileFingerprint(live.cwd, f.path);
+      return now !== accepted;
+    });
+
     this.publish({
       type: "DiffProposed",
       sessionId,
@@ -181,8 +192,31 @@ export class SessionManager {
   }
 
   private async diffAccept(sessionId: string, filePath: string | "*"): Promise<void> {
+    const live = this.live.get(sessionId);
+    if (!live) {
+      this.broadcast({ type: "error", message: "Unknown session — 新开会话后再 Accept" });
+      return;
+    }
+
     try {
-      this.snapshots.advance(sessionId);
+      const snap = this.snapshots.get(sessionId);
+      const current = this.diffEngine.compute(live.cwd, snap);
+      const targets =
+        filePath === "*"
+          ? current.map((f) => f.path)
+          : [filePath];
+
+      for (const p of targets) {
+        live.acceptedFp.set(p, fileFingerprint(live.cwd, p));
+      }
+
+      // 推进 baseline（给 Reject 用）；Accept 本身 = 保留磁盘现状
+      try {
+        this.snapshots.advance(sessionId);
+      } catch {
+        /* non-fatal */
+      }
+
       this.publish({
         type: "DiffResolved",
         sessionId,
@@ -190,15 +224,18 @@ export class SessionManager {
         action: "accept",
         at: nowIso(),
       });
-      const snap = this.snapshots.get(sessionId);
-      if (snap) {
+
+      const after = this.snapshots.get(sessionId);
+      if (after) {
         this.publish({
           type: "SnapshotTaken",
           sessionId,
-          snapshotId: snap.snapshotId,
+          snapshotId: after.snapshotId,
           at: nowIso(),
         });
       }
+
+      // 必须在标记 accepted 之后 refresh，卡片才会真正消失
       this.refreshDiff(sessionId);
     } catch (e) {
       this.publish({
@@ -211,8 +248,21 @@ export class SessionManager {
   }
 
   private async diffReject(sessionId: string, filePath: string | "*"): Promise<void> {
+    const live = this.live.get(sessionId);
+    if (!live) {
+      this.broadcast({ type: "error", message: "Unknown session — 新开会话后再 Reject" });
+      return;
+    }
+
     try {
+      if (filePath === "*") {
+        live.acceptedFp.clear();
+      } else {
+        live.acceptedFp.delete(filePath);
+      }
+
       this.snapshots.restore(sessionId, filePath);
+
       this.publish({
         type: "SnapshotRestored",
         sessionId,
