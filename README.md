@@ -32,9 +32,11 @@ npm run dev:web
 
 浏览器打开：http://127.0.0.1:5173
 
-1. 填工作区绝对路径  
-2. 点 **新会话**  
-3. 发消息  
+1. 点 **打开项目…** / 顶栏 **选择**（系统文件夹对话框）或左侧 Recent/Projects  
+2. 中间输入框写需求，点 **Start**（自动新会话 + 发送）  
+3. 或先 **New Agent** 再聊  
+
+> **和 Grok Build 的关系：** Agent Pane 走的是 CLI 里的 `grok agent stdio`（ACP 协议），**不依赖** Grok Build TUI 菜单里有没有「Agent 模式」。只要 `~/.grok/bin/grok` 能登录、能跑 agent 即可。 
 
 ## 环境变量
 
