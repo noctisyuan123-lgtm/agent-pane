@@ -313,6 +313,7 @@ export function useBridge() {
 
   const cancel = useCallback(() => {
     if (sessionId) send({ type: "session.cancel", sessionId });
+    // 乐观脱 busy；adapter 会丢弃残留 chunk
     setBusy(false);
   }, [send, sessionId]);
 

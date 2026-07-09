@@ -45,6 +45,9 @@ export class GrokAcpAdapter implements AgentProvider {
   >();
   /** 本会话用户消息，用于撤回 */
   private userTurns: string[] = [];
+  /** 当前 turn 是否已被用户取消（忽略后续 stream，直到下次 prompt） */
+  private turnCancelled = false;
+  private promptInFlight = false;
 
   constructor(opts?: { grokBin?: string; autoApprove?: boolean }) {
     this.grokBin =
@@ -290,6 +293,18 @@ export class GrokAcpAdapter implements AgentProvider {
     const sid = this.domainSessionId;
     const at = nowIso();
 
+    // 用户点了 Stop 之后仍可能收到少量残留 chunk —— 直接丢掉
+    if (
+      this.turnCancelled &&
+      (kind === "agent_message_chunk" ||
+        kind === "agent_thought_chunk" ||
+        kind === "tool_call" ||
+        kind === "tool_call_update" ||
+        kind === "plan")
+    ) {
+      return;
+    }
+
     switch (kind) {
       case "agent_message_chunk": {
         const content = update.content as { text?: string } | undefined;
@@ -488,6 +503,8 @@ export class GrokAcpAdapter implements AgentProvider {
     }
 
     this.userTurns.push(input.text);
+    this.turnCancelled = false;
+    this.promptInFlight = true;
     this.emit({
       type: "UserMessageAppended",
       sessionId: this.domainSessionId,
@@ -497,10 +514,23 @@ export class GrokAcpAdapter implements AgentProvider {
     });
 
     try {
-      await this.send("session/prompt", {
+      const result = (await this.send("session/prompt", {
         sessionId: this.providerSessionId,
         prompt: blocks,
-      });
+      })) as { stopReason?: string } | undefined;
+
+      this.promptInFlight = false;
+      const stop = result?.stopReason ?? "end_turn";
+      if (stop === "cancelled" || this.turnCancelled) {
+        this.emit({
+          type: "MessageDone",
+          sessionId: this.domainSessionId,
+          role: "assistant",
+          at: nowIso(),
+        });
+        // 可选：标注取消（前端 busy=false 即可）
+        return;
+      }
       this.emit({
         type: "MessageDone",
         sessionId: this.domainSessionId,
@@ -508,6 +538,16 @@ export class GrokAcpAdapter implements AgentProvider {
         at: nowIso(),
       });
     } catch (e) {
+      this.promptInFlight = false;
+      if (this.turnCancelled) {
+        this.emit({
+          type: "MessageDone",
+          sessionId: this.domainSessionId,
+          role: "assistant",
+          at: nowIso(),
+        });
+        return;
+      }
       this.emit({
         type: "SessionError",
         sessionId: this.domainSessionId,
@@ -517,11 +557,44 @@ export class GrokAcpAdapter implements AgentProvider {
     }
   }
 
+  /**
+   * 取消当前 turn。
+   * ACP 规定 session/cancel 是 **notification（无 id）**，
+   * 若带 id 当 request 发，Grok 会回 Method not found，生成不会停。
+   */
   async cancel(_sessionId: string): Promise<void> {
-    try {
-      await this.send("session/cancel", { sessionId: this.providerSessionId });
-    } catch {
-      /* optional */
+    this.turnCancelled = true;
+
+    // 取消进行中的权限请求
+    for (const [requestId, pending] of this.pendingPermissions) {
+      this.reply(pending.rpcId, { outcome: { outcome: "cancelled" } });
+      this.emit({
+        type: "PermissionResolved",
+        sessionId: this.domainSessionId,
+        requestId,
+        allow: false,
+        at: nowIso(),
+      });
+    }
+    this.pendingPermissions.clear();
+
+    // 关键：notification，不要 id，不要 await 响应
+    if (this.providerSessionId) {
+      this.write({
+        jsonrpc: "2.0",
+        method: "session/cancel",
+        params: { sessionId: this.providerSessionId },
+      });
+    }
+
+    // 立刻让 UI 脱 busy；prompt 的 JSON-RPC 稍后会以 cancelled 回来
+    if (this.promptInFlight) {
+      this.emit({
+        type: "MessageDone",
+        sessionId: this.domainSessionId,
+        role: "assistant",
+        at: nowIso(),
+      });
     }
   }
 
