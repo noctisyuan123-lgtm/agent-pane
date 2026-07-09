@@ -125,24 +125,55 @@ function parseContentBlocks(raw: string): {
   return { text, path, oldText, newText, lines };
 }
 
+/** line-level LCS-ish: only show lines that actually differ */
 function buildDiffLines(
   oldText?: string,
   newText?: string
 ): Array<{ type: "add" | "del" | "ctx"; text: string }> | undefined {
   if (oldText == null && newText == null) return undefined;
-  const oldL = (oldText ?? "").split("\n");
-  const newL = (newText ?? "").split("\n");
-  // simple: show all dels then all adds (good enough for small edits)
-  const out: Array<{ type: "add" | "del" | "ctx"; text: string }> = [];
-  if (oldText != null && oldText !== "") {
-    for (const line of oldL.slice(0, 40)) {
-      out.push({ type: "del", text: line });
-    }
+  const a = (oldText ?? "").replace(/\r\n/g, "\n").split("\n");
+  const b = (newText ?? "").replace(/\r\n/g, "\n").split("\n");
+  // trim single trailing empty from split
+  if (a.length && a[a.length - 1] === "") a.pop();
+  if (b.length && b[b.length - 1] === "") b.pop();
+
+  if (a.join("\n") === b.join("\n")) {
+    // 无实质变化 — 不展示假 diff
+    return undefined;
   }
-  if (newText != null) {
-    for (const line of newL.slice(0, 40)) {
-      out.push({ type: "add", text: line });
-    }
+
+  // Myers-lite: map line → count
+  const out: Array<{ type: "add" | "del" | "ctx"; text: string }> = [];
+  const n = Math.max(a.length, b.length);
+  // If short files, pairwise
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) {
+      out.push({ type: "ctx", text: a[i]! });
+      i++;
+      j++;
+    } else if (
+      j < b.length &&
+      (i >= a.length || (j + 1 < b.length && a[i] === b[j + 1]))
+    ) {
+      out.push({ type: "add", text: b[j]! });
+      j++;
+    } else if (i < a.length) {
+      out.push({ type: "del", text: a[i]! });
+      i++;
+    } else if (j < b.length) {
+      out.push({ type: "add", text: b[j]! });
+      j++;
+    } else break;
+    if (out.length > 80) break;
+  }
+  // if algorithm produced only ctx, fall back to full replace view
+  if (!out.some((l) => l.type !== "ctx")) {
+    const fb: Array<{ type: "add" | "del" | "ctx"; text: string }> = [];
+    for (const line of a.slice(0, 40)) fb.push({ type: "del", text: line });
+    for (const line of b.slice(0, 40)) fb.push({ type: "add", text: line });
+    return fb.length ? fb : undefined;
   }
   return out.length ? out : undefined;
 }
@@ -151,16 +182,22 @@ function countDiffStats(
   oldText?: string,
   newText?: string
 ): { additions: number; deletions: number } {
-  const oldN = oldText == null || oldText === "" ? 0 : oldText.split("\n").length;
-  const newN = newText == null ? 0 : newText.split("\n").length;
-  // crude; better than nothing for display
-  if (oldText === newText) return { additions: 0, deletions: 0 };
-  if (!oldText) return { additions: newN || 1, deletions: 0 };
-  if (newText == null) return { additions: 0, deletions: oldN || 1 };
-  return {
-    additions: Math.max(0, newN),
-    deletions: Math.max(0, oldN),
-  };
+  const lines = buildDiffLines(oldText, newText);
+  if (!lines) {
+    // no real change
+    if (oldText == null && newText != null) {
+      const n = newText.split("\n").filter((l, i, a) => !(i === a.length - 1 && l === "")).length;
+      return { additions: Math.max(1, n), deletions: 0 };
+    }
+    return { additions: 0, deletions: 0 };
+  }
+  let additions = 0;
+  let deletions = 0;
+  for (const l of lines) {
+    if (l.type === "add") additions++;
+    if (l.type === "del") deletions++;
+  }
+  return { additions, deletions };
 }
 
 export function formatToolStarted(input: {
@@ -257,11 +294,15 @@ export function formatToolFinished(
 
   if (isEdit) {
     const base = out.path ? basename(out.path) : "file";
+    const diffLines = buildDiffLines(parsed.oldText, parsed.newText);
     const stats = countDiffStats(parsed.oldText, parsed.newText);
     out.additions = stats.additions;
     out.deletions = stats.deletions;
-    out.label = `Edited ${base}`;
-    out.diffLines = buildDiffLines(parsed.oldText, parsed.newText);
+    out.label =
+      stats.additions === 0 && stats.deletions === 0
+        ? `Touched ${base}`
+        : `Edited ${base}`;
+    out.diffLines = diffLines;
     if (out.path) out.detailLines = [out.path];
   } else if (name.includes("read") || row.kind === "read") {
     const base = out.path ? basename(out.path) : row.path ? basename(row.path) : "file";

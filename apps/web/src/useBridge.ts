@@ -67,19 +67,35 @@ export function useBridge() {
   const assistantLiveId = useRef("a-live");
   const thoughtLiveId = useRef("t-live");
   const toolsGroupId = useRef("tools-live");
+  const thoughtBufMap = useRef(new Map<string, string>());
+  /** 已应用的 event.seq，防双连接/重放叠字 */
+  const seenSeq = useRef(new Set<string>());
   /** 历史回放时不重置时间线 */
   const replayingRef = useRef(false);
 
   const send = useCallback((cmd: ClientCommand) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setError("Bridge 未连接");
+      setError("Bridge 未连接 — 正在重连，连上后请再点一次发送");
+      setConnected(false);
       return;
     }
     ws.send(JSON.stringify(cmd));
   }, []);
 
   const applyEvent = useCallback((event: DomainEvent) => {
+    // 去重：同一 session+seq 只应用一次（防双 WS / 重放）
+    const seqKey =
+      event.seq != null
+        ? `${event.sessionId}:${event.seq}`
+        : `${event.sessionId}:${event.type}:${event.at}:${(event as { text?: string }).text ?? ""}`;
+    if (seenSeq.current.has(seqKey)) return;
+    // 无 seq 的也记一下，短窗口内防抖
+    seenSeq.current.add(seqKey);
+    if (seenSeq.current.size > 50_000) {
+      seenSeq.current.clear();
+    }
+
     switch (event.type) {
       case "SessionStarted":
         setSessionId(event.sessionId);
@@ -92,6 +108,10 @@ export function useBridge() {
           setDiffs([]);
           setBusy(false);
           assistantBuf.current = "";
+          thoughtBufMap.current.clear();
+          seenSeq.current.clear();
+          // 刚 clear 后把本条 SessionStarted 再记上
+          seenSeq.current.add(seqKey);
           setHistoryOnly(false);
         }
         assistantLiveId.current = `a-${event.sessionId}-live`;
@@ -106,6 +126,7 @@ export function useBridge() {
         ]);
         setBusy(true);
         assistantBuf.current = "";
+        thoughtBufMap.current.clear();
         // new live assistant id each user turn
         assistantLiveId.current = `a-${event.sessionId}-${event.seq ?? Date.now()}`;
         thoughtLiveId.current = `t-${event.sessionId}-${event.seq ?? Date.now()}`;
@@ -113,51 +134,49 @@ export function useBridge() {
         break;
 
       case "MessageChunk": {
-        // 若当前时间线末尾是 tools 组，说明中间插了工具——开新 assistant 气泡
+        // 重要：assistantBuf += 必须在 setState 外；StrictMode 会双跑 updater。
+        const wasEmpty = assistantBuf.current === "";
+        assistantBuf.current += event.text;
+        const textSnapshot = assistantBuf.current;
+        let id = assistantLiveId.current;
+
         setMessages((m) => {
           const last = m[m.length - 1];
-          if (last?.kind === "tools" && assistantBuf.current === "") {
-            assistantLiveId.current = `a-${event.sessionId}-after-tools-${event.seq ?? Date.now()}`;
+          if (wasEmpty && last?.kind === "tools") {
+            id = `a-${event.sessionId}-after-tools-${event.seq ?? Date.now()}`;
+            assistantLiveId.current = id;
           }
-          assistantBuf.current += event.text;
-          const id = assistantLiveId.current;
           const next = [...m];
           const idx = next.findIndex((x) => x.id === id);
           if (idx >= 0) {
-            next[idx] = {
-              kind: "assistant",
-              text: assistantBuf.current,
-              id,
-            };
+            next[idx] = { kind: "assistant", text: textSnapshot, id };
           } else {
-            next.push({
-              kind: "assistant",
-              text: assistantBuf.current,
-              id,
-            });
+            next.push({ kind: "assistant", text: textSnapshot, id });
           }
           return next;
         });
         break;
       }
 
-      case "ThoughtChunk":
+      case "ThoughtChunk": {
+        // 用 ref 累加，避免 StrictMode 双跑
+        const id = thoughtLiveId.current;
+        const prev =
+          (thoughtBufMap.current.get(id) ?? "") + event.text;
+        thoughtBufMap.current.set(id, prev);
+        const textSnapshot = prev;
         setMessages((m) => {
-          const id = thoughtLiveId.current;
           const next = [...m];
           const idx = next.findIndex((x) => x.id === id && x.kind === "thought");
-          if (idx >= 0 && next[idx].kind === "thought") {
-            next[idx] = {
-              kind: "thought",
-              text: next[idx].text + event.text,
-              id,
-            };
+          if (idx >= 0) {
+            next[idx] = { kind: "thought", text: textSnapshot, id };
           } else {
-            next.push({ kind: "thought", text: event.text, id });
+            next.push({ kind: "thought", text: textSnapshot, id });
           }
           return next;
         });
         break;
+      }
 
       case "MessageDone":
         // seal live assistant
@@ -313,6 +332,14 @@ export function useBridge() {
       case "SessionError":
         setError(event.message);
         setBusy(false);
+        // agent 进程挂了：标成 historyOnly，下次发送会自动新开会话
+        if (
+          /exited|disconnect|Unknown session|not started|ECONN/i.test(
+            event.message
+          )
+        ) {
+          setHistoryOnly(true);
+        }
         break;
       case "SessionEnded":
         setBusy(false);
@@ -377,6 +404,9 @@ export function useBridge() {
           } else if (msg.type === "error") {
             setError(msg.message);
             setBusy(false);
+            if (/Unknown session|not found|exited|disconnect/i.test(msg.message)) {
+              setHistoryOnly(true);
+            }
           }
         } catch {
           /* ignore */

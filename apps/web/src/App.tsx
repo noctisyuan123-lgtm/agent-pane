@@ -149,10 +149,14 @@ export function App() {
       b.setError("先选择项目文件夹");
       return;
     }
-    // 历史只读 / 无 live agent → 新开会话再发
+    // 历史只读 / agent 已断 / 无 session → 新开 live 会话再发
     if (!b.sessionId || b.historyOnly) {
       pendingPrompt.current = text.trim();
       setInput("");
+      if (!b.cwd.trim()) {
+        b.setError("先选择项目文件夹");
+        return;
+      }
       b.createSession();
       return;
     }
@@ -222,7 +226,9 @@ export function App() {
           </button>
         )}
         {b.historyOnly && (
-          <span className="hist-hint">历史 · 发送将新开会话</span>
+          <span className="hist-hint">
+            {b.sessionId ? "会话已断开 · 发送将重连" : "历史 · 发送将新开会话"}
+          </span>
         )}
         <button
           type="button"
