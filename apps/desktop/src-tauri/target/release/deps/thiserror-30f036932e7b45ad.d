@@ -1,0 +1,14 @@
+/Users/maybach/projects/agent-pane/apps/desktop/src-tauri/target/release/deps/thiserror-30f036932e7b45ad.d: /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /Users/maybach/projects/agent-pane/apps/desktop/src-tauri/target/release/build/thiserror-c797b37a28f32f70/out/private.rs
+
+/Users/maybach/projects/agent-pane/apps/desktop/src-tauri/target/release/deps/libthiserror-30f036932e7b45ad.rlib: /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /Users/maybach/projects/agent-pane/apps/desktop/src-tauri/target/release/build/thiserror-c797b37a28f32f70/out/private.rs
+
+/Users/maybach/projects/agent-pane/apps/desktop/src-tauri/target/release/deps/libthiserror-30f036932e7b45ad.rmeta: /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /Users/maybach/projects/agent-pane/apps/desktop/src-tauri/target/release/build/thiserror-c797b37a28f32f70/out/private.rs
+
+/Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs:
+/Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs:
+/Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs:
+/Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs:
+/Users/maybach/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs:
+/Users/maybach/projects/agent-pane/apps/desktop/src-tauri/target/release/build/thiserror-c797b37a28f32f70/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/maybach/projects/agent-pane/apps/desktop/src-tauri/target/release/build/thiserror-c797b37a28f32f70/out

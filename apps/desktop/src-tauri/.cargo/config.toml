@@ -1,0 +1,7 @@
+# Local network: system proxy is Clash on 7892 (not 7890)
+[http]
+proxy = "http://127.0.0.1:7892"
+check-revoke = false
+
+[net]
+git-fetch-with-cli = true

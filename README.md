@@ -16,7 +16,35 @@ React UI  ──WS──►  Bridge  ──Domain Event Store──► UI
 - 已安装并登录 Grok CLI（`~/.grok/bin/grok`）
 - 建议在 **git 仓库** 里工作（Diff / Reject 最稳）
 
-## 启动
+## 桌面端（推荐）
+
+已打好 macOS arm64 包：
+
+```text
+apps/desktop/src-tauri/target/release/bundle/macos/Agent Pane.app
+apps/desktop/src-tauri/target/release/bundle/dmg/Agent Pane_0.1.0_aarch64.dmg
+```
+
+双击 `.app` 即可；启动时会自动拉起本地 Bridge（`127.0.0.1:8787`）。  
+需要本机已安装 **Node**（找得到 `node`）且 **Grok CLI** 在 `~/.grok/bin`。
+
+重新打包：
+
+```bash
+cd ~/projects/agent-pane
+npm install
+# 若 cargo 拉 crates 失败，确保代理可用后：
+export http_proxy=http://127.0.0.1:7892 https_proxy=http://127.0.0.1:7892
+npm run desktop:build
+```
+
+开发模式（热更新 UI）：
+
+```bash
+npm run desktop:dev   # 需另开或自动起 web dev server
+```
+
+## Web 开发模式
 
 ```bash
 cd ~/projects/agent-pane

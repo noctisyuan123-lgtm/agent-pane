@@ -4,13 +4,17 @@
   "version": "0.1.0",
   "workspaces": [
     "packages/*",
-    "apps/*"
+    "apps/*",
+    "apps/desktop"
   ],
   "scripts": {
     "dev": "npm run dev -w @agent-pane/bridge & npm run dev -w @agent-pane/web",
     "dev:bridge": "npm run dev -w @agent-pane/bridge",
     "dev:web": "npm run dev -w @agent-pane/web",
     "build": "npm run build -w @agent-pane/shared && npm run build -w @agent-pane/bridge && npm run build -w @agent-pane/web",
-    "start": "npm run start -w @agent-pane/bridge"
+    "start": "npm run start -w @agent-pane/bridge",
+    "desktop:dev": "npm run dev -w @agent-pane/desktop",
+    "desktop:build": "npm run build -w @agent-pane/desktop",
+    "bundle:bridge": "npm run bundle:bridge -w @agent-pane/desktop"
   }
 }
