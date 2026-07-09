@@ -1,36 +1,54 @@
 :root {
-  /* Closer to Cursor Agents: cool charcoal, soft blue accent, near-opaque glass */
+  /*
+   * 从本机 Cursor 官方主题抠出：
+   * /Applications/Cursor.app/.../theme-cursor/themes/cursor-dark-color-theme.json
+   * （Agents 窗主区/侧栏就是这套 charcoal，不是我们之前的蓝紫 glow）
+   */
   color-scheme: dark;
+  /* editor.background */
+  --bg-editor: #181818;
+  /* sideBar / activityBar / panel / titleBar */
+  --bg-sidebar: #141414;
   --bg-deep: #141414;
+  /* Cursor 主区几乎是平涂 #181818，只留极弱 vignette */
   --bg-glow: radial-gradient(
-      900px 480px at 55% 28%,
-      rgba(55, 65, 90, 0.22),
-      transparent 58%
-    ),
-    radial-gradient(
-      700px 420px at 15% 90%,
-      rgba(30, 36, 50, 0.2),
-      transparent 55%
-    ),
-    #0f0f0f;
-  --glass: rgba(30, 30, 30, 0.78);
-  --glass-strong: rgba(24, 24, 24, 0.9);
-  --glass-border: rgba(255, 255, 255, 0.08);
-  --glass-border-hi: rgba(255, 255, 255, 0.12);
-  --text: #e4e4e4;
-  --text-muted: #9b9b9b;
-  --text-dim: #6b6b6b;
-  --accent: #4d7cff;
-  --accent-soft: rgba(77, 124, 255, 0.16);
-  --green: #3dd68c;
-  --red: #f07178;
-  --amber: #e6b450;
+      1200px 700px at 50% 40%,
+      #1c1c1c 0%,
+      #181818 45%,
+      #141414 100%
+    );
+  /* widget / dropdown / elevated */
+  --bg-elevated: #181818;
+  --bg-hover: #f0f0f011; /* list.hoverBackground */
+  --bg-active: #f0f0f01e; /* list.activeSelectionBackground / list.focus */
+  --bg-input: #f0f0f00a; /* input.background */
+  --glass: #181818eb;
+  --glass-strong: #141414f2;
+  /* editorGroup.border / tabsBorder #F0F0F013；hover widget #F0F0F026 */
+  --glass-border: #f0f0f013;
+  --glass-border-hi: #f0f0f026;
+  /* foreground */
+  --text: #f0f0f0;
+  --text-muted: #f0f0f0bd; /* sideBar / activityBar foreground @ ~74% */
+  --text-dim: #f0f0f05c; /* editorLineNumber / inlay ~36% */
+  /* button.background / hover */
+  --accent: #81a1c1;
+  --accent-hover: #87a6c4;
+  --accent-soft: #81a1c133;
+  --accent-ink: #191c22; /* button.foreground */
+  /* diff */
+  --green: #3fa266;
+  --green-soft: #3fa26633;
+  --red: #e34671;
+  --red-soft: #b8004933;
+  --amber: #d2943e;
+  --badge: #88c0d0;
   --sidebar-w: 248px;
   --radius: 12px;
   --radius-lg: 16px;
   --font: "Inter", system-ui, -apple-system, "SF Pro Text", sans-serif;
   --mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
-  --blur: blur(40px) saturate(140%);
+  --blur: blur(24px) saturate(120%);
 }
 
 * {
@@ -43,7 +61,7 @@ body,
   height: 100%;
   margin: 0;
   overflow: hidden; /* 整页不滚；滚动交给 sidebar / chat */
-  background: var(--bg-glow);
+  background: var(--bg-editor);
   color: var(--text);
   font-family: var(--font);
   font-size: 13.5px;
@@ -76,9 +94,7 @@ select {
   height: 100%;
   min-height: 0;
   overflow: hidden; /* 外层不滚 */
-  background: rgba(18, 18, 18, 0.88);
-  backdrop-filter: var(--blur);
-  -webkit-backdrop-filter: var(--blur);
+  background: var(--bg-sidebar);
   border-right: 1px solid var(--glass-border);
 }
 
@@ -97,11 +113,11 @@ select {
 }
 
 .side-btn:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--bg-hover);
 }
 
 .side-btn.primary {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--bg-active);
   font-weight: 550;
 }
 
@@ -187,9 +203,13 @@ select {
   width: 100%;
 }
 
-.side-item:hover,
+.side-item:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
 .side-item.active {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--bg-active);
   color: var(--text);
 }
 
@@ -246,6 +266,7 @@ select {
   height: 100%;
   overflow: hidden;
   position: relative; /* jump-bottom 定位 */
+  background: var(--bg-glow);
 }
 
 .stage-top {
@@ -262,9 +283,7 @@ select {
   gap: 8px;
   padding: 6px 12px;
   border-radius: 999px;
-  background: var(--glass);
-  backdrop-filter: var(--blur);
-  -webkit-backdrop-filter: var(--blur);
+  background: var(--bg-input);
   border: 1px solid var(--glass-border);
   color: var(--text-muted);
   font-size: 12.5px;
@@ -363,7 +382,7 @@ select {
 
 /* Composer: home = hero card; in-session = Cursor follow-up pill */
 .composer-shell {
-  background: var(--glass);
+  background: #181818f2;
   backdrop-filter: var(--blur);
   -webkit-backdrop-filter: var(--blur);
   border: 1px solid var(--glass-border-hi);
@@ -371,9 +390,9 @@ select {
   flex-direction: column;
   gap: 8px;
   box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.35),
-    0 16px 48px rgba(0, 0, 0, 0.35),
-    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    0 0 0 1px #00000040,
+    0 12px 40px #00000066,
+    inset 0 1px 0 #f0f0f00a;
 }
 
 .composer-shell.hero {
@@ -430,7 +449,7 @@ select {
   gap: 6px;
   padding: 5px 10px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--bg-input);
   border: 1px solid var(--glass-border);
   font-size: 12px;
   color: var(--text-muted);
@@ -493,9 +512,13 @@ select {
   background: transparent;
 }
 
-.side-item.session.row:hover,
+.side-item.session.row:hover {
+  background: var(--bg-hover);
+  border-radius: 8px;
+}
+
 .side-item.session.row.active {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--bg-active);
   border-radius: 8px;
 }
 
@@ -574,9 +597,9 @@ select {
   min-width: 180px;
   padding: 6px;
   border-radius: 12px;
-  background: rgba(32, 32, 34, 0.96);
+  background: #141414f5; /* editorHoverWidget / sideBar */
   border: 1px solid var(--glass-border-hi);
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 12px 40px #00000080;
   backdrop-filter: blur(20px);
   display: flex;
   flex-direction: column;
@@ -598,7 +621,7 @@ select {
 }
 
 .ctx-menu button:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--bg-hover);
 }
 
 .ctx-menu button.danger {
@@ -649,11 +672,15 @@ select {
 .send-btn {
   border: none;
   border-radius: 999px;
-  background: var(--accent);
-  color: white;
+  background: var(--accent); /* Cursor button.background #81A1C1 */
+  color: var(--accent-ink);
   padding: 7px 16px;
   font-weight: 560;
   cursor: pointer;
+}
+
+.send-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
 }
 
 .send-btn:disabled {
@@ -663,6 +690,7 @@ select {
 
 .send-btn.stop {
   background: var(--red);
+  color: #fff;
 }
 
 .pills {
@@ -748,8 +776,7 @@ select {
 }
 
 .msg.user .bubble {
-  background: var(--glass);
-  backdrop-filter: var(--blur);
+  background: var(--bg-active);
   border: 1px solid var(--glass-border);
   border-radius: 12px;
   padding: 10px 14px;
@@ -965,13 +992,13 @@ select {
 }
 
 .tl-diff-line.add {
-  background: rgba(61, 214, 140, 0.12);
-  color: #b6f0d0;
+  background: var(--green-soft); /* diffEditor.insertedLineBackground */
+  color: #a8e0bf;
 }
 
 .tl-diff-line.del {
-  background: rgba(240, 113, 120, 0.14);
-  color: #f5b4b8;
+  background: var(--red-soft); /* removed approx */
+  color: #f0a0b4;
 }
 
 .tl-diff-line .gutter {
