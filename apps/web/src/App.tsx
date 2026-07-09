@@ -32,6 +32,7 @@ import {
   IconRefresh,
   IconSpark,
   IconTerminal,
+  IconTrash,
 } from "./icons";
 
 function shortPath(p: string): string {
@@ -83,10 +84,12 @@ export function App() {
   const createFn = useRef(b.createSession);
   createFn.current = b.createSession;
 
-  const inSession = Boolean(b.sessionId);
+  const hasMessages = b.messages.length > 0;
+  /** 有消息才进对话布局；空会话/新会话 = Cursor 式居中 Home */
+  const showHome = !hasMessages;
   // follow-up bar: single-line grow; home hero: taller
-  const growMin = inSession ? 22 : 56;
-  const growMax = inSession ? 140 : 200;
+  const growMin = showHome ? 56 : 22;
+  const growMax = showHome ? 200 : 140;
   useAutoGrow(taRef, input, { min: growMin, max: growMax });
 
   useEffect(() => {
@@ -141,7 +144,7 @@ export function App() {
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
-  }, [inSession]);
+  }, [hasMessages]);
 
   const jumpBottom = () => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -160,7 +163,7 @@ export function App() {
   };
 
   const runSessionAction = async (
-    action: "pin" | "rename" | "unread" | "fork" | "archive",
+    action: "pin" | "rename" | "unread" | "fork" | "archive" | "delete",
     session: SessionMeta
   ) => {
     setMenu(null);
@@ -181,7 +184,16 @@ export function App() {
       } else if (action === "archive") {
         await patchSessionMeta(session.sessionId, { archived: true });
         if (b.sessionId === session.sessionId) {
-          // 当前正在看的被归档：清空主区
+          b.createSession();
+        }
+      } else if (action === "delete") {
+        const ok = window.confirm(
+          `永久删除会话「${session.title || "Untitled"}」？\n此操作不可恢复。`
+        );
+        if (!ok) return;
+        await deleteSessionApi(session.sessionId);
+        if (b.sessionId === session.sessionId) {
+          // 删的是当前：回空 Home（清 session）
           b.createSession();
         }
       }
@@ -247,14 +259,14 @@ export function App() {
   };
 
   const composer = (
-    <div className={`composer-shell ${inSession ? "followup" : "hero"}`}>
+    <div className={`composer-shell ${showHome ? "hero" : "followup"}`}>
       <textarea
         ref={taRef}
         className="composer-ta"
         placeholder={
-          inSession
-            ? "Send follow-up…"
-            : "Plan, Build, / for skills, @ for context"
+          showHome
+            ? "Plan, Build, / for skills, @ for context"
+            : "Send follow-up…"
         }
         rows={1}
         value={input}
@@ -276,7 +288,7 @@ export function App() {
           />
         </div>
         <span className="grow" />
-        {inSession && !b.historyOnly && (
+        {!showHome && !b.historyOnly && (
           <button
             type="button"
             className="ghost-btn compact"
@@ -288,7 +300,7 @@ export function App() {
         )}
         {b.historyOnly && (
           <span className="hist-hint">
-            {b.sessionId ? "会话已断开 · 发送将重连" : "历史 · 发送将新开会话"}
+            {b.sessionId ? "历史/已断开 · 发送将新开会话" : "历史 · 发送将新开会话"}
           </span>
         )}
         <button
@@ -297,7 +309,7 @@ export function App() {
           onClick={onSubmit}
           disabled={!b.connected || (!b.busy && !input.trim())}
         >
-          {b.busy ? "Stop" : inSession ? "Send" : "Start"}
+          {b.busy ? "Stop" : showHome ? "Start" : "Send"}
         </button>
       </div>
     </div>
@@ -486,7 +498,7 @@ export function App() {
           <div className="status-banner">{b.statusMsg}</div>
         )}
 
-        {!inSession ? (
+        {showHome ? (
           <div className="home">
             <div className="home-label">
               <span>Home</span>
@@ -510,7 +522,11 @@ export function App() {
               </button>
             </div>
             <div className="home-hint">
-              历史在左侧 Repositories · 缓存 15s 不重复扫盘
+              {b.statusMsg
+                ? b.statusMsg
+                : b.sessionId
+                  ? "输入后 Start 即可开始"
+                  : "历史在左侧 · 先选项目再开聊"}
             </div>
           </div>
         ) : (
@@ -715,10 +731,17 @@ export function App() {
             </button>
             <button
               type="button"
-              className="danger"
               onClick={() => void runSessionAction("archive", menu.session)}
             >
               <IconArchive size={14} /> Archive
+            </button>
+            <div className="ctx-sep" />
+            <button
+              type="button"
+              className="danger"
+              onClick={() => void runSessionAction("delete", menu.session)}
+            >
+              <IconTrash size={14} /> Delete
             </button>
           </div>
         </>

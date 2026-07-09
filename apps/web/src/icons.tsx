@@ -166,3 +166,14 @@ export function IconArrowDown({ size, className }: P) {
     </Svg>
   );
 }
+
+export function IconTrash({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M3 4.5h10" />
+      <path d="M6 4.5V3h4v1.5" />
+      <path d="M4.5 4.5l.7 9h5.6l.7-9" />
+      <path d="M6.5 7v4.5M9.5 7v4.5" />
+    </Svg>
+  );
+}
