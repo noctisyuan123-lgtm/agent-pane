@@ -61,10 +61,14 @@ export function useBridge() {
   const [permissions, setPermissions] = useState<PermissionReq[]>([]);
   const [busy, setBusy] = useState(false);
   const [restoredDraft, setRestoredDraft] = useState<string | null>(null);
+  /** 打开历史回放：尚无 live agent，发消息前会新开会话 */
+  const [historyOnly, setHistoryOnly] = useState(false);
   const assistantBuf = useRef("");
   const assistantLiveId = useRef("a-live");
   const thoughtLiveId = useRef("t-live");
   const toolsGroupId = useRef("tools-live");
+  /** 历史回放时不重置时间线 */
+  const replayingRef = useRef(false);
 
   const send = useCallback((cmd: ClientCommand) => {
     const ws = wsRef.current;
@@ -82,11 +86,14 @@ export function useBridge() {
         setCwd(event.cwd);
         if (event.model) setModel(event.model);
         setError(null);
-        setMessages([]);
-        setTasks([]);
-        setDiffs([]);
-        setBusy(false);
-        assistantBuf.current = "";
+        if (!replayingRef.current) {
+          setMessages([]);
+          setTasks([]);
+          setDiffs([]);
+          setBusy(false);
+          assistantBuf.current = "";
+          setHistoryOnly(false);
+        }
         assistantLiveId.current = `a-${event.sessionId}-live`;
         thoughtLiveId.current = `t-${event.sessionId}-live`;
         toolsGroupId.current = `tools-${event.sessionId}-live`;
@@ -395,12 +402,43 @@ export function useBridge() {
     setMessages([]);
     setTasks([]);
     setDiffs([]);
+    setHistoryOnly(false);
     send({
       type: "session.create",
       cwd: cwd.trim(),
       model: model.trim() || undefined,
     });
   }, [cwd, model, send]);
+
+  /** 从历史打开：只回放事件到 UI（继续聊请再 Start 新会话或同一 cwd 新 Agent） */
+  const openHistorySession = useCallback(
+    async (histSessionId: string, histCwd: string) => {
+      try {
+        const { fetchSessionEvents } = await import("./api");
+        const events = (await fetchSessionEvents(histSessionId)) as DomainEvent[];
+        setMessages([]);
+        setTasks([]);
+        setDiffs([]);
+        setPermissions([]);
+        setBusy(false);
+        assistantBuf.current = "";
+        setSessionId(histSessionId);
+        setCwd(histCwd);
+        localStorage.setItem("agent-pane-cwd", histCwd);
+        replayingRef.current = true;
+        for (const e of events) {
+          applyEvent(e);
+        }
+        replayingRef.current = false;
+        setHistoryOnly(true);
+        setBusy(false);
+      } catch (e) {
+        replayingRef.current = false;
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [applyEvent]
+  );
 
   const prompt = useCallback(
     (text: string) => {
@@ -466,9 +504,11 @@ export function useBridge() {
     diffs,
     permissions,
     busy,
+    historyOnly,
     restoredDraft,
     clearRestoredDraft,
     createSession,
+    openHistorySession,
     prompt,
     cancel,
     undoLast,

@@ -4,6 +4,10 @@ import { EventStore, type StoredEvent } from "./event-store.js";
 import { GrokAcpAdapter } from "./grok-acp-adapter.js";
 import { WorkspaceSnapshotService } from "./workspace-snapshot.js";
 import { DiffEngine, fileFingerprint } from "./diff-engine.js";
+import {
+  invalidateSessionEventsCache,
+  upsertMeta,
+} from "./history-index.js";
 
 export type Broadcast = (msg: unknown) => void;
 
@@ -42,6 +46,23 @@ export class SessionManager {
   private publish(event: DomainEvent): StoredEvent {
     const stored = this.store.append(event);
     this.broadcast({ type: "event", event: stored });
+    invalidateSessionEventsCache(event.sessionId);
+
+    // keep history index warm
+    if (event.type === "SessionStarted") {
+      upsertMeta({
+        sessionId: event.sessionId,
+        cwd: event.cwd,
+        title: "New session",
+      });
+    } else if (event.type === "UserMessageAppended") {
+      upsertMeta({
+        sessionId: event.sessionId,
+        title: event.text,
+        bumpMessage: true,
+      });
+    }
+
     return stored;
   }
 

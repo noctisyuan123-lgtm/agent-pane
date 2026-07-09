@@ -219,7 +219,7 @@ select {
   min-height: 0;
   height: 100%;
   overflow: hidden;
-  position: relative;
+  position: relative; /* jump-bottom 定位 */
 }
 
 .stage-top {
@@ -325,39 +325,64 @@ select {
   cursor: pointer;
 }
 
-.hero-card {
-  width: min(640px, 92vw);
+/* Composer: home = hero card; in-session = Cursor follow-up pill */
+.composer-shell {
   background: var(--glass);
   backdrop-filter: var(--blur);
   -webkit-backdrop-filter: var(--blur);
   border: 1px solid var(--glass-border-hi);
-  border-radius: var(--radius-lg);
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.35),
-    0 24px 80px rgba(0, 0, 0, 0.45),
-    inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  padding: 14px 16px 12px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.35),
+    0 16px 48px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
 }
 
-.hero-card textarea {
+.composer-shell.hero {
+  width: min(640px, 92vw);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px 12px;
+}
+
+.composer-shell.followup {
+  width: min(860px, 100%);
+  border-radius: 999px;
+  padding: 8px 12px 8px 16px;
+  /* 多行时圆角收一点 */
+  border-radius: 22px;
+}
+
+.composer-ta {
   border: none;
   outline: none;
   background: transparent;
   resize: none;
-  min-height: 72px;
-  max-height: 200px;
-  line-height: 1.5;
+  overflow-y: auto;
+  line-height: 1.45;
   color: var(--text);
+  width: 100%;
+  font-size: 14px;
+  padding: 2px 0;
+  field-sizing: content;
 }
 
-.hero-card textarea::placeholder {
+.composer-shell.hero .composer-ta {
+  min-height: 56px;
+}
+
+.composer-shell.followup .composer-ta {
+  min-height: 22px;
+  max-height: 140px;
+  padding: 4px 4px 0;
+}
+
+.composer-ta::placeholder {
   color: var(--text-dim);
 }
 
-.hero-row {
+.composer-bar {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -375,11 +400,15 @@ select {
   color: var(--text-muted);
 }
 
+.model-chip .plus {
+  opacity: 0.7;
+}
+
 .model-chip input {
   border: none;
   background: transparent;
   outline: none;
-  width: 140px;
+  width: 100px;
   color: var(--text);
   font-size: 12px;
 }
@@ -388,8 +417,80 @@ select {
   color: var(--text-dim);
 }
 
-.hero-row .grow {
+.composer-bar .grow {
   flex: 1;
+}
+
+.ghost-btn.compact {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 999px;
+}
+
+.hist-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.hist-group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-bottom: 4px;
+}
+
+.side-item.folder .name {
+  font-weight: 500;
+}
+
+.side-item.session {
+  padding-left: 28px;
+  font-size: 12.5px;
+}
+
+.side-item.session .name {
+  color: var(--text-muted);
+}
+
+.side-item.session.active .name,
+.side-item.session:hover .name {
+  color: var(--text);
+}
+
+.icon-mini {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 4px;
+}
+
+.icon-mini:hover {
+  color: var(--text);
+}
+
+.jump-bottom {
+  position: absolute;
+  right: 28px;
+  bottom: 100px;
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  border: 1px solid var(--glass-border-hi);
+  background: var(--glass-strong);
+  backdrop-filter: var(--blur);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 16px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 5;
+}
+
+.jump-bottom:hover {
+  border-color: rgba(255, 255, 255, 0.2);
+  filter: brightness(1.08);
 }
 
 .send-btn {
@@ -954,10 +1055,6 @@ select {
   padding: 10px 20px 18px;
   display: flex;
   justify-content: center;
-}
-
-.composer-dock .hero-card {
-  width: min(860px, 100%);
 }
 
 /* modal path manual */

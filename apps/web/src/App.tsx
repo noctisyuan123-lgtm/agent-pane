@@ -3,20 +3,36 @@ import ReactMarkdown from "react-markdown";
 import { useBridge } from "./useBridge";
 import { ToolTimeline } from "./ToolTimeline";
 import {
+  fetchHistory,
   fetchProjects,
   fetchRecent,
+  formatRelTime,
+  peekHistoryCache,
   pickFolder,
   rememberPath,
+  type HistoryGroup,
   type ProjectEntry,
 } from "./api";
 
 function shortPath(p: string): string {
   if (!p) return "未选择项目";
-  const home = "/Users/";
-  // show last 2 segments
   const parts = p.replace(/\/$/, "").split("/").filter(Boolean);
   if (parts.length <= 2) return p;
   return parts.slice(-2).join("/");
+}
+
+function useAutoGrow(
+  ref: React.RefObject<HTMLTextAreaElement | null>,
+  value: string,
+  opts: { min: number; max: number }
+) {
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const next = Math.min(opts.max, Math.max(opts.min, el.scrollHeight));
+    el.style.height = `${next}px`;
+  }, [value, ref, opts.min, opts.max]);
 }
 
 export function App() {
@@ -24,15 +40,30 @@ export function App() {
   const [input, setInput] = useState("");
   const [recent, setRecent] = useState<ProjectEntry[]>([]);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
+  const [history, setHistory] = useState<HistoryGroup[]>(
+    () => peekHistoryCache() ?? []
+  );
+  const [expandedCwd, setExpandedCwd] = useState<Record<string, boolean>>({});
   const [manualOpen, setManualOpen] = useState(false);
   const [manualPath, setManualPath] = useState("");
   const [picking, setPicking] = useState(false);
+  const [showJumpBottom, setShowJumpBottom] = useState(false);
+
   const bottomRef = useRef<HTMLDivElement>(null);
+  const chatRef = useRef<HTMLElement | null>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
   const pendingPrompt = useRef<string | null>(null);
   const promptFn = useRef(b.prompt);
   promptFn.current = b.prompt;
+  const createFn = useRef(b.createSession);
+  createFn.current = b.createSession;
 
-  // 撤回后把原文塞回输入框
+  const inSession = Boolean(b.sessionId);
+  // follow-up bar: single-line grow; home hero: taller
+  const growMin = inSession ? 22 : 56;
+  const growMax = inSession ? 140 : 200;
+  useAutoGrow(taRef, input, { min: growMin, max: growMax });
+
   useEffect(() => {
     if (b.restoredDraft != null) {
       setInput(b.restoredDraft);
@@ -40,25 +71,64 @@ export function App() {
     }
   }, [b.restoredDraft, b]);
 
-  const refreshLists = useCallback(async () => {
-    const [r, p] = await Promise.all([fetchRecent(), fetchProjects()]);
+  const refreshLists = useCallback(async (forceHistory = false) => {
+    const [r, p, h] = await Promise.all([
+      fetchRecent(),
+      fetchProjects(),
+      fetchHistory(forceHistory),
+    ]);
     setRecent(r);
     setProjects(p);
+    setHistory(h);
   }, []);
 
   useEffect(() => {
-    void refreshLists();
+    // 首屏用 cache 立刻画，后台静默刷新
+    void refreshLists(false);
   }, [refreshLists]);
 
+  // 新会话 / 用户消息后刷新历史（带 TTL，不卡）
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (!b.sessionId) return;
+    const t = setTimeout(() => void refreshLists(true), 800);
+    return () => clearTimeout(t);
+  }, [b.sessionId, b.messages.length, refreshLists]);
+
+  // auto scroll only when near bottom
+  useEffect(() => {
+    const el = chatRef.current;
+    if (!el) return;
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (dist < 120) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      setShowJumpBottom(false);
+    } else {
+      setShowJumpBottom(true);
+    }
   }, [b.messages, b.diffs, b.tasks]);
+
+  useEffect(() => {
+    const el = chatRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+      setShowJumpBottom(dist > 160);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [inSession]);
+
+  const jumpBottom = () => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    setShowJumpBottom(false);
+  };
 
   const selectCwd = async (path: string) => {
     b.setCwd(path);
     localStorage.setItem("agent-pane-cwd", path);
     await rememberPath(path);
-    await refreshLists();
+    await refreshLists(false);
+    setExpandedCwd((m) => ({ ...m, [path]: true }));
   };
 
   const onBrowse = async () => {
@@ -79,7 +149,8 @@ export function App() {
       b.setError("先选择项目文件夹");
       return;
     }
-    if (!b.sessionId) {
+    // 历史只读 / 无 live agent → 新开会话再发
+    if (!b.sessionId || b.historyOnly) {
       pendingPrompt.current = text.trim();
       setInput("");
       b.createSession();
@@ -90,12 +161,12 @@ export function App() {
   };
 
   useEffect(() => {
-    if (b.sessionId && pendingPrompt.current) {
+    if (b.sessionId && !b.historyOnly && pendingPrompt.current) {
       const t = pendingPrompt.current;
       pendingPrompt.current = null;
       promptFn.current(t);
     }
-  }, [b.sessionId]);
+  }, [b.sessionId, b.historyOnly]);
 
   const onSubmit = () => {
     if (b.busy) {
@@ -105,12 +176,22 @@ export function App() {
     void ensureSessionAndSend(input);
   };
 
-  const inSession = Boolean(b.sessionId);
+  const openHist = async (sessionId: string, cwd: string) => {
+    await b.openHistorySession(sessionId, cwd);
+    setExpandedCwd((m) => ({ ...m, [cwd]: true }));
+  };
 
   const composer = (
-    <div className="hero-card">
+    <div className={`composer-shell ${inSession ? "followup" : "hero"}`}>
       <textarea
-        placeholder="Plan, Build, / for skills, @ for context"
+        ref={taRef}
+        className="composer-ta"
+        placeholder={
+          inSession
+            ? "Send follow-up…"
+            : "Plan, Build, / for skills, @ for context"
+        }
+        rows={1}
         value={input}
         onChange={(e) => setInput(e.target.value)}
         onKeyDown={(e) => {
@@ -120,25 +201,28 @@ export function App() {
           }
         }}
       />
-      <div className="hero-row">
+      <div className="composer-bar">
         <div className="model-chip">
-          <span>+</span>
+          <span className="plus">+</span>
           <input
-            placeholder="Grok (default)"
+            placeholder="Grok"
             value={b.model}
             onChange={(e) => b.setModel(e.target.value)}
           />
         </div>
         <span className="grow" />
-        {inSession && (
+        {inSession && !b.historyOnly && (
           <button
             type="button"
-            className="ghost-btn"
-            title="撤回上一条用户消息，原文回填输入框"
+            className="ghost-btn compact"
+            title="撤回上一条"
             onClick={() => b.undoLast()}
           >
             撤回
           </button>
+        )}
+        {b.historyOnly && (
+          <span className="hist-hint">历史 · 发送将新开会话</span>
         )}
         <button
           type="button"
@@ -186,51 +270,86 @@ export function App() {
         </button>
 
         <div className="side-section">
-          <span>Recent</span>
+          <span>Repositories</span>
+          <button
+            type="button"
+            className="icon-mini"
+            title="刷新历史"
+            onClick={() => void refreshLists(true)}
+          >
+            ↻
+          </button>
         </div>
+
         <div className="side-list">
-          {recent.length === 0 && (
+          {history.length === 0 && (
             <div className="hint" style={{ padding: "6px 10px" }}>
-              还没有最近项目
+              还没有会话历史
             </div>
           )}
-          {recent.map((r) => (
-            <button
-              key={r.path}
-              type="button"
-              className={`side-item ${b.cwd === r.path ? "active" : ""}`}
-              onClick={() => void selectCwd(r.path)}
-              title={r.path}
-            >
-              <span>📂</span>
-              <span className="name">{r.name}</span>
-            </button>
-          ))}
+          {history.map((g) => {
+            const open = expandedCwd[g.cwd] ?? g.cwd === b.cwd;
+            return (
+              <div key={g.cwd} className="hist-group">
+                <button
+                  type="button"
+                  className={`side-item folder ${b.cwd === g.cwd ? "active" : ""}`}
+                  onClick={() => {
+                    setExpandedCwd((m) => ({
+                      ...m,
+                      [g.cwd]: !open,
+                    }));
+                    void selectCwd(g.cwd);
+                  }}
+                  title={g.cwd}
+                >
+                  <span className={`tl-chev ${open ? "open" : ""}`}>▸</span>
+                  <span className="name">📁 {g.name}</span>
+                  <span className="meta">{g.sessions.length}</span>
+                </button>
+                {open &&
+                  g.sessions.map((s) => (
+                    <button
+                      key={s.sessionId}
+                      type="button"
+                      className={`side-item session ${
+                        b.sessionId === s.sessionId ? "active" : ""
+                      }`}
+                      onClick={() => void openHist(s.sessionId, s.cwd)}
+                      title={s.title}
+                    >
+                      <span className="name">{s.title || "Untitled"}</span>
+                      <span className="meta">{formatRelTime(s.updatedAt)}</span>
+                    </button>
+                  ))}
+              </div>
+            );
+          })}
 
-          <div className="side-section">
-            <span>Projects</span>
-          </div>
-          {projects.map((p) => (
-            <button
-              key={p.path}
-              type="button"
-              className={`side-item ${b.cwd === p.path ? "active" : ""}`}
-              onClick={() => void selectCwd(p.path)}
-              title={p.path}
-            >
-              <span>📁</span>
-              <span className="name">{p.name}</span>
-            </button>
-          ))}
+          {recent.length > 0 && (
+            <>
+              <div className="side-section">
+                <span>Recent paths</span>
+              </div>
+              {recent.slice(0, 8).map((r) => (
+                <button
+                  key={r.path}
+                  type="button"
+                  className={`side-item ${b.cwd === r.path ? "active" : ""}`}
+                  onClick={() => void selectCwd(r.path)}
+                  title={r.path}
+                >
+                  <span className="name">{r.name}</span>
+                </button>
+              ))}
+            </>
+          )}
         </div>
 
         <div className="side-foot">
           <div className={`status-pill ${b.connected ? "ok" : ""}`}>
             <span className="dot" />
             {b.connected ? "Bridge · Grok ACP" : "Bridge offline"}
-          </div>
-          <div className="hint" style={{ paddingLeft: 8 }}>
-            不依赖 Grok Build UI
           </div>
         </div>
       </aside>
@@ -247,7 +366,11 @@ export function App() {
           </div>
           <div className="spacer" />
           {b.sessionId && (
-            <button type="button" className="ghost-btn" onClick={b.createSession}>
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={b.createSession}
+            >
               新会话
             </button>
           )}
@@ -268,11 +391,7 @@ export function App() {
             </div>
             {composer}
             <div className="pills">
-              <button
-                type="button"
-                className="pill"
-                onClick={() => void onBrowse()}
-              >
+              <button type="button" className="pill" onClick={() => void onBrowse()}>
                 选择项目文件夹
               </button>
               <button
@@ -285,22 +404,19 @@ export function App() {
               >
                 New Agent
               </button>
-              <button
-                type="button"
-                className="pill"
-                onClick={() => setInput("总结这个仓库的结构和主要入口文件")}
-              >
-                探索代码库
-              </button>
             </div>
             <div className="home-hint">
-              后端是 <code>grok agent stdio</code>（ACP），和 Grok Build TUI
-              菜单无关 · Enter 发送
+              历史在左侧 Repositories · 缓存 15s 不重复扫盘
             </div>
           </div>
         ) : (
           <>
-            <main className="chat">
+            <main
+              className="chat"
+              ref={(n) => {
+                chatRef.current = n;
+              }}
+            >
               {b.messages.map((m, idx) => {
                 if (m.kind === "user") {
                   let lastUserIdx = -1;
@@ -315,11 +431,10 @@ export function App() {
                     <div className="msg user" key={m.id}>
                       <div className="label-row">
                         <div className="label">You</div>
-                        {isLastUser && (
+                        {isLastUser && !b.historyOnly && (
                           <button
                             type="button"
                             className="undo-btn"
-                            title="撤回这条并填回输入框"
                             onClick={() => b.undoLast()}
                           >
                             撤回
@@ -440,6 +555,18 @@ export function App() {
 
               <div ref={bottomRef} />
             </main>
+
+            {showJumpBottom && (
+              <button
+                type="button"
+                className="jump-bottom"
+                onClick={jumpBottom}
+                title="滚到底部"
+              >
+                ↓
+              </button>
+            )}
+
             <div className="composer-dock">{composer}</div>
           </>
         )}

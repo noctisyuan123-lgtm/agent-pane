@@ -4,6 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import {
+  listHistory,
+  loadSessionEvents,
+  invalidateHistoryListCache,
+} from "./history-index.js";
 
 const execFileAsync = promisify(execFile);
 const recentPath = path.join(os.homedir(), ".agent-pane", "recent.json");
@@ -129,6 +134,40 @@ export async function handleHttp(
 
   if (url.pathname === "/api/projects" && req.method === "GET") {
     json(res, 200, { projects: scanProjects() });
+    return true;
+  }
+
+  // History: group by project cwd · list cached in memory
+  if (url.pathname === "/api/history" && req.method === "GET") {
+    const force = url.searchParams.get("force") === "1";
+    const groups = listHistory(force);
+    cors(res);
+    res.setHeader("Cache-Control", "private, max-age=10");
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ groups, cached: !force }));
+    return true;
+  }
+
+  if (url.pathname === "/api/history/invalidate" && req.method === "POST") {
+    invalidateHistoryListCache();
+    json(res, 200, { ok: true });
+    return true;
+  }
+
+  // GET /api/history/:sessionId/events
+  const histMatch = url.pathname.match(
+    /^\/api\/history\/([^/]+)\/events$/
+  );
+  if (histMatch && req.method === "GET") {
+    const sessionId = decodeURIComponent(histMatch[1]!);
+    const force = url.searchParams.get("force") === "1";
+    const events = loadSessionEvents(sessionId, force);
+    cors(res);
+    res.setHeader("Cache-Control", "private, max-age=30");
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(
+      JSON.stringify({ sessionId, events, count: events.length })
+    );
     return true;
   }
 
