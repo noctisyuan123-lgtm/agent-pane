@@ -14,6 +14,12 @@ export interface AgentProvider {
     attachments?: ContextRef[];
   }): Promise<void>;
   cancel(_sessionId: string): Promise<void>;
+  /** Undo last user turn. Returns restored user text. */
+  undoLastTurn(): Promise<{
+    restoredText: string;
+    providerOk: boolean;
+    note?: string;
+  }>;
   respondPermission(requestId: string, allow: boolean): Promise<void>;
   onEvent(handler: (e: DomainEvent) => void): void;
 }

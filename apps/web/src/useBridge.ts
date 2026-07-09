@@ -43,6 +43,8 @@ export function useBridge() {
   const [diffs, setDiffs] = useState<DiffFileMeta[]>([]);
   const [permissions, setPermissions] = useState<PermissionReq[]>([]);
   const [busy, setBusy] = useState(false);
+  /** 撤回后回填输入框 */
+  const [restoredDraft, setRestoredDraft] = useState<string | null>(null);
   const assistantBuf = useRef("");
 
   const send = useCallback((cmd: ClientCommand) => {
@@ -202,6 +204,32 @@ export function useBridge() {
       case "SessionEnded":
         setBusy(false);
         break;
+      case "SessionRewound": {
+        // 砍掉最后一条用户消息及其后的所有内容
+        setMessages((m) => {
+          let lastUser = -1;
+          for (let i = m.length - 1; i >= 0; i--) {
+            if (m[i]!.kind === "user") {
+              lastUser = i;
+              break;
+            }
+          }
+          if (lastUser < 0) return m;
+          return m.slice(0, lastUser);
+        });
+        setTools([]);
+        setTasks([]);
+        setPermissions([]);
+        setBusy(false);
+        assistantBuf.current = "";
+        setRestoredDraft(event.restoredText);
+        if (event.note && !event.providerOk) {
+          setError(event.note);
+        } else {
+          setError(null);
+        }
+        break;
+      }
       default:
         break;
     }
@@ -288,6 +316,16 @@ export function useBridge() {
     setBusy(false);
   }, [send, sessionId]);
 
+  const undoLast = useCallback(() => {
+    if (!sessionId) {
+      setError("没有会话可撤回");
+      return;
+    }
+    send({ type: "session.undoLast", sessionId });
+  }, [send, sessionId]);
+
+  const clearRestoredDraft = useCallback(() => setRestoredDraft(null), []);
+
   const respondPermission = useCallback(
     (requestId: string, allow: boolean) => {
       send({ type: "permission.respond", requestId, allow });
@@ -326,9 +364,12 @@ export function useBridge() {
     diffs,
     permissions,
     busy,
+    restoredDraft,
+    clearRestoredDraft,
     createSession,
     prompt,
     cancel,
+    undoLast,
     respondPermission,
     acceptDiff,
     rejectDiff,

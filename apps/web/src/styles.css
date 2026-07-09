@@ -471,6 +471,28 @@ select {
   text-transform: uppercase;
 }
 
+.msg .label-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.undo-btn {
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.undo-btn:hover {
+  border-color: var(--glass-border-hi);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
 .msg.user .bubble {
   background: var(--glass);
   backdrop-filter: var(--blur);

@@ -43,6 +43,8 @@ export class GrokAcpAdapter implements AgentProvider {
     string,
     { rpcId: number | string; options: Array<{ optionId: string; kind?: string }> }
   >();
+  /** 本会话用户消息，用于撤回 */
+  private userTurns: string[] = [];
 
   constructor(opts?: { grokBin?: string; autoApprove?: boolean }) {
     this.grokBin =
@@ -485,6 +487,7 @@ export class GrokAcpAdapter implements AgentProvider {
       }
     }
 
+    this.userTurns.push(input.text);
     this.emit({
       type: "UserMessageAppended",
       sessionId: this.domainSessionId,
@@ -520,6 +523,88 @@ export class GrokAcpAdapter implements AgentProvider {
     } catch {
       /* optional */
     }
+  }
+
+  /**
+   * 撤回上一条用户消息：
+   * 1) 取消进行中的 turn
+   * 2) 尽力调用 Grok `_x.ai/rewind/*`
+   * 3) 无论 provider 是否成功，都发出 SessionRewound 让 UI 回滚
+   */
+  async undoLastTurn(): Promise<{
+    restoredText: string;
+    providerOk: boolean;
+    note?: string;
+  }> {
+    if (this.userTurns.length === 0) {
+      throw new Error("没有可撤回的消息");
+    }
+
+    await this.cancel(this.domainSessionId);
+
+    const restoredText = this.userTurns[this.userTurns.length - 1]!;
+    let providerOk = false;
+    let note: string | undefined;
+
+    try {
+      // Grok 扩展方法用 _x.ai/ 前缀（无下划线的 x.ai/ 会 Method not found）
+      const pts = (await this.send("_x.ai/rewind/points", {
+        sessionId: this.providerSessionId,
+      })) as { rewind_points?: Array<{ prompt_index: number; prompt_preview?: string }> };
+
+      const points = pts?.rewind_points ?? [];
+      if (points.length === 0) {
+        note = "Grok 侧暂无 rewind 点，仅界面已撤回";
+      } else {
+        const last = points[points.length - 1]!;
+        const target = last.prompt_index;
+        // conversation_only：尽量只撤对话；执行失败时仍做 UI 撤回
+        const result = (await this.send("_x.ai/rewind/execute", {
+          sessionId: this.providerSessionId,
+          target_prompt_index: target,
+          mode: "conversation_only",
+        })) as {
+          success?: boolean;
+          prompt_text?: string | null;
+          error?: string | null;
+        };
+
+        if (result?.success) {
+          providerOk = true;
+          note = "已同步撤回 Grok 会话上下文";
+        } else {
+          note =
+            "界面已撤回；Grok rewind 未确认成功，若模型仍提上条内容请新开会话或再说「忽略上一条」";
+          // 再试 all 模式（部分版本 success 标志不可靠）
+          try {
+            await this.send("_x.ai/rewind/execute", {
+              sessionId: this.providerSessionId,
+              target_prompt_index: target,
+              mode: "all",
+            });
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    } catch (e) {
+      note = `界面已撤回；Grok rewind 调用失败：${
+        e instanceof Error ? e.message : String(e)
+      }`;
+    }
+
+    this.userTurns.pop();
+
+    this.emit({
+      type: "SessionRewound",
+      sessionId: this.domainSessionId,
+      restoredText,
+      providerOk,
+      note,
+      at: nowIso(),
+    });
+
+    return { restoredText, providerOk, note };
   }
 
   async respondPermission(requestId: string, allow: boolean): Promise<void> {

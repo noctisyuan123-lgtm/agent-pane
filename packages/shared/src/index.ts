@@ -88,7 +88,15 @@ export type DomainEvent =
       action: "accept" | "reject";
     })
   | (DomainEventBase & { type: "SnapshotTaken"; snapshotId: string })
-  | (DomainEventBase & { type: "SnapshotRestored"; snapshotId: string });
+  | (DomainEventBase & { type: "SnapshotRestored"; snapshotId: string })
+  /** 撤回上一条用户消息及其后的 agent 输出 */
+  | (DomainEventBase & {
+      type: "SessionRewound";
+      restoredText: string;
+      /** Grok 侧 rewind 是否成功 */
+      providerOk: boolean;
+      note?: string;
+    });
 
 export type ClientCommand =
   | { type: "session.create"; cwd: string; model?: string }
@@ -100,6 +108,8 @@ export type ClientCommand =
     }
   | { type: "session.cancel"; sessionId: string }
   | { type: "session.replay"; sessionId: string; fromSeq?: number }
+  /** 撤回最近一条用户消息（停生成 + UI/尽力 rewind provider） */
+  | { type: "session.undoLast"; sessionId: string }
   | { type: "permission.respond"; requestId: string; allow: boolean }
   | { type: "diff.accept"; sessionId: string; filePath: string | "*" }
   | { type: "diff.reject"; sessionId: string; filePath: string | "*" }

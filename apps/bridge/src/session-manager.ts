@@ -51,6 +51,23 @@ export class SessionManager {
       case "session.cancel":
         await this.live.get(cmd.sessionId)?.adapter.cancel(cmd.sessionId);
         break;
+      case "session.undoLast": {
+        const live = this.live.get(cmd.sessionId);
+        if (!live) {
+          this.broadcast({ type: "error", message: "Unknown session" });
+          break;
+        }
+        try {
+          // SessionRewound 由 adapter 自己 emit → publish
+          await live.adapter.undoLastTurn();
+        } catch (e) {
+          this.broadcast({
+            type: "error",
+            message: e instanceof Error ? e.message : String(e),
+          });
+        }
+        break;
+      }
       case "session.replay": {
         const events = this.store.list(cmd.sessionId, cmd.fromSeq ?? 0);
         this.broadcast({

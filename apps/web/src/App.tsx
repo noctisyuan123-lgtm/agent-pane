@@ -31,6 +31,14 @@ export function App() {
   const promptFn = useRef(b.prompt);
   promptFn.current = b.prompt;
 
+  // 撤回后把原文塞回输入框
+  useEffect(() => {
+    if (b.restoredDraft != null) {
+      setInput(b.restoredDraft);
+      b.clearRestoredDraft();
+    }
+  }, [b.restoredDraft, b]);
+
   const refreshLists = useCallback(async () => {
     const [r, p] = await Promise.all([fetchRecent(), fetchProjects()]);
     setRecent(r);
@@ -121,6 +129,16 @@ export function App() {
           />
         </div>
         <span className="grow" />
+        {inSession && (
+          <button
+            type="button"
+            className="ghost-btn"
+            title="撤回上一条用户消息，原文回填输入框"
+            onClick={() => b.undoLast()}
+          >
+            撤回
+          </button>
+        )}
         <button
           type="button"
           className={`send-btn ${b.busy ? "stop" : ""}`}
@@ -282,11 +300,31 @@ export function App() {
         ) : (
           <>
             <main className="chat">
-              {b.messages.map((m) => {
+              {b.messages.map((m, idx) => {
                 if (m.kind === "user") {
+                  let lastUserIdx = -1;
+                  for (let i = b.messages.length - 1; i >= 0; i--) {
+                    if (b.messages[i]!.kind === "user") {
+                      lastUserIdx = i;
+                      break;
+                    }
+                  }
+                  const isLastUser = lastUserIdx === idx;
                   return (
                     <div className="msg user" key={m.id}>
-                      <div className="label">You</div>
+                      <div className="label-row">
+                        <div className="label">You</div>
+                        {isLastUser && (
+                          <button
+                            type="button"
+                            className="undo-btn"
+                            title="撤回这条并填回输入框"
+                            onClick={() => b.undoLast()}
+                          >
+                            撤回
+                          </button>
+                        )}
+                      </div>
                       <div className="bubble">{m.text}</div>
                     </div>
                   );
