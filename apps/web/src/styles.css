@@ -42,6 +42,7 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  overflow: hidden; /* 整页不滚；滚动交给 sidebar / chat */
   background: var(--bg-glow);
   color: var(--text);
   font-family: var(--font);
@@ -62,7 +63,8 @@ select {
   display: grid;
   grid-template-columns: var(--sidebar-w) 1fr;
   height: 100%;
-  min-height: 100vh;
+  max-height: 100%;
+  overflow: hidden;
 }
 
 /* ── sidebar ── */
@@ -71,6 +73,9 @@ select {
   flex-direction: column;
   gap: 4px;
   padding: 12px 10px;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden; /* 外层不滚 */
   background: rgba(18, 18, 18, 0.88);
   backdrop-filter: var(--blur);
   -webkit-backdrop-filter: var(--blur);
@@ -119,12 +124,27 @@ select {
 }
 
 .side-list {
-  flex: 1;
-  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 0; /* flex 子项才能独立 overflow 滚动 */
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 2px;
   padding-bottom: 8px;
+  /* 细滚动条，别抢戏 */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+.side-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.side-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
 }
 
 .side-item {
@@ -161,7 +181,8 @@ select {
 }
 
 .side-foot {
-  margin-top: auto;
+  flex-shrink: 0;
+  margin-top: 4px;
   padding: 10px 8px 4px;
   border-top: 1px solid var(--glass-border);
   display: flex;
@@ -195,7 +216,9 @@ select {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   height: 100%;
+  overflow: hidden;
   position: relative;
 }
 
@@ -421,8 +444,11 @@ select {
 
 /* ── chat stage ── */
 .chat {
-  flex: 1;
-  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 18px 28px 28px;
   display: flex;
   flex-direction: column;
@@ -713,6 +739,7 @@ select {
 
 /* bottom composer (in session) */
 .composer-dock {
+  flex-shrink: 0;
   padding: 10px 20px 18px;
   display: flex;
   justify-content: center;
