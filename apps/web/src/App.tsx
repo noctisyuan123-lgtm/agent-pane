@@ -18,6 +18,21 @@ import {
   type ProjectEntry,
   type SessionMeta,
 } from "./api";
+import {
+  IconArchive,
+  IconArrowDown,
+  IconBell,
+  IconChevron,
+  IconFolder,
+  IconFork,
+  IconMoreVertical,
+  IconPencil,
+  IconPin,
+  IconPlus,
+  IconRefresh,
+  IconSpark,
+  IconTerminal,
+} from "./icons";
 
 function shortPath(p: string): string {
   if (!p) return "未选择项目";
@@ -253,7 +268,7 @@ export function App() {
       />
       <div className="composer-bar">
         <div className="model-chip">
-          <span className="plus">+</span>
+          <IconPlus size={14} className="ico-inline" />
           <input
             placeholder="Grok"
             value={b.model}
@@ -296,17 +311,18 @@ export function App() {
           className="side-btn primary"
           onClick={() => {
             if (!b.cwd) {
+              b.setError("请先选择项目文件夹");
               void onBrowse();
               return;
             }
             b.createSession();
           }}
         >
-          <span className="ico">✦</span>
+          <IconSpark className="ico" />
           New Agent
         </button>
         <button type="button" className="side-btn" onClick={() => void onBrowse()}>
-          <span className="ico">📁</span>
+          <IconFolder className="ico" />
           {picking ? "选择中…" : "打开项目…"}
         </button>
         <button
@@ -317,7 +333,7 @@ export function App() {
             setManualOpen(true);
           }}
         >
-          <span className="ico">⌘</span>
+          <IconTerminal className="ico" />
           输入路径…
         </button>
 
@@ -329,7 +345,7 @@ export function App() {
             title="刷新历史"
             onClick={() => void refreshLists(true)}
           >
-            ↻
+            <IconRefresh size={14} />
           </button>
         </div>
 
@@ -358,8 +374,12 @@ export function App() {
                   }}
                   title={g.cwd}
                 >
-                  <span className={`tl-chev ${open ? "open" : ""}`}>▸</span>
-                  <span className="name">📁 {g.name}</span>
+                  <IconChevron
+                    size={12}
+                    className={`ico-chev ${open ? "open" : ""}`}
+                  />
+                  <IconFolder size={14} className="ico-muted" />
+                  <span className="name">{g.name}</span>
                   <span className="meta">{g.sessions.length}</span>
                 </button>
                 {open &&
@@ -376,7 +396,9 @@ export function App() {
                         onClick={() => void openHist(s.sessionId, s.cwd)}
                         title={s.title}
                       >
-                        {s.pinned && <span className="pin-mark">📌</span>}
+                        {s.pinned && (
+                          <IconPin size={12} className="ico-muted" />
+                        )}
                         {s.unread && <span className="unread-dot" />}
                         <span className="name">{s.title || "Untitled"}</span>
                         <span className="meta">{formatRelTime(s.updatedAt)}</span>
@@ -397,7 +419,7 @@ export function App() {
                           });
                         }}
                       >
-                        ⋮
+                        <IconMoreVertical size={14} />
                       </button>
                     </div>
                   ))}
@@ -459,6 +481,9 @@ export function App() {
           <div className="error-banner" onClick={() => b.setError(null)}>
             {b.error}
           </div>
+        )}
+        {!b.error && b.statusMsg && (
+          <div className="status-banner">{b.statusMsg}</div>
         )}
 
         {!inSession ? (
@@ -642,7 +667,7 @@ export function App() {
                 onClick={jumpBottom}
                 title="滚到底部"
               >
-                ↓
+                <IconArrowDown size={16} />
               </button>
             )}
 
@@ -666,19 +691,19 @@ export function App() {
               type="button"
               onClick={() => void runSessionAction("pin", menu.session)}
             >
-              <span>📌</span> {menu.session.pinned ? "Unpin" : "Pin"}
+              <IconPin size={14} /> {menu.session.pinned ? "Unpin" : "Pin"}
             </button>
             <button
               type="button"
               onClick={() => void runSessionAction("rename", menu.session)}
             >
-              <span>✎</span> Rename
+              <IconPencil size={14} /> Rename
             </button>
             <button
               type="button"
               onClick={() => void runSessionAction("unread", menu.session)}
             >
-              <span>◎</span>{" "}
+              <IconBell size={14} />{" "}
               {menu.session.unread ? "Mark as Read" : "Mark as Unread"}
             </button>
             <div className="ctx-sep" />
@@ -686,14 +711,14 @@ export function App() {
               type="button"
               onClick={() => void runSessionAction("fork", menu.session)}
             >
-              <span>⑂</span> Fork Chat
+              <IconFork size={14} /> Fork Chat
             </button>
             <button
               type="button"
               className="danger"
               onClick={() => void runSessionAction("archive", menu.session)}
             >
-              <span>▤</span> Archive
+              <IconArchive size={14} /> Archive
             </button>
           </div>
         </>

@@ -50,6 +50,7 @@ export function useBridge() {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [cwd, setCwd] = useState(localStorage.getItem("agent-pane-cwd") || "");
   const [model, setModel] = useState(
@@ -102,6 +103,7 @@ export function useBridge() {
         setCwd(event.cwd);
         if (event.model) setModel(event.model);
         setError(null);
+        setStatusMsg(null);
         if (!replayingRef.current) {
           setMessages([]);
           setTasks([]);
@@ -407,6 +409,8 @@ export function useBridge() {
             if (/Unknown session|not found|exited|disconnect/i.test(msg.message)) {
               setHistoryOnly(true);
             }
+          } else if (msg.type === "status") {
+            setStatusMsg(msg.message);
           }
         } catch {
           /* ignore */
@@ -424,7 +428,7 @@ export function useBridge() {
 
   const createSession = useCallback(() => {
     if (!cwd.trim()) {
-      setError("请填写工作区路径 (cwd)");
+      setError("请先选择项目文件夹（cwd）");
       return;
     }
     localStorage.setItem("agent-pane-cwd", cwd.trim());
@@ -432,7 +436,15 @@ export function useBridge() {
     setMessages([]);
     setTasks([]);
     setDiffs([]);
+    setPermissions([]);
     setHistoryOnly(false);
+    setSessionId(null); // 清掉旧 id，避免发到死会话
+    setBusy(true);
+    setError(null);
+    setStatusMsg("正在启动 Grok agent…");
+    assistantBuf.current = "";
+    thoughtBufMap.current.clear();
+    seenSeq.current.clear();
     send({
       type: "session.create",
       cwd: cwd.trim(),
@@ -537,6 +549,7 @@ export function useBridge() {
     connected,
     error,
     setError,
+    statusMsg,
     sessionId,
     cwd,
     setCwd,

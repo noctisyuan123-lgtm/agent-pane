@@ -119,7 +119,8 @@ export type ServerMessage =
   | { type: "hello"; version: string }
   | { type: "event"; event: DomainEvent }
   | { type: "replay"; sessionId: string; events: DomainEvent[] }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "status"; message: string };
 
 export function nowIso(): string {
   return new Date().toISOString();

@@ -122,7 +122,29 @@ export class SessionManager {
     }
   }
 
+  /** 关掉所有（或指定 cwd）旧 adapter，避免 grok agent 进程堆僵尸 */
+  private async stopLiveSessions(filterCwd?: string): Promise<void> {
+    const entries = [...this.live.entries()];
+    for (const [id, s] of entries) {
+      if (filterCwd && s.cwd !== filterCwd) continue;
+      try {
+        await s.adapter.stop();
+      } catch {
+        /* best effort */
+      }
+      this.live.delete(id);
+    }
+  }
+
   private async createSession(cwd: string, model?: string): Promise<void> {
+    // 先清旧会话——这是「New Agent 点了像死了」的主因
+    await this.stopLiveSessions();
+
+    this.broadcast({
+      type: "status",
+      message: "正在启动 Grok agent…",
+    });
+
     const adapter = new GrokAcpAdapter({
       autoApprove: this.permissionMode !== "ask" && this.permissionMode !== "default",
     });
@@ -143,7 +165,7 @@ export class SessionManager {
     } catch (e) {
       this.broadcast({
         type: "error",
-        message: e instanceof Error ? e.message : String(e),
+        message: `启动失败: ${e instanceof Error ? e.message : String(e)}`,
       });
       return;
     }
