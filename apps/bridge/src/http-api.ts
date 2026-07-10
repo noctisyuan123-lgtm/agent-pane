@@ -18,6 +18,101 @@ const recentPath = path.join(os.homedir(), ".agent-pane", "recent.json");
 
 export type RecentEntry = { path: string; name: string; at: string };
 
+export type SkillEntry = {
+  name: string;
+  description: string;
+  source: string;
+  dir: string;
+};
+
+function parseSkillFrontmatter(raw: string): {
+  name?: string;
+  description?: string;
+} {
+  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return {};
+  const block = m[1]!;
+  const name = block.match(/^name:\s*(.+)$/m)?.[1]?.trim().replace(/^["']|["']$/g, "");
+  let description = block.match(/^description:\s*(.+)$/m)?.[1]?.trim();
+  if (description?.startsWith('"') || description?.startsWith("'")) {
+    // single-line quoted
+    description = description.replace(/^["']|["']$/g, "");
+  } else if (description?.startsWith("|") || description?.startsWith(">")) {
+    description = description.replace(/^[|>]-?\s*/, "");
+  }
+  // multiline description: "description: |\n  ..."
+  if (!description || description === "|" || description === ">") {
+    const multi = block.match(
+      /^description:\s*[|>]-?\s*\n((?:[ \t]+.+\n?)+)/m
+    );
+    if (multi) {
+      description = multi[1]!
+        .split("\n")
+        .map((l) => l.replace(/^[ \t]+/, ""))
+        .join(" ")
+        .trim();
+    }
+  }
+  return { name, description };
+}
+
+/** Discover Grok / Claude / Cursor skills (name + short description). */
+export function listSkills(cwd?: string): SkillEntry[] {
+  const roots: { dir: string; source: string }[] = [
+    { dir: path.join(os.homedir(), ".grok", "skills"), source: "user-grok" },
+    { dir: path.join(os.homedir(), ".claude", "skills"), source: "user-claude" },
+    { dir: path.join(os.homedir(), ".cursor", "skills"), source: "user-cursor" },
+  ];
+  if (cwd) {
+    roots.unshift(
+      { dir: path.join(cwd, ".grok", "skills"), source: "project-grok" },
+      { dir: path.join(cwd, ".claude", "skills"), source: "project-claude" },
+      { dir: path.join(cwd, ".cursor", "skills"), source: "project-cursor" }
+    );
+  }
+
+  const byName = new Map<string, SkillEntry>();
+  // later roots lower priority — first wins (project first when cwd set)
+  for (const { dir, source } of roots) {
+    let entries: fs.Dirent[] = [];
+    try {
+      if (!fs.existsSync(dir)) continue;
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      // skip known vendor noise
+      if (["shell", "canvas", "statusline", "node_modules"].includes(ent.name)) {
+        continue;
+      }
+      const skillDir = path.join(dir, ent.name);
+      const md = path.join(skillDir, "SKILL.md");
+      if (!fs.existsSync(md)) continue;
+      try {
+        const raw = fs.readFileSync(md, "utf8").slice(0, 8000);
+        const fm = parseSkillFrontmatter(raw);
+        const name = (fm.name || ent.name).trim();
+        if (!name || byName.has(name)) continue;
+        const description = (fm.description || "").slice(0, 160);
+        byName.set(name, {
+          name,
+          description,
+          source,
+          dir: skillDir,
+        });
+      } catch {
+        /* skip */
+      }
+    }
+  }
+
+  return [...byName.values()].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
+  );
+}
+
 function cors(res: ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
@@ -112,9 +207,17 @@ function scanProjects(): RecentEntry[] {
   return out.slice(0, 40);
 }
 
+export type HttpApiHooks = {
+  /** Stop live agent before deleting its session dir (avoids write-race resurrecting files). */
+  stopSession?: (sessionId: string) => void | Promise<void>;
+  /** Clear in-memory event store for a deleted session. */
+  purgeSession?: (sessionId: string) => void;
+};
+
 export async function handleHttp(
   req: IncomingMessage,
-  res: ServerResponse
+  res: ServerResponse,
+  hooks: HttpApiHooks = {}
 ): Promise<boolean> {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
 
@@ -137,6 +240,13 @@ export async function handleHttp(
 
   if (url.pathname === "/api/projects" && req.method === "GET") {
     json(res, 200, { projects: scanProjects() });
+    return true;
+  }
+
+  // Skills from ~/.grok, ~/.claude, and optional project cwd
+  if (url.pathname === "/api/skills" && req.method === "GET") {
+    const cwd = url.searchParams.get("cwd") || undefined;
+    json(res, 200, { skills: listSkills(cwd) });
     return true;
   }
 
@@ -216,8 +326,69 @@ export async function handleHttp(
   // DELETE /api/history/:sessionId
   if (patchMatch && req.method === "DELETE") {
     const sessionId = decodeURIComponent(patchMatch[1]!);
+    try {
+      await hooks.stopSession?.(sessionId);
+    } catch {
+      /* best effort — still try disk delete */
+    }
     const ok = deleteSession(sessionId);
-    json(res, ok ? 200 : 404, { ok });
+    try {
+      hooks.purgeSession?.(sessionId);
+    } catch {
+      /* ignore */
+    }
+    // Second pass: kill anything a late flush recreated
+    if (ok) deleteSession(sessionId);
+    // Idempotent: gone-on-disk is success (stale UI / double-click)
+    if (ok) {
+      json(res, 200, { ok: true });
+    } else {
+      json(res, 500, {
+        ok: false,
+        error: "Failed to delete session (disk error)",
+      });
+    }
+    return true;
+  }
+
+  // POST /api/upload  { name, base64, mime? } → save under ~/.agent-pane/uploads
+  // Used for browser/HTML5 drops when native path is unavailable.
+  if (url.pathname === "/api/upload" && req.method === "POST") {
+    try {
+      const body = JSON.parse(await readBody(req)) as {
+        name?: string;
+        base64?: string;
+        mime?: string;
+      };
+      const name = String(body.name || "upload.bin").replace(/[^\w.\-()+ ]+/g, "_");
+      const b64 = String(body.base64 || "");
+      if (!b64) {
+        json(res, 400, { error: "base64 required" });
+        return true;
+      }
+      const dir = path.join(os.homedir(), ".agent-pane", "uploads");
+      fs.mkdirSync(dir, { recursive: true });
+      const stamp = Date.now().toString(36);
+      const safe = name.slice(0, 120) || "upload.bin";
+      const dest = path.join(dir, `${stamp}-${safe}`);
+      const buf = Buffer.from(b64, "base64");
+      // 40MB cap
+      if (buf.length > 40 * 1024 * 1024) {
+        json(res, 413, { error: "file too large (max 40MB)" });
+        return true;
+      }
+      fs.writeFileSync(dest, buf);
+      json(res, 200, {
+        path: dest,
+        name: safe,
+        size: buf.length,
+        mime: body.mime || null,
+      });
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
     return true;
   }
 

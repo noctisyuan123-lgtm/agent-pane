@@ -41,19 +41,53 @@ export function IconSpark({ size, className }: P) {
   );
 }
 
-export function IconFolder({ size, className }: P) {
+/**
+ * Cursor Agents “New Agent” — paper plane (codicon-style send).
+ * Matches the filled-wing plane in Cursor sidebar better than a spark.
+ */
+export function IconPaperPlane({ size, className }: P) {
   return (
     <Svg size={size} className={className}>
-      <path d="M2 4.5h4l1.2 1.5H14a1 1 0 0 1 1 1V12a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12V6a1.5 1.5 0 0 1 1.5-1.5H2z" />
+      <path
+        d="M2 3.2l12.5 4.8L2 12.8V8.6l7.2-.6L2 7.4V3.2z"
+        fill="currentColor"
+        stroke="none"
+      />
     </Svg>
   );
 }
 
+/**
+ * Closed folder — flat tab + body outline (collapsed repo row).
+ */
+export function IconFolder({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M1.5 3.75c0-.69.56-1.25 1.25-1.25h3.38c.3 0 .59.11.81.31L8.1 4h5.15c.69 0 1.25.56 1.25 1.25v6.5c0 .69-.56 1.25-1.25 1.25h-10c-.69 0-1.25-.56-1.25-1.25v-8z" />
+    </Svg>
+  );
+}
+
+/**
+ * Open folder — expanded repo (matches Cursor / user ref: tab + open pocket).
+ */
 export function IconFolderOpen({ size, className }: P) {
   return (
     <Svg size={size} className={className}>
-      <path d="M1.5 6.5V5A1.5 1.5 0 0 1 3 3.5h3l1.2 1.5H13A1.5 1.5 0 0 1 14.5 6.5" />
-      <path d="M1.5 6.5h13l-1.2 6.2A1.5 1.5 0 0 1 11.8 14H4.2a1.5 1.5 0 0 1-1.5-1.3L1.5 6.5z" />
+      {/* back / tab rim */}
+      <path d="M1.5 4.2c0-.66.54-1.2 1.2-1.2h3.15l1.15 1.25h5.3c.66 0 1.2.54 1.2 1.2V6" />
+      {/* open front pocket (deeper body) */}
+      <path d="M1.65 6.35h12.7l-1.4 6.05c-.12.5-.56.85-1.08.85H4.13c-.52 0-.96-.35-1.08-.85L1.65 6.35z" />
+    </Svg>
+  );
+}
+
+/** Copy — two overlapping squares (Cursor style) */
+export function IconCopy({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <rect x="5.5" y="5.5" width="8" height="8" rx="1.2" />
+      <path d="M3.5 10.5V3.8A1.3 1.3 0 0 1 4.8 2.5h6.7" />
     </Svg>
   );
 }
@@ -151,6 +185,55 @@ export function IconChevron({ size, className }: P) {
   );
 }
 
+export function IconBook({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M3 2.5h4.5A2.5 2.5 0 0 1 10 5v9.5H5A2 2 0 0 1 3 12.5v-10z" />
+      <path d="M13 2.5H8.5A2.5 2.5 0 0 0 6 5v9.5h5A2 2 0 0 0 13 12.5v-10z" />
+    </Svg>
+  );
+}
+
+export function IconBug({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M8 5.5a3 3 0 0 1 3 3v3.5a3 3 0 0 1-6 0V8.5a3 3 0 0 1 3-3z" />
+      <path d="M5 8.5H2.5M13.5 8.5H11M5 12H3M13 12h-2M5.5 5.5L3.5 3.5M10.5 5.5l2-2" />
+    </Svg>
+  );
+}
+
+export function IconList({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M5 4h9M5 8h9M5 12h9" />
+      <circle cx="2.5" cy="4" r="0.8" fill="currentColor" stroke="none" />
+      <circle cx="2.5" cy="8" r="0.8" fill="currentColor" stroke="none" />
+      <circle cx="2.5" cy="12" r="0.8" fill="currentColor" stroke="none" />
+    </Svg>
+  );
+}
+
+export function IconQuestion({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <circle cx="8" cy="8" r="6" />
+      <path d="M6.2 6.2a1.8 1.8 0 1 1 2.5 1.6c-.6.3-1 .8-1 1.5V10" />
+      <circle cx="8" cy="12.2" r="0.6" fill="currentColor" stroke="none" />
+    </Svg>
+  );
+}
+
+/** Undo / rewind */
+export function IconUndo({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M4 7H11a3 3 0 0 1 0 6H8" />
+      <path d="M4 7l2.5-2.5M4 7l2.5 2.5" />
+    </Svg>
+  );
+}
+
 export function IconPlus({ size, className }: P) {
   return (
     <Svg size={size} className={className}>
@@ -163,6 +246,32 @@ export function IconArrowDown({ size, className }: P) {
   return (
     <Svg size={size} className={className}>
       <path d="M8 3v10M4 9l4 4 4-4" />
+    </Svg>
+  );
+}
+
+/** Send — up arrow (Cursor-style circular control, no mic) */
+export function IconArrowUp({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M8 13V3M4 7l4-4 4 4" />
+    </Svg>
+  );
+}
+
+/** Stop generation — filled square */
+export function IconStop({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <rect
+        x="4"
+        y="4"
+        width="8"
+        height="8"
+        rx="1.2"
+        fill="currentColor"
+        stroke="none"
+      />
     </Svg>
   );
 }

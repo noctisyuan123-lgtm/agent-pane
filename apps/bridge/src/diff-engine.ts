@@ -3,7 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import type { DiffFileMeta } from "@agent-pane/shared";
-import type { SnapshotInfo } from "./workspace-snapshot.js";
+import {
+  loadSnapshotFingerprints,
+  type SnapshotInfo,
+} from "./workspace-snapshot.js";
 
 function git(cwd: string, args: string[]): string {
   try {
@@ -44,11 +47,14 @@ export function fileFingerprint(cwd: string, relPath: string): string {
 }
 
 /**
- * Diff Engine: truth = worktree vs git HEAD (dirty tree).
- * Caller may filter with Accept fingerprints so Keep 后不再弹出同内容 diff。
+ * Diff Engine: show only files that changed *during this session*.
+ *
+ * Pre-existing dirty worktree (vs HEAD) is recorded at session snapshot and
+ * filtered out — so "hello" / Read-only turns no longer dump 25 unrelated diffs.
+ * Caller may further filter with Accept fingerprints so Keep 后不再弹出同内容.
  */
 export class DiffEngine {
-  compute(cwd: string, _snapshot: SnapshotInfo | undefined): DiffFileMeta[] {
+  compute(cwd: string, snapshot: SnapshotInfo | undefined): DiffFileMeta[] {
     try {
       execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
         cwd,
@@ -61,12 +67,23 @@ export class DiffEngine {
     const status = git(cwd, ["status", "--porcelain", "-uall"]);
     if (!status.trim()) return [];
 
+    const baseline = loadSnapshotFingerprints(snapshot);
+
     const files: DiffFileMeta[] = [];
     for (const line of status.split("\n").filter(Boolean)) {
       const xy = line.slice(0, 2);
       let filePath = line.slice(3).trim();
       if (filePath.includes(" -> ")) {
         filePath = filePath.split(" -> ").pop()!;
+      }
+
+      // Skip paths unchanged since session open (already dirty before New Agent)
+      if (baseline) {
+        const nowFp = fileFingerprint(cwd, filePath);
+        const baseFp = baseline.get(filePath);
+        if (baseFp != null && baseFp === nowFp) {
+          continue;
+        }
       }
 
       let statusKind: DiffFileMeta["status"] = "modified";

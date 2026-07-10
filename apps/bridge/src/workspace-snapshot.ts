@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export type SnapshotInfo = {
   snapshotId: string;
@@ -11,6 +11,64 @@ export type SnapshotInfo = {
   /** git: commit/tree-ish or "WORKTREE_BASE"; files: backup dir */
   ref: string;
 };
+
+function hashFile(abs: string): string {
+  try {
+    if (!fs.existsSync(abs)) return "missing";
+    const st = fs.statSync(abs);
+    if (st.isDirectory()) return `dir:${st.mtimeMs}`;
+    const buf = fs.readFileSync(abs);
+    return createHash("sha256").update(buf).digest("hex");
+  } catch {
+    return "error";
+  }
+}
+
+/** Session-start fingerprints for paths that were already dirty. */
+export function loadSnapshotFingerprints(
+  snapshot: SnapshotInfo | undefined
+): Map<string, string> | null {
+  if (!snapshot) return null;
+  const root =
+    snapshot.kind === "files"
+      ? snapshot.ref
+      : path.join(
+          process.env.HOME || os.homedir(),
+          ".agent-pane",
+          "snapshots",
+          snapshot.snapshotId
+        );
+  const fpPath = path.join(root, "fingerprints.json");
+  try {
+    if (fs.existsSync(fpPath)) {
+      const obj = JSON.parse(fs.readFileSync(fpPath, "utf8")) as Record<
+        string,
+        string
+      >;
+      return new Map(Object.entries(obj));
+    }
+  } catch {
+    /* fall through */
+  }
+  // Older snapshots: hash backup copies under files/
+  const filesDir = path.join(root, "files");
+  const map = new Map<string, string>();
+  if (!fs.existsSync(filesDir)) return map;
+  const walk = (dir: string, prefix: string) => {
+    for (const name of fs.readdirSync(dir)) {
+      const abs = path.join(dir, name);
+      const rel = prefix ? `${prefix}/${name}` : name;
+      try {
+        if (fs.statSync(abs).isDirectory()) walk(abs, rel);
+        else map.set(rel, hashFile(abs));
+      } catch {
+        /* skip */
+      }
+    }
+  };
+  walk(filesDir, "");
+  return map;
+}
 
 function isGitRepo(cwd: string): boolean {
   try {
@@ -88,7 +146,9 @@ export class WorkspaceSnapshotService {
         ref: head,
       };
       fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2));
-      // backup currently dirty files
+      // backup currently dirty files + fingerprints so Diff UI only shows
+      // changes *after* session start (not pre-existing dirty worktree)
+      const fingerprints: Record<string, string> = {};
       for (const line of status.split("\n").filter(Boolean)) {
         const p = line.slice(3).trim().split(" -> ").pop()!;
         const abs = path.join(cwd, p);
@@ -97,11 +157,20 @@ export class WorkspaceSnapshotService {
           fs.mkdirSync(path.dirname(dest), { recursive: true });
           try {
             fs.copyFileSync(abs, dest);
+            fingerprints[p] = hashFile(abs);
           } catch {
             /* skip */
           }
+        } else {
+          // deleted / missing at session open
+          fingerprints[p] = "missing";
         }
       }
+      fs.writeFileSync(
+        path.join(dir, "fingerprints.json"),
+        JSON.stringify(fingerprints, null, 2),
+        "utf8"
+      );
       this.snapshots.set(sessionId, meta);
       return meta;
     }

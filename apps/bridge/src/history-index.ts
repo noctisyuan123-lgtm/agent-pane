@@ -14,6 +14,8 @@ export type SessionMeta = {
   pinned?: boolean;
   unread?: boolean;
   archived?: boolean;
+  /** Grok ACP provider session id — used for session/load resume */
+  providerSessionId?: string;
 };
 
 export type HistoryGroup = {
@@ -23,10 +25,53 @@ export type HistoryGroup = {
 };
 
 const ROOT = path.join(os.homedir(), ".agent-pane", "sessions");
+/** Pins live in a dedicated store (like grok-desktop-code) so meta rewrites never drop them */
+const PINS_PATH = path.join(os.homedir(), ".agent-pane", "pins.json");
 
 /** In-memory caches — avoid re-scanning disk on every sidebar open */
 let listCache: { at: number; groups: HistoryGroup[] } | null = null;
 const LIST_TTL_MS = 12_000;
+
+// ── Pin store (sessionId → true) ──────────────────────────────────────
+function readPinSet(): Set<string> {
+  try {
+    if (!fs.existsSync(PINS_PATH)) return new Set();
+    const raw = JSON.parse(fs.readFileSync(PINS_PATH, "utf8")) as unknown;
+    if (Array.isArray(raw)) return new Set(raw.map(String));
+    if (raw && typeof raw === "object") {
+      // support { ids: string[] } or Record<id, true>
+      const o = raw as Record<string, unknown>;
+      if (Array.isArray(o.ids)) return new Set(o.ids.map(String));
+      return new Set(Object.keys(o).filter((k) => o[k]));
+    }
+  } catch {
+    /* ignore */
+  }
+  return new Set();
+}
+
+function writePinSet(ids: Set<string>): void {
+  ensureRoot();
+  const dir = path.dirname(PINS_PATH);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    PINS_PATH,
+    JSON.stringify({ ids: [...ids] }, null, 2),
+    "utf8"
+  );
+  invalidateHistoryListCache();
+}
+
+export function isPinned(sessionId: string): boolean {
+  return readPinSet().has(sessionId);
+}
+
+export function setPinned(sessionId: string, pinned: boolean): void {
+  const set = readPinSet();
+  if (pinned) set.add(sessionId);
+  else set.delete(sessionId);
+  writePinSet(set);
+}
 
 const eventsCache = new Map<
   string,
@@ -55,11 +100,25 @@ function eventsPath(sessionId: string): string {
   return path.join(ROOT, sessionId, "events.jsonl");
 }
 
+/** Never return meta without a usable title. */
+function ensureTitle(sessionId: string, title: string | undefined | null): string {
+  const t = (title || "").trim();
+  if (t && t !== "Untitled") return t.slice(0, 80);
+  const derived = deriveMetaFromEvents(sessionId);
+  const d = (derived?.title || "").trim();
+  if (d && d !== "New session" && d !== "Untitled") return d.slice(0, 80);
+  return t || "New session";
+}
+
 export function readMeta(sessionId: string): SessionMeta | null {
   try {
     const p = metaPath(sessionId);
     if (!fs.existsSync(p)) return null;
-    return JSON.parse(fs.readFileSync(p, "utf8")) as SessionMeta;
+    const meta = JSON.parse(fs.readFileSync(p, "utf8")) as SessionMeta;
+    // Overlay pin from dedicated store (source of truth)
+    meta.pinned = isPinned(sessionId) || !!meta.pinned;
+    meta.title = ensureTitle(sessionId, meta.title);
+    return meta;
   } catch {
     return null;
   }
@@ -69,7 +128,14 @@ export function writeMeta(meta: SessionMeta): void {
   ensureRoot();
   const dir = path.join(ROOT, meta.sessionId);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(metaPath(meta.sessionId), JSON.stringify(meta, null, 2), "utf8");
+  // Always persist a real title — JSON.stringify drops undefined, which
+  // made the UI show "Untitled" after pin/resume rewrites.
+  const fixed: SessionMeta = {
+    ...meta,
+    title: ensureTitle(meta.sessionId, meta.title),
+    pinned: isPinned(meta.sessionId) || !!meta.pinned,
+  };
+  fs.writeFileSync(metaPath(meta.sessionId), JSON.stringify(fixed, null, 2), "utf8");
   invalidateHistoryListCache();
 }
 
@@ -79,32 +145,37 @@ export function upsertMeta(patch: {
   cwd?: string;
   title?: string;
   bumpMessage?: boolean;
+  providerSessionId?: string;
 }): SessionMeta {
   const prev = readMeta(patch.sessionId);
   const now = new Date().toISOString();
+  const prevTitle = (prev?.title || "").trim();
+  const patchTitle = (patch.title || "").trim().slice(0, 80);
+  // Once a real title is set (not empty / default), keep it — never clobber
+  // with later turns or wipe on resume-only upserts.
+  const keepTitle =
+    prevTitle &&
+    prevTitle !== "New session" &&
+    prevTitle !== "Untitled" &&
+    (prev?.messageCount ?? 0) > 0;
+  const title = keepTitle
+    ? prevTitle
+    : patchTitle || prevTitle || "New session";
+
   const meta: SessionMeta = {
     sessionId: patch.sessionId,
     cwd: patch.cwd ?? prev?.cwd ?? "",
-    title: patch.title?.trim()
-      ? patch.title.trim().slice(0, 80)
-      : prev?.title || "New session",
+    title: ensureTitle(patch.sessionId, title),
     createdAt: prev?.createdAt ?? now,
     updatedAt: now,
     messageCount: (prev?.messageCount ?? 0) + (patch.bumpMessage ? 1 : 0),
+    providerSessionId:
+      patch.providerSessionId ?? prev?.providerSessionId,
+    // Pin from dedicated store (never lost on upsert)
+    pinned: isPinned(patch.sessionId) || !!prev?.pinned,
+    unread: prev?.unread,
+    archived: prev?.archived,
   };
-  // first real title wins unless still default
-  if (
-    patch.title?.trim() &&
-    prev?.title &&
-    prev.title !== "New session" &&
-    !patch.title
-  ) {
-    meta.title = prev.title;
-  }
-  if (prev?.title && prev.title !== "New session" && patch.title) {
-    // keep first user message as title once set
-    if (prev.messageCount > 0) meta.title = prev.title;
-  }
   writeMeta(meta);
   return meta;
 }
@@ -172,12 +243,45 @@ export function listHistory(force = false): HistoryGroup[] {
     } catch {
       continue;
     }
+    // Zombie: meta or empty dir without any real events — hide and self-heal
+    if (!hasReplayableEvents(id)) {
+      try {
+        const metaOnly = readMeta(id);
+        const ev = eventsPath(id);
+        const emptyOrMissing =
+          !fs.existsSync(ev) || fs.statSync(ev).size === 0;
+        // Keep draft shells with only SessionStarted (still no history entry).
+        // Drop meta-only / empty corpses so they never stick in the sidebar.
+        if (metaOnly && emptyOrMissing) {
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
     let meta = readMeta(id);
     if (!meta) {
       meta = deriveMetaFromEvents(id);
-      if (meta) writeMeta(meta);
+      // Only persist meta once there's a real conversation — drafts stay disk-only
+      if (meta && !isDraftSession(meta)) {
+        meta.pinned = isPinned(id);
+        writeMeta(meta);
+      }
+    } else {
+      // Migrate legacy meta.pinned → pins.json once
+      if (meta.pinned && !isPinned(id)) setPinned(id, true);
+      // Always overlay pin store + ensure title before listing
+      const before = JSON.stringify({ t: meta.title, p: meta.pinned });
+      meta = {
+        ...meta,
+        title: ensureTitle(id, meta.title),
+        pinned: isPinned(id) || !!meta.pinned,
+      };
+      const after = JSON.stringify({ t: meta.title, p: meta.pinned });
+      if (before !== after && !isDraftSession(meta)) writeMeta(meta);
     }
-    if (meta) sessions.push(meta);
+    if (meta && !isDraftSession(meta)) sessions.push(meta);
   }
 
   sessions.sort(
@@ -186,8 +290,8 @@ export function listHistory(force = false): HistoryGroup[] {
   );
 
   const byCwd = new Map<string, SessionMeta[]>();
-  // 默认不展示已归档（可用 includeArchived）
-  const active = sessions.filter((s) => !s.archived);
+  // 默认不展示已归档；空 New session（未发过消息）不进 history
+  const active = sessions.filter((s) => !s.archived && !isDraftSession(s));
 
   for (const s of active) {
     const key = s.cwd || "(unknown)";
@@ -273,21 +377,108 @@ export function patchMeta(
   if (!prev) return null;
   const next: SessionMeta = {
     ...prev,
-    ...patch,
     updatedAt: new Date().toISOString(),
   };
-  if (patch.title != null) next.title = String(patch.title).slice(0, 80);
+  // Apply only defined fields — never spread undefined over title/pin
+  if (patch.title != null && String(patch.title).trim()) {
+    next.title = String(patch.title).trim().slice(0, 80);
+  }
+  if (typeof patch.pinned === "boolean") {
+    setPinned(sessionId, patch.pinned);
+    next.pinned = patch.pinned;
+  } else {
+    next.pinned = isPinned(sessionId) || !!prev.pinned;
+  }
+  if (typeof patch.unread === "boolean") next.unread = patch.unread;
+  if (typeof patch.archived === "boolean") next.archived = patch.archived;
+  if (patch.cwd != null) next.cwd = patch.cwd;
+  next.title = ensureTitle(sessionId, next.title);
   writeMeta(next);
   return next;
 }
 
+/**
+ * Remove a session from disk. Idempotent: missing dir still counts as success
+ * so UI never gets a raw `{"ok":false}` from double-delete / race.
+ */
 export function deleteSession(sessionId: string): boolean {
   const dir = path.join(ROOT, sessionId);
-  if (!fs.existsSync(dir)) return false;
-  fs.rmSync(dir, { recursive: true, force: true });
+  try {
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  } catch (e) {
+    console.error("[history] deleteSession failed", sessionId, e);
+    return false;
+  }
+  // Belt-and-suspenders: if a late write recreated the folder, kill it again
+  try {
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  } catch {
+    /* ignore */
+  }
   invalidateHistoryListCache();
   invalidateSessionEventsCache(sessionId);
   return true;
+}
+
+/** True if the session has no real conversation yet (draft / abandoned New Agent). */
+export function isDraftSession(meta: SessionMeta): boolean {
+  return (meta.messageCount ?? 0) <= 0;
+}
+
+/** Has at least one user message on disk — otherwise not openable history. */
+export function hasReplayableEvents(sessionId: string): boolean {
+  const p = eventsPath(sessionId);
+  if (!fs.existsSync(p)) return false;
+  try {
+    const lines = fs.readFileSync(p, "utf8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line) as { type?: string };
+        if (e.type === "UserMessageAppended") return true;
+      } catch {
+        /* skip */
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Drop abandoned empty sessions (messageCount 0), optionally keeping the live one.
+ * Called when starting a New Agent so history doesn't pile up with "New session".
+ */
+export function pruneDraftSessions(opts?: {
+  keepSessionId?: string;
+  cwd?: string;
+}): number {
+  ensureRoot();
+  let removed = 0;
+  let dirs: string[] = [];
+  try {
+    dirs = fs.readdirSync(ROOT);
+  } catch {
+    return 0;
+  }
+  for (const id of dirs) {
+    if (opts?.keepSessionId && id === opts.keepSessionId) continue;
+    const dir = path.join(ROOT, id);
+    try {
+      if (!fs.statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const meta = readMeta(id) ?? deriveMetaFromEvents(id);
+    if (!meta || !isDraftSession(meta)) continue;
+    if (opts?.cwd && meta.cwd && meta.cwd !== opts.cwd) continue;
+    if (deleteSession(id)) removed++;
+  }
+  return removed;
 }
 
 /** Fork = copy events.jsonl + meta under new id */

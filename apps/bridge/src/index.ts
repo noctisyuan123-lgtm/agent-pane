@@ -23,7 +23,10 @@ const sessions = new SessionManager({
 
 const server = http.createServer(async (req, res) => {
   try {
-    const handled = await handleHttp(req, res);
+    const handled = await handleHttp(req, res, {
+      stopSession: (id) => sessions.stopSession(id),
+      purgeSession: (id) => sessions.purgeSession(id),
+    });
     if (!handled) {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "not found" }));

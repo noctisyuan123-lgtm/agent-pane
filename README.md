@@ -31,7 +31,7 @@ apps/desktop/src-tauri/target/release/bundle/dmg/Agent Pane_0.1.0_aarch64.dmg
 重新打包：
 
 ```bash
-cd ~/projects/agent-pane
+cd ~/agent-pane
 npm install
 # 若 cargo 拉 crates 失败，确保代理可用后：
 export http_proxy=http://127.0.0.1:7892 https_proxy=http://127.0.0.1:7892
@@ -47,7 +47,7 @@ npm run desktop:dev   # 需另开或自动起 web dev server
 ## Web 开发模式
 
 ```bash
-cd ~/projects/agent-pane
+cd ~/agent-pane
 npm install
 npm run build -w @agent-pane/shared
 

@@ -62,7 +62,7 @@ export async function fetchSessionEvents(
   if (!res.ok) {
     // 失败时才回退缓存
     if (hit?.events?.length) return hit.events;
-    throw new Error(`加载历史失败 HTTP ${res.status}`);
+    throw new Error(`Failed to load history HTTP ${res.status}`);
   }
   const data = (await res.json()) as { events: unknown[] };
   const events = data.events ?? [];
@@ -112,7 +112,16 @@ export async function deleteSessionApi(sessionId: string): Promise<void> {
     `${BRIDGE_HTTP}/api/history/${encodeURIComponent(sessionId)}`,
     { method: "DELETE" }
   );
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) {
+    let msg = `Delete failed (HTTP ${res.status})`;
+    try {
+      const body = (await res.json()) as { error?: string; ok?: boolean };
+      if (body.error) msg = body.error;
+    } catch {
+      /* keep default */
+    }
+    throw new Error(msg);
+  }
   invalidateHistoryClientCache(sessionId);
 }
 
@@ -155,10 +164,56 @@ export async function fetchProjects(): Promise<ProjectEntry[]> {
   return data.projects ?? [];
 }
 
+export type SkillEntry = {
+  name: string;
+  description: string;
+  source: string;
+  dir: string;
+};
+
+export async function fetchSkills(cwd?: string): Promise<SkillEntry[]> {
+  const q = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
+  const res = await fetch(`${BRIDGE_HTTP}/api/skills${q}`);
+  if (!res.ok) return [];
+  const data = (await res.json()) as { skills: SkillEntry[] };
+  return data.skills ?? [];
+}
+
 export async function rememberPath(p: string): Promise<void> {
   await fetch(`${BRIDGE_HTTP}/api/recent`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path: p }),
   }).catch(() => undefined);
+}
+
+/** Persist a dropped/pasted file for attachment (returns absolute path). */
+export async function uploadAttachment(input: {
+  name: string;
+  base64: string;
+  mime?: string;
+}): Promise<{ path: string; name: string; size: number }> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/upload`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(t || `Upload failed HTTP ${res.status}`);
+  }
+  return (await res.json()) as { path: string; name: string; size: number };
+}
+
+export function fileToBase64(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result || "");
+      const i = s.indexOf(",");
+      resolve(i >= 0 ? s.slice(i + 1) : s);
+    };
+    r.onerror = () => reject(r.error || new Error("read failed"));
+    r.readAsDataURL(file);
+  });
 }

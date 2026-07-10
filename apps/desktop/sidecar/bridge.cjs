@@ -2273,7 +2273,7 @@ var require_websocket = __commonJS({
     var http2 = require("http");
     var net = require("net");
     var tls = require("tls");
-    var { randomBytes, createHash: createHash2 } = require("crypto");
+    var { randomBytes, createHash: createHash3 } = require("crypto");
     var { Duplex, Readable } = require("stream");
     var { URL: URL2 } = require("url");
     var PerMessageDeflate2 = require_permessage_deflate();
@@ -2941,7 +2941,7 @@ var require_websocket = __commonJS({
           abortHandshake(websocket, socket, "Invalid Upgrade header");
           return;
         }
-        const digest = createHash2("sha1").update(key + GUID).digest("base64");
+        const digest = createHash3("sha1").update(key + GUID).digest("base64");
         if (res.headers["sec-websocket-accept"] !== digest) {
           abortHandshake(websocket, socket, "Invalid Sec-WebSocket-Accept header");
           return;
@@ -3310,7 +3310,7 @@ var require_websocket_server = __commonJS({
     var EventEmitter = require("events");
     var http2 = require("http");
     var { Duplex } = require("stream");
-    var { createHash: createHash2 } = require("crypto");
+    var { createHash: createHash3 } = require("crypto");
     var extension2 = require_extension();
     var PerMessageDeflate2 = require_permessage_deflate();
     var subprotocol2 = require_subprotocol();
@@ -3617,7 +3617,7 @@ var require_websocket_server = __commonJS({
           );
         }
         if (this._state > RUNNING) return abortHandshake(socket, 503);
-        const digest = createHash2("sha1").update(key + GUID).digest("base64");
+        const digest = createHash3("sha1").update(key + GUID).digest("base64");
         const headers = [
           "HTTP/1.1 101 Switching Protocols",
           "Upgrade: websocket",
@@ -3734,15 +3734,45 @@ var EventStore = class {
     this.root = root ?? import_node_path.default.join(import_node_os.default.homedir(), ".agent-pane", "sessions");
     import_node_fs.default.mkdirSync(this.root, { recursive: true });
   }
-  sessionDir(sessionId) {
+  sessionDir(sessionId, create) {
     const dir = import_node_path.default.join(this.root, sessionId);
-    import_node_fs.default.mkdirSync(dir, { recursive: true });
+    if (create) import_node_fs.default.mkdirSync(dir, { recursive: true });
     return dir;
   }
-  eventsPath(sessionId) {
-    return import_node_path.default.join(this.sessionDir(sessionId), "events.jsonl");
+  eventsPath(sessionId, create = false) {
+    return import_node_path.default.join(this.sessionDir(sessionId, create), "events.jsonl");
+  }
+  /**
+   * Ensure in-memory seq cursor is at least as high as anything already on disk.
+   * Without this, after bridge restart / resume the cursor resets to 0 and new
+   * events reuse seq 1..N — UI seenSeq then drops them as "already applied"
+   * from the history replay. That was "resume works on disk but UI blank".
+   */
+  ensureSessionLoaded(sessionId) {
+    if (!this.memory.has(sessionId)) {
+      this.loadFromDisk(sessionId);
+      return;
+    }
+    const cursor = this.seqBySession.get(sessionId) ?? 0;
+    const p = this.eventsPath(sessionId, false);
+    if (!import_node_fs.default.existsSync(p)) return;
+    try {
+      const lines = import_node_fs.default.readFileSync(p, "utf8").split("\n").filter(Boolean);
+      let maxSeq = cursor;
+      for (const line of lines) {
+        try {
+          const e = JSON.parse(line);
+          if ((e.seq ?? 0) > maxSeq) maxSeq = e.seq ?? 0;
+        } catch {
+        }
+      }
+      if (lines.length > maxSeq) maxSeq = lines.length;
+      if (maxSeq > cursor) this.seqBySession.set(sessionId, maxSeq);
+    } catch {
+    }
   }
   append(event) {
+    this.ensureSessionLoaded(event.sessionId);
     const prev = this.seqBySession.get(event.sessionId) ?? 0;
     const seq = prev + 1;
     this.seqBySession.set(event.sessionId, seq);
@@ -3750,7 +3780,11 @@ var EventStore = class {
     const list = this.memory.get(event.sessionId) ?? [];
     list.push(stored);
     this.memory.set(event.sessionId, list);
-    import_node_fs.default.appendFileSync(this.eventsPath(event.sessionId), JSON.stringify(stored) + "\n", "utf8");
+    import_node_fs.default.appendFileSync(
+      this.eventsPath(event.sessionId, true),
+      JSON.stringify(stored) + "\n",
+      "utf8"
+    );
     return stored;
   }
   list(sessionId, fromSeq = 0) {
@@ -3761,9 +3795,10 @@ var EventStore = class {
     return list.filter((e) => (e.seq ?? 0) > fromSeq);
   }
   loadFromDisk(sessionId) {
-    const p = this.eventsPath(sessionId);
+    const p = this.eventsPath(sessionId, false);
     if (!import_node_fs.default.existsSync(p)) {
       this.memory.set(sessionId, []);
+      this.seqBySession.set(sessionId, 0);
       return;
     }
     const lines = import_node_fs.default.readFileSync(p, "utf8").split("\n").filter(Boolean);
@@ -3773,12 +3808,18 @@ var EventStore = class {
       try {
         const e = JSON.parse(line);
         events.push(e);
-        if (e.seq > maxSeq) maxSeq = e.seq;
+        if ((e.seq ?? 0) > maxSeq) maxSeq = e.seq ?? 0;
       } catch {
       }
     }
+    if (lines.length > maxSeq) maxSeq = lines.length;
     this.memory.set(sessionId, events);
     this.seqBySession.set(sessionId, maxSeq);
+  }
+  /** Drop in-memory state after disk delete so zombies cannot reappear. */
+  purge(sessionId) {
+    this.memory.delete(sessionId);
+    this.seqBySession.delete(sessionId);
   }
   listSessions() {
     if (!import_node_fs.default.existsSync(this.root)) return [];
@@ -3812,12 +3853,32 @@ var GrokAcpAdapter = class {
   /** 当前 turn 是否已被用户取消（忽略后续 stream，直到下次 prompt） */
   turnCancelled = false;
   promptInFlight = false;
+  /** Called when the child process dies unexpectedly (not after stop()). */
+  deadHandlers = [];
+  /**
+   * While true, drop session/update notifications (session/load replays history
+   * as updates — must not re-append into our event log / UI).
+   */
+  absorbUpdates = false;
+  /** If session/load fails, first prompt gets a short history preamble. */
+  contextPrefix = null;
+  /** ACP terminal/create sessions */
+  terminals = /* @__PURE__ */ new Map();
   constructor(opts) {
     this.grokBin = opts?.grokBin ?? process.env.GROK_BIN ?? `${process.env.HOME}/.grok/bin/grok`;
     this.autoApprove = opts?.autoApprove ?? process.env.AGENT_PANE_PERMISSION !== "ask";
   }
   onEvent(handler) {
     this.handlers.push(handler);
+  }
+  onDead(handler) {
+    this.deadHandlers.push(handler);
+  }
+  /** Child still running and stdin open. */
+  isAlive() {
+    return Boolean(
+      this.proc && !this.closed && this.proc.exitCode === null && this.proc.killed !== true && this.proc.stdin && !this.proc.stdin.destroyed
+    );
   }
   emit(event) {
     for (const h of this.handlers) {
@@ -3832,12 +3893,28 @@ var GrokAcpAdapter = class {
     if (!this.proc?.stdin) return;
     this.proc.stdin.write(JSON.stringify(obj) + "\n");
   }
-  send(method, params) {
-    if (!this.proc?.stdin) return Promise.reject(new Error("Agent not started"));
+  send(method, params, timeoutMs = 12e4) {
+    if (!this.proc?.stdin || this.closed) {
+      return Promise.reject(new Error("Agent not started"));
+    }
     const id = this.nextId++;
     this.write({ jsonrpc: "2.0", id, method, params });
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        reject(new Error(`${method} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        }
+      });
     });
   }
   reply(id, result) {
@@ -3918,6 +3995,7 @@ var GrokAcpAdapter = class {
           summary: JSON.stringify(p).slice(0, 500),
           at: nowIso()
         });
+        this.emitActivity(`Permission: ${tool}`, "permission");
         if (this.autoApprove) {
           const optionId = options.find((o) => o.kind === "allow_always")?.optionId ?? options.find((o) => o.kind === "allow_once")?.optionId ?? options[0]?.optionId ?? "allow-once";
           this.reply(id, {
@@ -3930,9 +4008,70 @@ var GrokAcpAdapter = class {
             allow: true,
             at: nowIso()
           });
+          this.emitActivity(null);
         } else {
           this.pendingPermissions.set(requestId, { rpcId: id, options });
         }
+        return;
+      }
+      if (method === "terminal/create") {
+        const termId = this.createTerminal(p);
+        this.reply(id, { terminalId: termId });
+        return;
+      }
+      if (method === "terminal/output") {
+        const term = this.terminals.get(String(p.terminalId ?? ""));
+        if (!term) {
+          this.replyError(id, `Unknown terminal: ${p.terminalId}`);
+          return;
+        }
+        this.reply(id, {
+          output: term.output,
+          truncated: term.truncated,
+          exitStatus: term.exited ? { exitCode: term.exitCode, signal: term.signal } : null
+        });
+        return;
+      }
+      if (method === "terminal/wait_for_exit") {
+        const term = this.terminals.get(String(p.terminalId ?? ""));
+        if (!term) {
+          this.replyError(id, `Unknown terminal: ${p.terminalId}`);
+          return;
+        }
+        if (term.exited) {
+          this.reply(id, { exitCode: term.exitCode, signal: term.signal });
+          return;
+        }
+        await new Promise((resolve) => {
+          term.waiters.push(resolve);
+        });
+        this.reply(id, { exitCode: term.exitCode, signal: term.signal });
+        return;
+      }
+      if (method === "terminal/kill") {
+        const term = this.terminals.get(String(p.terminalId ?? ""));
+        if (term && !term.exited) {
+          try {
+            term.proc.kill("SIGTERM");
+          } catch {
+          }
+        }
+        this.reply(id, {});
+        return;
+      }
+      if (method === "terminal/release") {
+        const tid = String(p.terminalId ?? "");
+        const term = this.terminals.get(tid);
+        if (term) {
+          if (!term.exited) {
+            try {
+              term.proc.kill("SIGTERM");
+            } catch {
+            }
+          }
+          this.terminals.delete(tid);
+        }
+        this.reply(id, {});
         return;
       }
       console.warn("[adapter] unhandled server request", method);
@@ -3968,11 +4107,123 @@ var GrokAcpAdapter = class {
     import_node_fs2.default.mkdirSync(import_node_path2.default.dirname(resolved), { recursive: true });
     import_node_fs2.default.writeFileSync(resolved, content, "utf8");
   }
+  emitActivity(text, phase) {
+    if (!this.domainSessionId) return;
+    this.emit({
+      type: "AgentActivity",
+      sessionId: this.domainSessionId,
+      text,
+      phase,
+      at: nowIso()
+    });
+  }
+  createTerminal(p) {
+    const id = `term-${(0, import_node_crypto.randomUUID)()}`;
+    const command = String(p.command ?? "");
+    const args = Array.isArray(p.args) ? p.args.map(String) : [];
+    const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : this.cwd || process.cwd();
+    const byteLimit = typeof p.outputByteLimit === "number" && p.outputByteLimit > 0 ? p.outputByteLimit : 1048576;
+    const envList = Array.isArray(p.env) ? p.env : [];
+    const env = { ...process.env };
+    for (const e of envList) {
+      if (e?.name) env[e.name] = String(e.value ?? "");
+    }
+    const useShell = args.length === 0 && /[\s'"|&;<>]/.test(command);
+    const proc = useShell ? (0, import_node_child_process.spawn)(command, {
+      cwd,
+      env,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    }) : (0, import_node_child_process.spawn)(command || "/bin/bash", args.length ? args : ["-lc", "true"], {
+      cwd,
+      env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    const term = {
+      id,
+      proc,
+      output: "",
+      truncated: false,
+      exitCode: null,
+      signal: null,
+      exited: false,
+      waiters: [],
+      byteLimit
+    };
+    const append = (chunk) => {
+      const s = chunk.toString("utf8");
+      term.output += s;
+      if (term.output.length > term.byteLimit) {
+        term.output = term.output.slice(term.output.length - term.byteLimit);
+        term.truncated = true;
+      }
+      const last = s.trim().split("\n").filter(Boolean).pop();
+      if (last) {
+        this.emitActivity(
+          last.length > 80 ? `${last.slice(0, 80)}\u2026` : last,
+          "sleeping"
+        );
+      }
+    };
+    proc.stdout?.on("data", append);
+    proc.stderr?.on("data", append);
+    proc.on("error", (err) => {
+      term.output += `
+[spawn error] ${err.message}`;
+      term.exitCode = 1;
+      term.exited = true;
+      for (const w of term.waiters.splice(0)) w();
+    });
+    proc.on("close", (code, signal) => {
+      term.exitCode = code;
+      term.signal = signal;
+      term.exited = true;
+      for (const w of term.waiters.splice(0)) w();
+      this.emitActivity(null);
+    });
+    this.terminals.set(id, term);
+    const label = useShell ? command.slice(0, 60) : `${command} ${args.join(" ")}`.trim().slice(0, 60);
+    this.emitActivity(`Running ${label}${label.length >= 60 ? "\u2026" : ""}`, "tool");
+    return id;
+  }
   handleNotification(method, params) {
     const p = params ?? {};
     if (method === "session/update") {
       const update = p.update ?? p;
       this.mapSessionUpdate(update);
+      return;
+    }
+    if (method === "_x.ai/sessions/changed" || method === "x.ai/sessions/changed") {
+      const upserted = p.upserted ?? [];
+      for (const u of upserted) {
+        if (String(u.sessionId ?? "") !== this.providerSessionId) continue;
+        const activity = String(u.activity ?? "");
+        if (activity === "working") {
+          this.emitActivity("Working\u2026", "working");
+        } else if (activity === "idle") {
+          this.emitActivity(null, "idle");
+        }
+      }
+      return;
+    }
+    if (method === "_x.ai/queue/changed" || method === "x.ai/queue/changed") {
+      if (String(p.sessionId ?? "") && String(p.sessionId) !== this.providerSessionId) {
+        return;
+      }
+      const entries = p.entries ?? [];
+      const running = p.runningPromptId ? String(p.runningPromptId) : "";
+      const head = entries[0];
+      if (head?.text?.trim().startsWith("/compact")) {
+        this.emitActivity("Compacting conversation\u2026", "compact");
+      } else if (running && head?.text) {
+        this.emitActivity(
+          `Queued: ${String(head.text).slice(0, 60)}`,
+          "queue"
+        );
+      } else if (running) {
+        this.emitActivity("Waiting for model\u2026", "working");
+      }
       return;
     }
     if (method === "_x.ai/session_notification" || method === "x.ai/session_notification") {
@@ -3982,7 +4233,7 @@ var GrokAcpAdapter = class {
         const toolId = String(update.tool_call_id ?? update.toolCallId ?? "delta");
         const name = String(update.name ?? "");
         const argDelta = update.arguments_delta;
-        if (name) {
+        if (name && !name.startsWith("pending")) {
           this.emit({
             type: "ToolProgress",
             sessionId: this.domainSessionId,
@@ -3990,15 +4241,27 @@ var GrokAcpAdapter = class {
             detail: name + (argDelta ? ` ${String(argDelta).slice(0, 120)}` : ""),
             at: nowIso()
           });
+          this.emitActivity(`Calling ${name}\u2026`, "tool");
         }
       } else if (kind === "pending_interaction") {
-        this.emit({
-          type: "ToolProgress",
-          sessionId: this.domainSessionId,
-          toolId: String(update.tool_call_id ?? "interaction"),
-          detail: `pending: ${update.kind ?? "interaction"}`,
-          at: nowIso()
-        });
+        const ik = String(update.kind ?? "interaction");
+        if (ik === "permission") {
+          this.emitActivity("Waiting for permission\u2026", "permission");
+        } else {
+          this.emitActivity(`Waiting: ${ik}\u2026`, "working");
+        }
+      } else if (kind === "interaction_resolved") {
+        this.emitActivity(null);
+      } else if (kind === "auto_compact_started" || kind === "compact_started" || kind === "compacting") {
+        this.emitActivity("Compacting conversation\u2026", "compact");
+      } else if (kind === "auto_compact_completed" || kind === "compact_completed") {
+        const before = update.tokens_before ?? update.tokensBefore;
+        const after = update.tokens_after ?? update.tokensAfter;
+        const msg = before != null && after != null ? `Compacted \xB7 ${before} \u2192 ${after} tokens` : "Compact complete";
+        this.emitActivity(msg, "compact");
+        setTimeout(() => this.emitActivity(null), 8e3);
+      } else if (kind === "turn_completed") {
+      } else if (kind === "session_summary_generated") {
       }
     }
   }
@@ -4006,6 +4269,9 @@ var GrokAcpAdapter = class {
     const kind = String(update.sessionUpdate ?? update.type ?? "");
     const sid = this.domainSessionId;
     const at = nowIso();
+    if (this.absorbUpdates) {
+      return;
+    }
     if (this.turnCancelled && (kind === "agent_message_chunk" || kind === "agent_thought_chunk" || kind === "tool_call" || kind === "tool_call_update" || kind === "plan")) {
       return;
     }
@@ -4029,6 +4295,7 @@ var GrokAcpAdapter = class {
         const text = content?.text ?? update.text ?? "";
         if (text) {
           this.emit({ type: "ThoughtChunk", sessionId: sid, text, at });
+          this.emitActivity("Thinking\u2026", "thinking");
         }
         break;
       }
@@ -4045,6 +4312,10 @@ var GrokAcpAdapter = class {
           inputSummary: summarize(update.rawInput ?? update.input ?? update.arguments),
           at
         });
+        this.emitActivity(
+          title.startsWith("Execute") || toolKind === "execute" ? `${title.slice(0, 72)}${title.length > 72 ? "\u2026" : ""}` : `Using ${title.slice(0, 60)}\u2026`,
+          "tool"
+        );
         break;
       }
       case "tool_call_update": {
@@ -4100,7 +4371,7 @@ var GrokAcpAdapter = class {
     this.cwd = opts.cwd;
     this.model = opts.model;
     this.closed = false;
-    this.domainSessionId = (0, import_node_crypto.randomUUID)();
+    this.domainSessionId = opts.domainSessionId ?? (0, import_node_crypto.randomUUID)();
     if (opts.permissionMode === "default" || opts.permissionMode === "ask") {
       this.autoApprove = false;
     } else {
@@ -4123,43 +4394,88 @@ var GrokAcpAdapter = class {
     this.rl = readline.createInterface({ input: this.proc.stdout });
     this.rl.on("line", (line) => this.handleLine(line));
     this.proc.on("exit", (code) => {
-      if (!this.closed) {
+      const unexpected = !this.closed;
+      this.proc = null;
+      if (unexpected) {
         this.emit({
           type: "SessionError",
           sessionId: this.domainSessionId,
-          message: `grok agent exited (${code})`,
+          message: `grok agent exited (${code}) \u2014 send again to resume`,
           at: nowIso()
         });
+        this.emit({
+          type: "SessionEnded",
+          sessionId: this.domainSessionId,
+          stopReason: `exited:${code ?? "?"}`,
+          at: nowIso()
+        });
+        for (const h of this.deadHandlers) {
+          try {
+            h(this.domainSessionId);
+          } catch (e) {
+            console.error("[adapter] onDead error", e);
+          }
+        }
       }
     });
     await this.send("initialize", {
       protocolVersion: 1,
       clientCapabilities: {
-        fs: { readTextFile: true, writeTextFile: true }
-        // Don't claim terminal until we implement terminal/* RPC
+        fs: { readTextFile: true, writeTextFile: true },
+        // Implemented: terminal/create|output|wait_for_exit|kill|release
+        terminal: true
       },
-      clientInfo: { name: "agent-pane", version: "0.1.1" }
+      clientInfo: { name: "agent-pane", version: "0.1.2" }
     });
-    const result = await this.send("session/new", {
-      cwd: opts.cwd,
-      mcpServers: []
-    });
+    this.absorbUpdates = false;
+    const result = await this.send(
+      "session/new",
+      { cwd: opts.cwd, mcpServers: [] },
+      3e4
+    );
     this.providerSessionId = result.sessionId ?? (0, import_node_crypto.randomUUID)();
-    this.emit({
-      type: "SessionStarted",
-      sessionId: this.domainSessionId,
+    return {
+      providerSessionId: this.providerSessionId,
+      domainSessionId: this.domainSessionId,
+      resumed: Boolean(opts.resumed),
       cwd: opts.cwd,
       model: opts.model,
-      at: nowIso()
-    });
-    return { providerSessionId: this.providerSessionId };
+      /** Always need digest when resumed (we no longer session/load). */
+      needsHistoryDigest: Boolean(opts.resumed)
+    };
+  }
+  /** Optional preamble for first prompt after resume-without-load. */
+  setContextPrefix(text) {
+    this.contextPrefix = text && text.trim() ? text.trim() : null;
   }
   getSessionId() {
     return this.domainSessionId;
   }
+  getProviderSessionId() {
+    return this.providerSessionId;
+  }
   async sendPrompt(input) {
+    if (!this.isAlive()) {
+      this.emit({
+        type: "SessionError",
+        sessionId: this.domainSessionId,
+        message: "grok agent not running \u2014 send again to resume",
+        at: nowIso()
+      });
+      throw new Error("agent not alive");
+    }
+    this.absorbUpdates = false;
+    let promptText = input.text;
+    if (this.contextPrefix) {
+      promptText = `${this.contextPrefix}
+
+---
+
+${input.text}`;
+      this.contextPrefix = null;
+    }
     const blocks = [
-      { type: "text", text: input.text }
+      { type: "text", text: promptText }
     ];
     if (input.attachments?.length) {
       for (const a of input.attachments) {
@@ -4170,22 +4486,33 @@ var GrokAcpAdapter = class {
         });
       }
     }
-    this.userTurns.push(input.text);
+    const shown = input.displayText ?? input.text;
     this.turnCancelled = false;
     this.promptInFlight = true;
-    this.emit({
-      type: "UserMessageAppended",
-      sessionId: this.domainSessionId,
-      text: input.text,
-      attachments: input.attachments,
-      at: nowIso()
-    });
+    if (!input.skipUserEvent) {
+      this.userTurns.push(shown);
+      this.emit({
+        type: "UserMessageAppended",
+        sessionId: this.domainSessionId,
+        text: shown,
+        attachments: input.attachments,
+        at: nowIso()
+      });
+    }
+    if (shown.trim().startsWith("/compact")) {
+      this.emitActivity("Compacting conversation\u2026", "compact");
+    } else if (shown.trim().startsWith("/")) {
+      this.emitActivity(`Running ${shown.trim().split(/\s+/)[0]}\u2026`, "working");
+    } else {
+      this.emitActivity("Waiting for model\u2026", "working");
+    }
     try {
       const result = await this.send("session/prompt", {
         sessionId: this.providerSessionId,
         prompt: blocks
       });
       this.promptInFlight = false;
+      this.emitActivity(null);
       const stop = result?.stopReason ?? "end_turn";
       if (stop === "cancelled" || this.turnCancelled) {
         this.emit({
@@ -4263,7 +4590,7 @@ var GrokAcpAdapter = class {
    */
   async undoLastTurn() {
     if (this.userTurns.length === 0) {
-      throw new Error("\u6CA1\u6709\u53EF\u64A4\u56DE\u7684\u6D88\u606F");
+      throw new Error("Nothing to undo");
     }
     await this.cancel(this.domainSessionId);
     const restoredText = this.userTurns[this.userTurns.length - 1];
@@ -4275,7 +4602,7 @@ var GrokAcpAdapter = class {
       });
       const points = pts?.rewind_points ?? [];
       if (points.length === 0) {
-        note = "Grok \u4FA7\u6682\u65E0 rewind \u70B9\uFF0C\u4EC5\u754C\u9762\u5DF2\u64A4\u56DE";
+        note = "UI undid the turn; Grok had no rewind point";
       } else {
         const last = points[points.length - 1];
         const target = last.prompt_index;
@@ -4286,9 +4613,9 @@ var GrokAcpAdapter = class {
         });
         if (result?.success) {
           providerOk = true;
-          note = "\u5DF2\u540C\u6B65\u64A4\u56DE Grok \u4F1A\u8BDD\u4E0A\u4E0B\u6587";
+          note = void 0;
         } else {
-          note = "\u754C\u9762\u5DF2\u64A4\u56DE\uFF1BGrok rewind \u672A\u786E\u8BA4\u6210\u529F\uFF0C\u82E5\u6A21\u578B\u4ECD\u63D0\u4E0A\u6761\u5185\u5BB9\u8BF7\u65B0\u5F00\u4F1A\u8BDD\u6216\u518D\u8BF4\u300C\u5FFD\u7565\u4E0A\u4E00\u6761\u300D";
+          note = "UI undid the turn; Grok rewind not confirmed \u2014 model may still recall the last message";
           try {
             await this.send("_x.ai/rewind/execute", {
               sessionId: this.providerSessionId,
@@ -4300,7 +4627,7 @@ var GrokAcpAdapter = class {
         }
       }
     } catch (e) {
-      note = `\u754C\u9762\u5DF2\u64A4\u56DE\uFF1BGrok rewind \u8C03\u7528\u5931\u8D25\uFF1A${e instanceof Error ? e.message : String(e)}`;
+      note = `UI undid the turn; Grok rewind failed: ${e instanceof Error ? e.message : String(e)}`;
     }
     this.userTurns.pop();
     this.emit({
@@ -4312,6 +4639,64 @@ var GrokAcpAdapter = class {
       at: nowIso()
     });
     return { restoredText, providerOk, note };
+  }
+  /**
+   * Weekly credit usage / billing snapshot (Grok TUI `/usage`).
+   * Not advertised in available_commands under ACP — pager-only there;
+   * exposed via extension `_x.ai/billing`.
+   */
+  async fetchBillingUsage() {
+    if (!this.isAlive() || !this.providerSessionId) {
+      throw new Error("agent not alive");
+    }
+    const result = await this.send("_x.ai/billing", {
+      sessionId: this.providerSessionId
+    });
+    const cfg = result?.config ?? {};
+    const period = cfg.currentPeriod ?? {};
+    const numVal = (v) => {
+      if (typeof v === "number") return v;
+      if (v && typeof v === "object" && "val" in v) {
+        const n = Number(v.val);
+        return Number.isFinite(n) ? n : void 0;
+      }
+      return void 0;
+    };
+    return {
+      creditUsagePercent: typeof cfg.creditUsagePercent === "number" ? cfg.creditUsagePercent : void 0,
+      periodType: typeof period.type === "string" ? period.type : void 0,
+      periodStart: (typeof period.start === "string" ? period.start : void 0) ?? (typeof cfg.billingPeriodStart === "string" ? cfg.billingPeriodStart : void 0),
+      periodEnd: (typeof period.end === "string" ? period.end : void 0) ?? (typeof cfg.billingPeriodEnd === "string" ? cfg.billingPeriodEnd : void 0),
+      subscriptionTier: result?.subscription_tier,
+      onDemandCap: numVal(cfg.onDemandCap),
+      onDemandUsed: numVal(cfg.onDemandUsed),
+      prepaidBalance: numVal(cfg.prepaidBalance),
+      raw: result
+    };
+  }
+  /** Show a local system-style reply without hitting the model. */
+  emitLocalReply(userText, assistantText) {
+    const at = nowIso();
+    this.userTurns.push(userText);
+    this.emit({
+      type: "UserMessageAppended",
+      sessionId: this.domainSessionId,
+      text: userText,
+      at
+    });
+    this.emit({
+      type: "MessageChunk",
+      sessionId: this.domainSessionId,
+      role: "assistant",
+      text: assistantText,
+      at
+    });
+    this.emit({
+      type: "MessageDone",
+      sessionId: this.domainSessionId,
+      role: "assistant",
+      at: nowIso()
+    });
   }
   async respondPermission(requestId, allow) {
     const pending = this.pendingPermissions.get(requestId);
@@ -4331,6 +4716,15 @@ var GrokAcpAdapter = class {
   }
   async stop() {
     this.closed = true;
+    for (const term of this.terminals.values()) {
+      if (!term.exited) {
+        try {
+          term.proc.kill("SIGTERM");
+        } catch {
+        }
+      }
+    }
+    this.terminals.clear();
     this.rl?.close();
     this.proc?.kill();
     this.proc = null;
@@ -4367,6 +4761,50 @@ var import_node_fs3 = __toESM(require("node:fs"), 1);
 var import_node_path3 = __toESM(require("node:path"), 1);
 var import_node_os2 = __toESM(require("node:os"), 1);
 var import_node_crypto2 = require("node:crypto");
+function hashFile(abs) {
+  try {
+    if (!import_node_fs3.default.existsSync(abs)) return "missing";
+    const st = import_node_fs3.default.statSync(abs);
+    if (st.isDirectory()) return `dir:${st.mtimeMs}`;
+    const buf = import_node_fs3.default.readFileSync(abs);
+    return (0, import_node_crypto2.createHash)("sha256").update(buf).digest("hex");
+  } catch {
+    return "error";
+  }
+}
+function loadSnapshotFingerprints(snapshot) {
+  if (!snapshot) return null;
+  const root = snapshot.kind === "files" ? snapshot.ref : import_node_path3.default.join(
+    process.env.HOME || import_node_os2.default.homedir(),
+    ".agent-pane",
+    "snapshots",
+    snapshot.snapshotId
+  );
+  const fpPath = import_node_path3.default.join(root, "fingerprints.json");
+  try {
+    if (import_node_fs3.default.existsSync(fpPath)) {
+      const obj = JSON.parse(import_node_fs3.default.readFileSync(fpPath, "utf8"));
+      return new Map(Object.entries(obj));
+    }
+  } catch {
+  }
+  const filesDir = import_node_path3.default.join(root, "files");
+  const map = /* @__PURE__ */ new Map();
+  if (!import_node_fs3.default.existsSync(filesDir)) return map;
+  const walk = (dir, prefix) => {
+    for (const name of import_node_fs3.default.readdirSync(dir)) {
+      const abs = import_node_path3.default.join(dir, name);
+      const rel = prefix ? `${prefix}/${name}` : name;
+      try {
+        if (import_node_fs3.default.statSync(abs).isDirectory()) walk(abs, rel);
+        else map.set(rel, hashFile(abs));
+      } catch {
+      }
+    }
+  };
+  walk(filesDir, "");
+  return map;
+}
 function isGitRepo(cwd) {
   try {
     (0, import_node_child_process2.execFileSync)("git", ["rev-parse", "--is-inside-work-tree"], {
@@ -4414,6 +4852,7 @@ var WorkspaceSnapshotService = class {
         ref: head
       };
       import_node_fs3.default.writeFileSync(import_node_path3.default.join(dir, "meta.json"), JSON.stringify(meta2, null, 2));
+      const fingerprints = {};
       for (const line of status.split("\n").filter(Boolean)) {
         const p = line.slice(3).trim().split(" -> ").pop();
         const abs = import_node_path3.default.join(cwd, p);
@@ -4422,10 +4861,18 @@ var WorkspaceSnapshotService = class {
           import_node_fs3.default.mkdirSync(import_node_path3.default.dirname(dest), { recursive: true });
           try {
             import_node_fs3.default.copyFileSync(abs, dest);
+            fingerprints[p] = hashFile(abs);
           } catch {
           }
+        } else {
+          fingerprints[p] = "missing";
         }
       }
+      import_node_fs3.default.writeFileSync(
+        import_node_path3.default.join(dir, "fingerprints.json"),
+        JSON.stringify(fingerprints, null, 2),
+        "utf8"
+      );
       this.snapshots.set(sessionId, meta2);
       return meta2;
     }
@@ -4545,7 +4992,7 @@ function fileFingerprint(cwd, relPath) {
   }
 }
 var DiffEngine = class {
-  compute(cwd, _snapshot) {
+  compute(cwd, snapshot) {
     try {
       (0, import_node_child_process3.execFileSync)("git", ["rev-parse", "--is-inside-work-tree"], {
         cwd,
@@ -4556,12 +5003,20 @@ var DiffEngine = class {
     }
     const status = git2(cwd, ["status", "--porcelain", "-uall"]);
     if (!status.trim()) return [];
+    const baseline = loadSnapshotFingerprints(snapshot);
     const files = [];
     for (const line of status.split("\n").filter(Boolean)) {
       const xy = line.slice(0, 2);
       let filePath = line.slice(3).trim();
       if (filePath.includes(" -> ")) {
         filePath = filePath.split(" -> ").pop();
+      }
+      if (baseline) {
+        const nowFp = fileFingerprint(cwd, filePath);
+        const baseFp = baseline.get(filePath);
+        if (baseFp != null && baseFp === nowFp) {
+          continue;
+        }
       }
       let statusKind = "modified";
       if (xy.includes("A") || xy === "??") statusKind = "added";
@@ -4595,8 +5050,43 @@ var import_node_os3 = __toESM(require("node:os"), 1);
 var import_node_path5 = __toESM(require("node:path"), 1);
 var import_node_crypto4 = require("node:crypto");
 var ROOT = import_node_path5.default.join(import_node_os3.default.homedir(), ".agent-pane", "sessions");
+var PINS_PATH = import_node_path5.default.join(import_node_os3.default.homedir(), ".agent-pane", "pins.json");
 var listCache = null;
 var LIST_TTL_MS = 12e3;
+function readPinSet() {
+  try {
+    if (!import_node_fs5.default.existsSync(PINS_PATH)) return /* @__PURE__ */ new Set();
+    const raw = JSON.parse(import_node_fs5.default.readFileSync(PINS_PATH, "utf8"));
+    if (Array.isArray(raw)) return new Set(raw.map(String));
+    if (raw && typeof raw === "object") {
+      const o = raw;
+      if (Array.isArray(o.ids)) return new Set(o.ids.map(String));
+      return new Set(Object.keys(o).filter((k) => o[k]));
+    }
+  } catch {
+  }
+  return /* @__PURE__ */ new Set();
+}
+function writePinSet(ids) {
+  ensureRoot();
+  const dir = import_node_path5.default.dirname(PINS_PATH);
+  import_node_fs5.default.mkdirSync(dir, { recursive: true });
+  import_node_fs5.default.writeFileSync(
+    PINS_PATH,
+    JSON.stringify({ ids: [...ids] }, null, 2),
+    "utf8"
+  );
+  invalidateHistoryListCache();
+}
+function isPinned(sessionId) {
+  return readPinSet().has(sessionId);
+}
+function setPinned(sessionId, pinned) {
+  const set = readPinSet();
+  if (pinned) set.add(sessionId);
+  else set.delete(sessionId);
+  writePinSet(set);
+}
 var eventsCache = /* @__PURE__ */ new Map();
 var EVENTS_TTL_MS = 6e4;
 function invalidateHistoryListCache() {
@@ -4615,11 +5105,22 @@ function metaPath(sessionId) {
 function eventsPath(sessionId) {
   return import_node_path5.default.join(ROOT, sessionId, "events.jsonl");
 }
+function ensureTitle(sessionId, title) {
+  const t = (title || "").trim();
+  if (t && t !== "Untitled") return t.slice(0, 80);
+  const derived = deriveMetaFromEvents(sessionId);
+  const d = (derived?.title || "").trim();
+  if (d && d !== "New session" && d !== "Untitled") return d.slice(0, 80);
+  return t || "New session";
+}
 function readMeta(sessionId) {
   try {
     const p = metaPath(sessionId);
     if (!import_node_fs5.default.existsSync(p)) return null;
-    return JSON.parse(import_node_fs5.default.readFileSync(p, "utf8"));
+    const meta = JSON.parse(import_node_fs5.default.readFileSync(p, "utf8"));
+    meta.pinned = isPinned(sessionId) || !!meta.pinned;
+    meta.title = ensureTitle(sessionId, meta.title);
+    return meta;
   } catch {
     return null;
   }
@@ -4628,26 +5129,34 @@ function writeMeta(meta) {
   ensureRoot();
   const dir = import_node_path5.default.join(ROOT, meta.sessionId);
   import_node_fs5.default.mkdirSync(dir, { recursive: true });
-  import_node_fs5.default.writeFileSync(metaPath(meta.sessionId), JSON.stringify(meta, null, 2), "utf8");
+  const fixed = {
+    ...meta,
+    title: ensureTitle(meta.sessionId, meta.title),
+    pinned: isPinned(meta.sessionId) || !!meta.pinned
+  };
+  import_node_fs5.default.writeFileSync(metaPath(meta.sessionId), JSON.stringify(fixed, null, 2), "utf8");
   invalidateHistoryListCache();
 }
 function upsertMeta(patch) {
   const prev = readMeta(patch.sessionId);
   const now = (/* @__PURE__ */ new Date()).toISOString();
+  const prevTitle = (prev?.title || "").trim();
+  const patchTitle = (patch.title || "").trim().slice(0, 80);
+  const keepTitle = prevTitle && prevTitle !== "New session" && prevTitle !== "Untitled" && (prev?.messageCount ?? 0) > 0;
+  const title = keepTitle ? prevTitle : patchTitle || prevTitle || "New session";
   const meta = {
     sessionId: patch.sessionId,
     cwd: patch.cwd ?? prev?.cwd ?? "",
-    title: patch.title?.trim() ? patch.title.trim().slice(0, 80) : prev?.title || "New session",
+    title: ensureTitle(patch.sessionId, title),
     createdAt: prev?.createdAt ?? now,
     updatedAt: now,
-    messageCount: (prev?.messageCount ?? 0) + (patch.bumpMessage ? 1 : 0)
+    messageCount: (prev?.messageCount ?? 0) + (patch.bumpMessage ? 1 : 0),
+    providerSessionId: patch.providerSessionId ?? prev?.providerSessionId,
+    // Pin from dedicated store (never lost on upsert)
+    pinned: isPinned(patch.sessionId) || !!prev?.pinned,
+    unread: prev?.unread,
+    archived: prev?.archived
   };
-  if (patch.title?.trim() && prev?.title && prev.title !== "New session" && !patch.title) {
-    meta.title = prev.title;
-  }
-  if (prev?.title && prev.title !== "New session" && patch.title) {
-    if (prev.messageCount > 0) meta.title = prev.title;
-  }
   writeMeta(meta);
   return meta;
 }
@@ -4711,18 +5220,43 @@ function listHistory(force = false) {
     } catch {
       continue;
     }
+    if (!hasReplayableEvents(id)) {
+      try {
+        const metaOnly = readMeta(id);
+        const ev = eventsPath(id);
+        const emptyOrMissing = !import_node_fs5.default.existsSync(ev) || import_node_fs5.default.statSync(ev).size === 0;
+        if (metaOnly && emptyOrMissing) {
+          import_node_fs5.default.rmSync(dir, { recursive: true, force: true });
+        }
+      } catch {
+      }
+      continue;
+    }
     let meta = readMeta(id);
     if (!meta) {
       meta = deriveMetaFromEvents(id);
-      if (meta) writeMeta(meta);
+      if (meta && !isDraftSession(meta)) {
+        meta.pinned = isPinned(id);
+        writeMeta(meta);
+      }
+    } else {
+      if (meta.pinned && !isPinned(id)) setPinned(id, true);
+      const before = JSON.stringify({ t: meta.title, p: meta.pinned });
+      meta = {
+        ...meta,
+        title: ensureTitle(id, meta.title),
+        pinned: isPinned(id) || !!meta.pinned
+      };
+      const after = JSON.stringify({ t: meta.title, p: meta.pinned });
+      if (before !== after && !isDraftSession(meta)) writeMeta(meta);
     }
-    if (meta) sessions2.push(meta);
+    if (meta && !isDraftSession(meta)) sessions2.push(meta);
   }
   sessions2.sort(
     (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
   );
   const byCwd = /* @__PURE__ */ new Map();
-  const active = sessions2.filter((s) => !s.archived);
+  const active = sessions2.filter((s) => !s.archived && !isDraftSession(s));
   for (const s of active) {
     const key = s.cwd || "(unknown)";
     const list = byCwd.get(key) ?? [];
@@ -4783,20 +5317,87 @@ function patchMeta(sessionId, patch) {
   if (!prev) return null;
   const next = {
     ...prev,
-    ...patch,
     updatedAt: (/* @__PURE__ */ new Date()).toISOString()
   };
-  if (patch.title != null) next.title = String(patch.title).slice(0, 80);
+  if (patch.title != null && String(patch.title).trim()) {
+    next.title = String(patch.title).trim().slice(0, 80);
+  }
+  if (typeof patch.pinned === "boolean") {
+    setPinned(sessionId, patch.pinned);
+    next.pinned = patch.pinned;
+  } else {
+    next.pinned = isPinned(sessionId) || !!prev.pinned;
+  }
+  if (typeof patch.unread === "boolean") next.unread = patch.unread;
+  if (typeof patch.archived === "boolean") next.archived = patch.archived;
+  if (patch.cwd != null) next.cwd = patch.cwd;
+  next.title = ensureTitle(sessionId, next.title);
   writeMeta(next);
   return next;
 }
 function deleteSession(sessionId) {
   const dir = import_node_path5.default.join(ROOT, sessionId);
-  if (!import_node_fs5.default.existsSync(dir)) return false;
-  import_node_fs5.default.rmSync(dir, { recursive: true, force: true });
+  try {
+    if (import_node_fs5.default.existsSync(dir)) {
+      import_node_fs5.default.rmSync(dir, { recursive: true, force: true });
+    }
+  } catch (e) {
+    console.error("[history] deleteSession failed", sessionId, e);
+    return false;
+  }
+  try {
+    if (import_node_fs5.default.existsSync(dir)) {
+      import_node_fs5.default.rmSync(dir, { recursive: true, force: true });
+    }
+  } catch {
+  }
   invalidateHistoryListCache();
   invalidateSessionEventsCache(sessionId);
   return true;
+}
+function isDraftSession(meta) {
+  return (meta.messageCount ?? 0) <= 0;
+}
+function hasReplayableEvents(sessionId) {
+  const p = eventsPath(sessionId);
+  if (!import_node_fs5.default.existsSync(p)) return false;
+  try {
+    const lines = import_node_fs5.default.readFileSync(p, "utf8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line);
+        if (e.type === "UserMessageAppended") return true;
+      } catch {
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+function pruneDraftSessions(opts) {
+  ensureRoot();
+  let removed = 0;
+  let dirs = [];
+  try {
+    dirs = import_node_fs5.default.readdirSync(ROOT);
+  } catch {
+    return 0;
+  }
+  for (const id of dirs) {
+    if (opts?.keepSessionId && id === opts.keepSessionId) continue;
+    const dir = import_node_path5.default.join(ROOT, id);
+    try {
+      if (!import_node_fs5.default.statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const meta = readMeta(id) ?? deriveMetaFromEvents(id);
+    if (!meta || !isDraftSession(meta)) continue;
+    if (opts?.cwd && meta.cwd && meta.cwd !== opts.cwd) continue;
+    if (deleteSession(id)) removed++;
+  }
+  return removed;
 }
 function forkSession(sessionId) {
   const events = loadSessionEvents(sessionId, true);
@@ -4825,6 +5426,48 @@ function forkSession(sessionId) {
 }
 
 // ../bridge/src/session-manager.ts
+function modeUsesAlwaysApprove(mode) {
+  const m = mode.toLowerCase();
+  return m === "agent" || m === "always" || m === "always-approve" || m === "yolo";
+}
+function buildHistoryDigest(sessionId, maxTurns = 12) {
+  const events = loadSessionEvents(sessionId, true);
+  if (!events.length) return "";
+  const lines = [
+    "[Conversation resume context \u2014 this is a continued chat in the same UI session.",
+    "Stay in character and continue from the last turns. Do not claim you are starting fresh.]"
+  ];
+  let turns = 0;
+  let assistantBuf = "";
+  const flushAssistant = () => {
+    const t = assistantBuf.trim();
+    if (!t) return;
+    const clipped = t.length > 1200 ? `${t.slice(0, 1200)}\u2026` : t;
+    lines.push(`Assistant: ${clipped}`);
+    assistantBuf = "";
+  };
+  for (const e of events) {
+    if (e.type === "UserMessageAppended") {
+      flushAssistant();
+      turns++;
+      if (turns > maxTurns) {
+        const header = lines.slice(0, 2);
+        const body = lines.slice(2);
+        const keep = body.slice(-maxTurns * 2);
+        lines.length = 0;
+        lines.push(...header, ...keep);
+      }
+      lines.push(`User: ${e.text.slice(0, 800)}`);
+    } else if (e.type === "MessageChunk") {
+      assistantBuf += e.text;
+    } else if (e.type === "MessageDone") {
+      flushAssistant();
+    }
+  }
+  flushAssistant();
+  if (lines.length <= 2) return "";
+  return lines.join("\n");
+}
 var SessionManager = class {
   store;
   snapshots;
@@ -4840,28 +5483,72 @@ var SessionManager = class {
     this.permissionMode = opts.permissionMode ?? "auto";
   }
   publish(event) {
+    if (event.type === "SessionStarted" && event.resumed) {
+      const live = this.live.get(event.sessionId);
+      if (live && event.providerSessionId) {
+        live.providerSessionId = event.providerSessionId;
+      }
+      if (event.providerSessionId) {
+        upsertMeta({
+          sessionId: event.sessionId,
+          cwd: event.cwd,
+          providerSessionId: event.providerSessionId
+        });
+      }
+      const ephemeral = { ...event, seq: 0 };
+      this.broadcast({ type: "event", event: ephemeral });
+      return ephemeral;
+    }
     const stored = this.store.append(event);
     this.broadcast({ type: "event", event: stored });
     invalidateSessionEventsCache(event.sessionId);
-    if (event.type === "SessionStarted") {
+    if (event.type === "UserMessageAppended") {
+      const live = this.live.get(event.sessionId);
       upsertMeta({
         sessionId: event.sessionId,
-        cwd: event.cwd,
-        title: "New session"
-      });
-    } else if (event.type === "UserMessageAppended") {
-      upsertMeta({
-        sessionId: event.sessionId,
+        cwd: live?.cwd,
         title: event.text,
-        bumpMessage: true
+        bumpMessage: true,
+        providerSessionId: live?.providerSessionId
       });
+    } else if (event.type === "SessionStarted" && event.providerSessionId) {
+      const live = this.live.get(event.sessionId);
+      if (live) live.providerSessionId = event.providerSessionId;
     }
     return stored;
+  }
+  /** Stop a live agent (if any) so disk delete won't race with writes. */
+  async stopSession(sessionId) {
+    const s = this.live.get(sessionId);
+    if (!s) return;
+    try {
+      await s.adapter.stop();
+    } catch {
+    }
+    this.live.delete(sessionId);
+    this.store.purge(sessionId);
+  }
+  /** After disk delete: purge store even if session was not live. */
+  purgeSession(sessionId) {
+    this.live.delete(sessionId);
+    this.store.purge(sessionId);
   }
   async handleCommand(cmd) {
     switch (cmd.type) {
       case "session.create":
-        await this.createSession(cmd.cwd, cmd.model);
+        await this.createSession(
+          cmd.cwd,
+          cmd.model,
+          cmd.permissionMode ?? this.permissionMode
+        );
+        break;
+      case "session.resume":
+        await this.resumeSession({
+          sessionId: cmd.sessionId,
+          cwd: cmd.cwd,
+          model: cmd.model,
+          permissionMode: cmd.permissionMode ?? this.permissionMode
+        });
         break;
       case "session.prompt":
         await this.prompt(cmd.sessionId, cmd.text, cmd.attachments);
@@ -4925,15 +5612,7 @@ var SessionManager = class {
       this.live.delete(id);
     }
   }
-  async createSession(cwd, model) {
-    await this.stopLiveSessions();
-    this.broadcast({
-      type: "status",
-      message: "\u6B63\u5728\u542F\u52A8 Grok agent\u2026"
-    });
-    const adapter = new GrokAcpAdapter({
-      autoApprove: this.permissionMode !== "ask" && this.permissionMode !== "default"
-    });
+  wireAdapter(adapter) {
     adapter.onEvent((e) => {
       this.publish(e);
       if (e.type === "ToolFinished" || e.type === "MessageDone") {
@@ -4941,11 +5620,32 @@ var SessionManager = class {
         setTimeout(() => this.refreshDiff(sid), 300);
       }
     });
+    adapter.onDead((domainSessionId) => {
+      const s = this.live.get(domainSessionId);
+      if (s?.adapter === adapter) {
+        this.live.delete(domainSessionId);
+      }
+    });
+  }
+  async createSession(cwd, model, permissionMode) {
+    await this.stopLiveSessions();
+    const mode = (permissionMode ?? this.permissionMode ?? "agent").toLowerCase();
+    this.permissionMode = mode;
+    this.broadcast({
+      type: "status",
+      message: "\u6B63\u5728\u542F\u52A8 Grok agent\u2026"
+    });
+    const adapter = new GrokAcpAdapter({
+      autoApprove: modeUsesAlwaysApprove(mode)
+    });
+    this.wireAdapter(adapter);
+    let started;
     try {
-      await adapter.start({
+      started = await adapter.start({
         cwd,
         model,
-        permissionMode: this.permissionMode
+        // adapter maps ask/default → no --always-approve; else always-approve
+        permissionMode: modeUsesAlwaysApprove(mode) ? "auto" : "ask"
       });
     } catch (e) {
       this.broadcast({
@@ -4954,14 +5654,33 @@ var SessionManager = class {
       });
       return;
     }
-    const domainSessionId = adapter.getSessionId();
+    const domainSessionId = started.domainSessionId;
+    const providerSessionId = started.providerSessionId;
     this.live.set(domainSessionId, {
       domainSessionId,
       cwd,
       model,
+      permissionMode: mode,
+      providerSessionId,
       adapter,
       acceptedFp: /* @__PURE__ */ new Map()
     });
+    this.publish({
+      type: "SessionStarted",
+      sessionId: domainSessionId,
+      cwd,
+      model,
+      resumed: false,
+      providerSessionId,
+      at: nowIso()
+    });
+    if (readMeta(domainSessionId)) {
+      upsertMeta({ sessionId: domainSessionId, cwd, providerSessionId });
+    }
+    try {
+      pruneDraftSessions({ keepSessionId: domainSessionId, cwd });
+    } catch {
+    }
     try {
       const snap = this.snapshots.take(domainSessionId, cwd);
       this.publish({
@@ -4980,13 +5699,227 @@ var SessionManager = class {
     }
     this.refreshDiff(domainSessionId);
   }
-  async prompt(sessionId, text, attachments) {
-    const live = this.live.get(sessionId);
-    if (!live) {
-      this.broadcast({ type: "error", message: "Unknown session. Create one first." });
+  /**
+   * Re-attach a live Grok agent to an existing history session so follow-ups
+   * continue the same conversation (same domain sessionId on disk).
+   */
+  async resumeSession(opts) {
+    const { sessionId, cwd } = opts;
+    const existing = this.live.get(sessionId);
+    if (existing?.adapter.isAlive()) {
+      this.broadcast({
+        type: "event",
+        event: {
+          type: "SessionStarted",
+          sessionId,
+          cwd: existing.cwd,
+          model: existing.model,
+          resumed: true,
+          providerSessionId: existing.providerSessionId,
+          at: nowIso()
+        }
+      });
       return;
     }
-    await live.adapter.sendPrompt({ sessionId, text, attachments });
+    if (existing) {
+      try {
+        await existing.adapter.stop();
+      } catch {
+      }
+      this.live.delete(sessionId);
+    }
+    const mode = (opts.permissionMode ?? this.permissionMode ?? "agent").toLowerCase();
+    this.permissionMode = mode;
+    const meta = readMeta(sessionId);
+    const providerSessionId = meta?.providerSessionId ?? existing?.providerSessionId;
+    const others = [...this.live.entries()].filter(([id]) => id !== sessionId);
+    for (const [id, s] of others) {
+      try {
+        await s.adapter.stop();
+      } catch {
+      }
+      this.live.delete(id);
+    }
+    this.broadcast({
+      type: "status",
+      message: "\u6B63\u5728\u6062\u590D\u4F1A\u8BDD\u2026"
+    });
+    const adapter = new GrokAcpAdapter({
+      autoApprove: modeUsesAlwaysApprove(mode)
+    });
+    this.wireAdapter(adapter);
+    const resumeCwd = cwd || meta?.cwd || existing?.cwd || "";
+    const resumeModel = opts.model ?? existing?.model;
+    let started;
+    try {
+      started = await adapter.start({
+        cwd: resumeCwd,
+        model: resumeModel,
+        permissionMode: modeUsesAlwaysApprove(mode) ? "auto" : "ask",
+        domainSessionId: sessionId,
+        // Keep id for bookkeeping; start() no longer session/load (prompt hang).
+        providerSessionId,
+        resumed: true
+      });
+    } catch (e) {
+      this.broadcast({
+        type: "error",
+        message: `\u6062\u590D\u4F1A\u8BDD\u5931\u8D25: ${e instanceof Error ? e.message : String(e)}`
+      });
+      return;
+    }
+    const loadedProvider = started.providerSessionId;
+    const digest = buildHistoryDigest(sessionId);
+    if (digest) adapter.setContextPrefix(digest);
+    this.live.set(sessionId, {
+      domainSessionId: sessionId,
+      cwd: resumeCwd,
+      model: resumeModel,
+      permissionMode: mode,
+      providerSessionId: loadedProvider,
+      adapter,
+      acceptedFp: /* @__PURE__ */ new Map()
+    });
+    this.publish({
+      type: "SessionStarted",
+      sessionId,
+      cwd: resumeCwd,
+      model: resumeModel,
+      resumed: true,
+      providerSessionId: loadedProvider,
+      at: nowIso()
+    });
+    upsertMeta({
+      sessionId,
+      cwd: resumeCwd,
+      providerSessionId: loadedProvider
+    });
+    try {
+      const snap = this.snapshots.take(sessionId, resumeCwd);
+      this.publish({
+        type: "SnapshotTaken",
+        sessionId,
+        snapshotId: snap.snapshotId,
+        at: nowIso()
+      });
+    } catch {
+    }
+    this.refreshDiff(sessionId);
+  }
+  async prompt(sessionId, text, attachments) {
+    let live = this.live.get(sessionId);
+    if (!live || !live.adapter.isAlive()) {
+      const meta = readMeta(sessionId);
+      await this.resumeSession({
+        sessionId,
+        cwd: live?.cwd || meta?.cwd || "",
+        model: live?.model,
+        permissionMode: live?.permissionMode
+      });
+      live = this.live.get(sessionId);
+      if (!live || !live.adapter.isAlive()) {
+        this.broadcast({
+          type: "error",
+          message: "Session disconnected \u2014 resume failed, try Send again"
+        });
+        return;
+      }
+    }
+    const slashName = text.trim().match(/^\/([a-zA-Z][\w-]*)/)?.[1]?.toLowerCase();
+    if (slashName === "usage" || slashName === "billing") {
+      try {
+        this.broadcast({ type: "status", message: "Fetching usage\u2026" });
+        const u = await live.adapter.fetchBillingUsage();
+        const pct = u.creditUsagePercent != null ? `${Math.round(u.creditUsagePercent)}%` : "\u2014";
+        const fmtDate = (iso) => {
+          if (!iso) return "\u2014";
+          try {
+            return new Date(iso).toLocaleString(void 0, {
+              month: "short",
+              day: "numeric",
+              hour: "2-digit",
+              minute: "2-digit"
+            });
+          } catch {
+            return iso;
+          }
+        };
+        const periodLabel = u.periodType?.includes("WEEKLY") || u.periodType?.includes("weekly") ? "Weekly" : u.periodType?.replace(/^USAGE_PERIOD_TYPE_/, "") || "Current";
+        const barFilled = Math.min(
+          20,
+          Math.max(0, Math.round((u.creditUsagePercent ?? 0) / 5))
+        );
+        const bar = "\u2588".repeat(barFilled) + "\u2591".repeat(Math.max(0, 20 - barFilled));
+        const lines = [
+          `**Usage \xB7 ${u.subscriptionTier || "Grok"}**`,
+          "",
+          `${periodLabel} credits: **${pct}** used`,
+          `\`${bar}\``,
+          "",
+          `Period: ${fmtDate(u.periodStart)} \u2192 ${fmtDate(u.periodEnd)}`
+        ];
+        if (u.onDemandCap != null || u.onDemandUsed != null) {
+          lines.push(
+            `On-demand: ${u.onDemandUsed ?? 0} / ${u.onDemandCap ?? "\u2014"}`
+          );
+        }
+        if (u.prepaidBalance != null && u.prepaidBalance !== 0) {
+          lines.push(`Prepaid balance: ${u.prepaidBalance}`);
+        }
+        lines.push("", "_Source: Grok `_x.ai/billing` (same as TUI `/usage`)._");
+        live.adapter.emitLocalReply(text.trim(), lines.join("\n"));
+        this.broadcast({ type: "status", message: " " });
+      } catch (e) {
+        this.broadcast({
+          type: "error",
+          message: `Usage lookup failed: ${e instanceof Error ? e.message : String(e)}`
+        });
+      }
+      return;
+    }
+    let body = text;
+    const isSlash = /^\s*\/[a-zA-Z]/.test(text);
+    if (live.permissionMode === "plan" && !isSlash) {
+      body = "[Plan mode active: do NOT edit, create, or delete files. Research if needed, then produce a clear step-by-step plan only. Wait for approval before any implementation.]\n\n" + text;
+    }
+    try {
+      await live.adapter.sendPrompt({
+        sessionId,
+        text: body,
+        displayText: text,
+        attachments
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/not alive|EPIPE|exited|disconnect/i.test(msg)) {
+        this.live.delete(sessionId);
+        const meta = readMeta(sessionId);
+        await this.resumeSession({
+          sessionId,
+          cwd: live.cwd || meta?.cwd || "",
+          model: live.model,
+          permissionMode: live.permissionMode
+        });
+        const again = this.live.get(sessionId);
+        if (again?.adapter.isAlive()) {
+          await again.adapter.sendPrompt({
+            sessionId,
+            text: body,
+            displayText: text,
+            attachments,
+            // UserMessage already recorded on first attempt (or not — if
+            // fail-before-emit, skipUserEvent false would be safer; we only
+            // get here after emit for RPC failures, so skip duplicate).
+            skipUserEvent: !/not alive/i.test(msg)
+          });
+          return;
+        }
+      }
+      this.broadcast({
+        type: "error",
+        message: msg || "Prompt failed"
+      });
+    }
   }
   refreshDiff(sessionId) {
     const live = this.live.get(sessionId);
@@ -5095,6 +6028,77 @@ var import_node_path6 = __toESM(require("node:path"), 1);
 var import_node_util = require("node:util");
 var execFileAsync = (0, import_node_util.promisify)(import_node_child_process4.execFile);
 var recentPath = import_node_path6.default.join(import_node_os4.default.homedir(), ".agent-pane", "recent.json");
+function parseSkillFrontmatter(raw) {
+  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return {};
+  const block = m[1];
+  const name = block.match(/^name:\s*(.+)$/m)?.[1]?.trim().replace(/^["']|["']$/g, "");
+  let description = block.match(/^description:\s*(.+)$/m)?.[1]?.trim();
+  if (description?.startsWith('"') || description?.startsWith("'")) {
+    description = description.replace(/^["']|["']$/g, "");
+  } else if (description?.startsWith("|") || description?.startsWith(">")) {
+    description = description.replace(/^[|>]-?\s*/, "");
+  }
+  if (!description || description === "|" || description === ">") {
+    const multi = block.match(
+      /^description:\s*[|>]-?\s*\n((?:[ \t]+.+\n?)+)/m
+    );
+    if (multi) {
+      description = multi[1].split("\n").map((l) => l.replace(/^[ \t]+/, "")).join(" ").trim();
+    }
+  }
+  return { name, description };
+}
+function listSkills(cwd) {
+  const roots = [
+    { dir: import_node_path6.default.join(import_node_os4.default.homedir(), ".grok", "skills"), source: "user-grok" },
+    { dir: import_node_path6.default.join(import_node_os4.default.homedir(), ".claude", "skills"), source: "user-claude" },
+    { dir: import_node_path6.default.join(import_node_os4.default.homedir(), ".cursor", "skills"), source: "user-cursor" }
+  ];
+  if (cwd) {
+    roots.unshift(
+      { dir: import_node_path6.default.join(cwd, ".grok", "skills"), source: "project-grok" },
+      { dir: import_node_path6.default.join(cwd, ".claude", "skills"), source: "project-claude" },
+      { dir: import_node_path6.default.join(cwd, ".cursor", "skills"), source: "project-cursor" }
+    );
+  }
+  const byName = /* @__PURE__ */ new Map();
+  for (const { dir, source } of roots) {
+    let entries = [];
+    try {
+      if (!import_node_fs6.default.existsSync(dir)) continue;
+      entries = import_node_fs6.default.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      if (["shell", "canvas", "statusline", "node_modules"].includes(ent.name)) {
+        continue;
+      }
+      const skillDir = import_node_path6.default.join(dir, ent.name);
+      const md = import_node_path6.default.join(skillDir, "SKILL.md");
+      if (!import_node_fs6.default.existsSync(md)) continue;
+      try {
+        const raw = import_node_fs6.default.readFileSync(md, "utf8").slice(0, 8e3);
+        const fm = parseSkillFrontmatter(raw);
+        const name = (fm.name || ent.name).trim();
+        if (!name || byName.has(name)) continue;
+        const description = (fm.description || "").slice(0, 160);
+        byName.set(name, {
+          name,
+          description,
+          source,
+          dir: skillDir
+        });
+      } catch {
+      }
+    }
+  }
+  return [...byName.values()].sort(
+    (a, b) => a.name.localeCompare(b.name, void 0, { sensitivity: "base" })
+  );
+}
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
@@ -5181,7 +6185,7 @@ function scanProjects() {
   }
   return out.slice(0, 40);
 }
-async function handleHttp(req, res) {
+async function handleHttp(req, res, hooks = {}) {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
   if (req.method === "OPTIONS") {
     cors(res);
@@ -5199,6 +6203,11 @@ async function handleHttp(req, res) {
   }
   if (url.pathname === "/api/projects" && req.method === "GET") {
     json(res, 200, { projects: scanProjects() });
+    return true;
+  }
+  if (url.pathname === "/api/skills" && req.method === "GET") {
+    const cwd = url.searchParams.get("cwd") || void 0;
+    json(res, 200, { skills: listSkills(cwd) });
     return true;
   }
   if (url.pathname === "/api/history" && req.method === "GET") {
@@ -5266,8 +6275,57 @@ async function handleHttp(req, res) {
   }
   if (patchMatch && req.method === "DELETE") {
     const sessionId = decodeURIComponent(patchMatch[1]);
+    try {
+      await hooks.stopSession?.(sessionId);
+    } catch {
+    }
     const ok = deleteSession(sessionId);
-    json(res, ok ? 200 : 404, { ok });
+    try {
+      hooks.purgeSession?.(sessionId);
+    } catch {
+    }
+    if (ok) deleteSession(sessionId);
+    if (ok) {
+      json(res, 200, { ok: true });
+    } else {
+      json(res, 500, {
+        ok: false,
+        error: "Failed to delete session (disk error)"
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/upload" && req.method === "POST") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const name = String(body.name || "upload.bin").replace(/[^\w.\-()+ ]+/g, "_");
+      const b64 = String(body.base64 || "");
+      if (!b64) {
+        json(res, 400, { error: "base64 required" });
+        return true;
+      }
+      const dir = import_node_path6.default.join(import_node_os4.default.homedir(), ".agent-pane", "uploads");
+      import_node_fs6.default.mkdirSync(dir, { recursive: true });
+      const stamp = Date.now().toString(36);
+      const safe = name.slice(0, 120) || "upload.bin";
+      const dest = import_node_path6.default.join(dir, `${stamp}-${safe}`);
+      const buf = Buffer.from(b64, "base64");
+      if (buf.length > 40 * 1024 * 1024) {
+        json(res, 413, { error: "file too large (max 40MB)" });
+        return true;
+      }
+      import_node_fs6.default.writeFileSync(dest, buf);
+      json(res, 200, {
+        path: dest,
+        name: safe,
+        size: buf.length,
+        mime: body.mime || null
+      });
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
     return true;
   }
   if (url.pathname === "/api/folder-pick" && req.method === "POST") {
@@ -5321,7 +6379,10 @@ var sessions = new SessionManager({
 });
 var server = import_node_http.default.createServer(async (req, res) => {
   try {
-    const handled = await handleHttp(req, res);
+    const handled = await handleHttp(req, res, {
+      stopSession: (id) => sessions.stopSession(id),
+      purgeSession: (id) => sessions.purgeSession(id)
+    });
     if (!handled) {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "not found" }));

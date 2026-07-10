@@ -7,6 +7,19 @@ import type { ContextRef, DomainEvent } from "@agent-pane/shared";
 import { nowIso } from "@agent-pane/shared";
 import type { AgentProvider } from "./provider-api.js";
 
+/** ACP terminal/* session state */
+type AcpTerminal = {
+  id: string;
+  proc: ChildProcess;
+  output: string;
+  truncated: boolean;
+  exitCode: number | null;
+  signal: string | null;
+  exited: boolean;
+  waiters: Array<() => void>;
+  byteLimit: number;
+};
+
 type JsonRpcMsg = {
   jsonrpc?: string;
   id?: number | string;
@@ -48,6 +61,17 @@ export class GrokAcpAdapter implements AgentProvider {
   /** 当前 turn 是否已被用户取消（忽略后续 stream，直到下次 prompt） */
   private turnCancelled = false;
   private promptInFlight = false;
+  /** Called when the child process dies unexpectedly (not after stop()). */
+  private deadHandlers: Array<(domainSessionId: string) => void> = [];
+  /**
+   * While true, drop session/update notifications (session/load replays history
+   * as updates — must not re-append into our event log / UI).
+   */
+  private absorbUpdates = false;
+  /** If session/load fails, first prompt gets a short history preamble. */
+  private contextPrefix: string | null = null;
+  /** ACP terminal/create sessions */
+  private terminals = new Map<string, AcpTerminal>();
 
   constructor(opts?: { grokBin?: string; autoApprove?: boolean }) {
     this.grokBin =
@@ -61,6 +85,22 @@ export class GrokAcpAdapter implements AgentProvider {
 
   onEvent(handler: (e: DomainEvent) => void): void {
     this.handlers.push(handler);
+  }
+
+  onDead(handler: (domainSessionId: string) => void): void {
+    this.deadHandlers.push(handler);
+  }
+
+  /** Child still running and stdin open. */
+  isAlive(): boolean {
+    return Boolean(
+      this.proc &&
+        !this.closed &&
+        this.proc.exitCode === null &&
+        this.proc.killed !== true &&
+        this.proc.stdin &&
+        !this.proc.stdin.destroyed
+    );
   }
 
   private emit(event: DomainEvent): void {
@@ -78,12 +118,33 @@ export class GrokAcpAdapter implements AgentProvider {
     this.proc.stdin.write(JSON.stringify(obj) + "\n");
   }
 
-  private send(method: string, params?: unknown): Promise<unknown> {
-    if (!this.proc?.stdin) return Promise.reject(new Error("Agent not started"));
+  private send(
+    method: string,
+    params?: unknown,
+    timeoutMs = 120_000
+  ): Promise<unknown> {
+    // During start(), isAlive() may be strict; only require proc+stdin here
+    if (!this.proc?.stdin || this.closed) {
+      return Promise.reject(new Error("Agent not started"));
+    }
     const id = this.nextId++;
     this.write({ jsonrpc: "2.0", id, method, params });
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        reject(new Error(`${method} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
     });
   }
 
@@ -183,6 +244,7 @@ export class GrokAcpAdapter implements AgentProvider {
           summary: JSON.stringify(p).slice(0, 500),
           at: nowIso(),
         });
+        this.emitActivity(`Permission: ${tool}`, "permission");
 
         if (this.autoApprove) {
           const optionId =
@@ -200,9 +262,76 @@ export class GrokAcpAdapter implements AgentProvider {
             allow: true,
             at: nowIso(),
           });
+          this.emitActivity(null);
         } else {
           this.pendingPermissions.set(requestId, { rpcId: id, options });
         }
+        return;
+      }
+
+      // ── ACP terminal/* (required once we advertise terminal: true) ──
+      if (method === "terminal/create") {
+        const termId = this.createTerminal(p);
+        this.reply(id, { terminalId: termId });
+        return;
+      }
+      if (method === "terminal/output") {
+        const term = this.terminals.get(String(p.terminalId ?? ""));
+        if (!term) {
+          this.replyError(id, `Unknown terminal: ${p.terminalId}`);
+          return;
+        }
+        this.reply(id, {
+          output: term.output,
+          truncated: term.truncated,
+          exitStatus: term.exited
+            ? { exitCode: term.exitCode, signal: term.signal }
+            : null,
+        });
+        return;
+      }
+      if (method === "terminal/wait_for_exit") {
+        const term = this.terminals.get(String(p.terminalId ?? ""));
+        if (!term) {
+          this.replyError(id, `Unknown terminal: ${p.terminalId}`);
+          return;
+        }
+        if (term.exited) {
+          this.reply(id, { exitCode: term.exitCode, signal: term.signal });
+          return;
+        }
+        await new Promise<void>((resolve) => {
+          term.waiters.push(resolve);
+        });
+        this.reply(id, { exitCode: term.exitCode, signal: term.signal });
+        return;
+      }
+      if (method === "terminal/kill") {
+        const term = this.terminals.get(String(p.terminalId ?? ""));
+        if (term && !term.exited) {
+          try {
+            term.proc.kill("SIGTERM");
+          } catch {
+            /* ignore */
+          }
+        }
+        this.reply(id, {});
+        return;
+      }
+      if (method === "terminal/release") {
+        const tid = String(p.terminalId ?? "");
+        const term = this.terminals.get(tid);
+        if (term) {
+          if (!term.exited) {
+            try {
+              term.proc.kill("SIGTERM");
+            } catch {
+              /* ignore */
+            }
+          }
+          this.terminals.delete(tid);
+        }
+        this.reply(id, {});
         return;
       }
 
@@ -250,6 +379,118 @@ export class GrokAcpAdapter implements AgentProvider {
     fs.writeFileSync(resolved, content, "utf8");
   }
 
+  private emitActivity(
+    text: string | null,
+    phase?:
+      | "idle"
+      | "working"
+      | "thinking"
+      | "tool"
+      | "permission"
+      | "compact"
+      | "queue"
+      | "sleeping"
+      | "error"
+  ): void {
+    if (!this.domainSessionId) return;
+    this.emit({
+      type: "AgentActivity",
+      sessionId: this.domainSessionId,
+      text,
+      phase,
+      at: nowIso(),
+    });
+  }
+
+  private createTerminal(p: Record<string, unknown>): string {
+    const id = `term-${randomUUID()}`;
+    const command = String(p.command ?? "");
+    const args = Array.isArray(p.args) ? (p.args as string[]).map(String) : [];
+    const cwd =
+      typeof p.cwd === "string" && p.cwd
+        ? p.cwd
+        : this.cwd || process.cwd();
+    const byteLimit =
+      typeof p.outputByteLimit === "number" && p.outputByteLimit > 0
+        ? p.outputByteLimit
+        : 1_048_576;
+    const envList = Array.isArray(p.env)
+      ? (p.env as Array<{ name?: string; value?: string }>)
+      : [];
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const e of envList) {
+      if (e?.name) env[e.name] = String(e.value ?? "");
+    }
+
+    // Grok often sends a full shell line as `command` (e.g. `/bin/bash -lc '…'`)
+    // with empty args. Prefer shell:true for that shape; else spawn file+args.
+    const useShell = args.length === 0 && /[\s'"|&;<>]/.test(command);
+    const proc = useShell
+      ? spawn(command, {
+          cwd,
+          env,
+          shell: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        })
+      : spawn(command || "/bin/bash", args.length ? args : ["-lc", "true"], {
+          cwd,
+          env,
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+
+    const term: AcpTerminal = {
+      id,
+      proc,
+      output: "",
+      truncated: false,
+      exitCode: null,
+      signal: null,
+      exited: false,
+      waiters: [],
+      byteLimit,
+    };
+
+    const append = (chunk: Buffer) => {
+      const s = chunk.toString("utf8");
+      term.output += s;
+      if (term.output.length > term.byteLimit) {
+        term.output = term.output.slice(term.output.length - term.byteLimit);
+        term.truncated = true;
+      }
+      // Surface live command output as muted activity (Cursor/Grok "sleeping")
+      const last = s.trim().split("\n").filter(Boolean).pop();
+      if (last) {
+        this.emitActivity(
+          last.length > 80 ? `${last.slice(0, 80)}…` : last,
+          "sleeping"
+        );
+      }
+    };
+    proc.stdout?.on("data", append);
+    proc.stderr?.on("data", append);
+    proc.on("error", (err) => {
+      term.output += `\n[spawn error] ${err.message}`;
+      term.exitCode = 1;
+      term.exited = true;
+      for (const w of term.waiters.splice(0)) w();
+    });
+    proc.on("close", (code, signal) => {
+      term.exitCode = code;
+      term.signal = signal;
+      term.exited = true;
+      for (const w of term.waiters.splice(0)) w();
+      this.emitActivity(null);
+    });
+
+    this.terminals.set(id, term);
+    const label = useShell
+      ? command.slice(0, 60)
+      : `${command} ${args.join(" ")}`.trim().slice(0, 60);
+    this.emitActivity(`Running ${label}${label.length >= 60 ? "…" : ""}`, "tool");
+    return id;
+  }
+
   private handleNotification(method: string, params: unknown): void {
     const p = (params ?? {}) as Record<string, unknown>;
 
@@ -259,7 +500,43 @@ export class GrokAcpAdapter implements AgentProvider {
       return;
     }
 
-    // xAI extension notifications — log tool deltas into timeline
+    // Live activity from sessions list (working / idle)
+    if (method === "_x.ai/sessions/changed" || method === "x.ai/sessions/changed") {
+      const upserted = (p.upserted as Array<Record<string, unknown>>) ?? [];
+      for (const u of upserted) {
+        if (String(u.sessionId ?? "") !== this.providerSessionId) continue;
+        const activity = String(u.activity ?? "");
+        if (activity === "working") {
+          this.emitActivity("Working…", "working");
+        } else if (activity === "idle") {
+          this.emitActivity(null, "idle");
+        }
+      }
+      return;
+    }
+
+    // Prompt queue (shows while compact / queued)
+    if (method === "_x.ai/queue/changed" || method === "x.ai/queue/changed") {
+      if (String(p.sessionId ?? "") && String(p.sessionId) !== this.providerSessionId) {
+        return;
+      }
+      const entries = (p.entries as Array<{ kind?: string; text?: string }>) ?? [];
+      const running = p.runningPromptId ? String(p.runningPromptId) : "";
+      const head = entries[0];
+      if (head?.text?.trim().startsWith("/compact")) {
+        this.emitActivity("Compacting conversation…", "compact");
+      } else if (running && head?.text) {
+        this.emitActivity(
+          `Queued: ${String(head.text).slice(0, 60)}`,
+          "queue"
+        );
+      } else if (running) {
+        this.emitActivity("Waiting for model…", "working");
+      }
+      return;
+    }
+
+    // xAI extension notifications
     if (method === "_x.ai/session_notification" || method === "x.ai/session_notification") {
       const update = (p.update ?? p) as Record<string, unknown>;
       const kind = String(update.sessionUpdate ?? "");
@@ -267,7 +544,8 @@ export class GrokAcpAdapter implements AgentProvider {
         const toolId = String(update.tool_call_id ?? update.toolCallId ?? "delta");
         const name = String(update.name ?? "");
         const argDelta = update.arguments_delta;
-        if (name) {
+        // Only attach real tool names — never "pending: permission" as a tool row
+        if (name && !name.startsWith("pending")) {
           this.emit({
             type: "ToolProgress",
             sessionId: this.domainSessionId,
@@ -275,15 +553,42 @@ export class GrokAcpAdapter implements AgentProvider {
             detail: name + (argDelta ? ` ${String(argDelta).slice(0, 120)}` : ""),
             at: nowIso(),
           });
+          this.emitActivity(`Calling ${name}…`, "tool");
         }
       } else if (kind === "pending_interaction") {
-        this.emit({
-          type: "ToolProgress",
-          sessionId: this.domainSessionId,
-          toolId: String(update.tool_call_id ?? "interaction"),
-          detail: `pending: ${update.kind ?? "interaction"}`,
-          at: nowIso(),
-        });
+        // NOT a tool failure — ephemeral status (Grok TUI small text)
+        const ik = String(update.kind ?? "interaction");
+        if (ik === "permission") {
+          this.emitActivity("Waiting for permission…", "permission");
+        } else {
+          this.emitActivity(`Waiting: ${ik}…`, "working");
+        }
+      } else if (kind === "interaction_resolved") {
+        this.emitActivity(null);
+      } else if (
+        kind === "auto_compact_started" ||
+        kind === "compact_started" ||
+        kind === "compacting"
+      ) {
+        this.emitActivity("Compacting conversation…", "compact");
+      } else if (
+        kind === "auto_compact_completed" ||
+        kind === "compact_completed"
+      ) {
+        const before = update.tokens_before ?? update.tokensBefore;
+        const after = update.tokens_after ?? update.tokensAfter;
+        const msg =
+          before != null && after != null
+            ? `Compacted · ${before} → ${after} tokens`
+            : "Compact complete";
+        this.emitActivity(msg, "compact");
+        // keep longer so user can actually read it
+        setTimeout(() => this.emitActivity(null), 8000);
+      } else if (kind === "turn_completed") {
+        // Don't wipe compact-complete message immediately
+        // (prompt RPC finally may clear separately)
+      } else if (kind === "session_summary_generated") {
+        // ignore for activity strip
       }
     }
   }
@@ -292,6 +597,11 @@ export class GrokAcpAdapter implements AgentProvider {
     const kind = String(update.sessionUpdate ?? update.type ?? "");
     const sid = this.domainSessionId;
     const at = nowIso();
+
+    // session/load (and residual history) must not pollute domain events / UI
+    if (this.absorbUpdates) {
+      return;
+    }
 
     // 用户点了 Stop 之后仍可能收到少量残留 chunk —— 直接丢掉
     if (
@@ -325,6 +635,7 @@ export class GrokAcpAdapter implements AgentProvider {
         const text = content?.text ?? (update.text as string) ?? "";
         if (text) {
           this.emit({ type: "ThoughtChunk", sessionId: sid, text, at });
+          this.emitActivity("Thinking…", "thinking");
         }
         break;
       }
@@ -341,6 +652,12 @@ export class GrokAcpAdapter implements AgentProvider {
           inputSummary: summarize(update.rawInput ?? update.input ?? update.arguments),
           at,
         });
+        this.emitActivity(
+          title.startsWith("Execute") || toolKind === "execute"
+            ? `${title.slice(0, 72)}${title.length > 72 ? "…" : ""}`
+            : `Using ${title.slice(0, 60)}…`,
+          "tool"
+        );
         break;
       }
       case "tool_call_update": {
@@ -411,11 +728,23 @@ export class GrokAcpAdapter implements AgentProvider {
     cwd: string;
     model?: string;
     permissionMode?: string;
-  }): Promise<{ providerSessionId: string }> {
+    /** Reuse Agent Pane domain id so history appends to the same session */
+    domainSessionId?: string;
+    /** Grok ACP session id for session/load */
+    providerSessionId?: string;
+    resumed?: boolean;
+  }): Promise<{
+    providerSessionId: string;
+    domainSessionId: string;
+    resumed: boolean;
+    cwd: string;
+    model?: string;
+    needsHistoryDigest?: boolean;
+  }> {
     this.cwd = opts.cwd;
     this.model = opts.model;
     this.closed = false;
-    this.domainSessionId = randomUUID();
+    this.domainSessionId = opts.domainSessionId ?? randomUUID();
     if (opts.permissionMode === "default" || opts.permissionMode === "ask") {
       this.autoApprove = false;
     } else {
@@ -443,13 +772,28 @@ export class GrokAcpAdapter implements AgentProvider {
     this.rl.on("line", (line) => this.handleLine(line));
 
     this.proc.on("exit", (code) => {
-      if (!this.closed) {
+      const unexpected = !this.closed;
+      this.proc = null;
+      if (unexpected) {
         this.emit({
           type: "SessionError",
           sessionId: this.domainSessionId,
-          message: `grok agent exited (${code})`,
+          message: `grok agent exited (${code}) — send again to resume`,
           at: nowIso(),
         });
+        this.emit({
+          type: "SessionEnded",
+          sessionId: this.domainSessionId,
+          stopReason: `exited:${code ?? "?"}`,
+          at: nowIso(),
+        });
+        for (const h of this.deadHandlers) {
+          try {
+            h(this.domainSessionId);
+          } catch (e) {
+            console.error("[adapter] onDead error", e);
+          }
+        }
       }
     });
 
@@ -457,40 +801,84 @@ export class GrokAcpAdapter implements AgentProvider {
       protocolVersion: 1,
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
-        // Don't claim terminal until we implement terminal/* RPC
+        // Implemented: terminal/create|output|wait_for_exit|kill|release
+        terminal: true,
       },
-      clientInfo: { name: "agent-pane", version: "0.1.1" },
+      clientInfo: { name: "agent-pane", version: "0.1.2" },
     });
 
-    const result = (await this.send("session/new", {
-      cwd: opts.cwd,
-      mcpServers: [],
-    })) as { sessionId?: string };
-
+    /**
+     * Resume strategy: always session/new + history digest (SessionManager).
+     *
+     * session/load can succeed but leave the ACP session in a state where the
+     * next session/prompt never returns (UI shows 60s timeout). New session +
+     * our event-log digest is reliable for "continue this chat".
+     */
+    this.absorbUpdates = false;
+    const result = (await this.send(
+      "session/new",
+      { cwd: opts.cwd, mcpServers: [] },
+      30_000
+    )) as { sessionId?: string };
     this.providerSessionId = result.sessionId ?? randomUUID();
 
-    this.emit({
-      type: "SessionStarted",
-      sessionId: this.domainSessionId,
+    // NOTE: do NOT emit SessionStarted here. SessionManager must register
+    // this adapter in `live` first, then emit — otherwise the UI races a
+    // prompt against an empty live map (idle resume / New Agent + pending).
+    return {
+      providerSessionId: this.providerSessionId,
+      domainSessionId: this.domainSessionId,
+      resumed: Boolean(opts.resumed),
       cwd: opts.cwd,
       model: opts.model,
-      at: nowIso(),
-    });
+      /** Always need digest when resumed (we no longer session/load). */
+      needsHistoryDigest: Boolean(opts.resumed),
+    };
+  }
 
-    return { providerSessionId: this.providerSessionId };
+  /** Optional preamble for first prompt after resume-without-load. */
+  setContextPrefix(text: string | null): void {
+    this.contextPrefix = text && text.trim() ? text.trim() : null;
   }
 
   getSessionId(): string {
     return this.domainSessionId;
   }
 
+  getProviderSessionId(): string {
+    return this.providerSessionId;
+  }
+
   async sendPrompt(input: {
     sessionId: string;
     text: string;
+    /** Shown in UI / history title; defaults to text */
+    displayText?: string;
     attachments?: ContextRef[];
+    /** Retry after reconnect — don't duplicate UserMessageAppended */
+    skipUserEvent?: boolean;
   }): Promise<void> {
+    if (!this.isAlive()) {
+      this.emit({
+        type: "SessionError",
+        sessionId: this.domainSessionId,
+        message: "grok agent not running — send again to resume",
+        at: nowIso(),
+      });
+      throw new Error("agent not alive");
+    }
+
+    // First real user turn after resume/load — accept live updates again
+    this.absorbUpdates = false;
+
+    let promptText = input.text;
+    if (this.contextPrefix) {
+      promptText = `${this.contextPrefix}\n\n---\n\n${input.text}`;
+      this.contextPrefix = null;
+    }
+
     const blocks: Array<Record<string, unknown>> = [
-      { type: "text", text: input.text },
+      { type: "text", text: promptText },
     ];
     if (input.attachments?.length) {
       for (const a of input.attachments) {
@@ -502,16 +890,28 @@ export class GrokAcpAdapter implements AgentProvider {
       }
     }
 
-    this.userTurns.push(input.text);
+    const shown = input.displayText ?? input.text;
     this.turnCancelled = false;
     this.promptInFlight = true;
-    this.emit({
-      type: "UserMessageAppended",
-      sessionId: this.domainSessionId,
-      text: input.text,
-      attachments: input.attachments,
-      at: nowIso(),
-    });
+    if (!input.skipUserEvent) {
+      this.userTurns.push(shown);
+      this.emit({
+        type: "UserMessageAppended",
+        sessionId: this.domainSessionId,
+        text: shown,
+        attachments: input.attachments,
+        at: nowIso(),
+      });
+    }
+
+    // Grok TUI-style status while waiting on the model / slash handlers
+    if (shown.trim().startsWith("/compact")) {
+      this.emitActivity("Compacting conversation…", "compact");
+    } else if (shown.trim().startsWith("/")) {
+      this.emitActivity(`Running ${shown.trim().split(/\s+/)[0]}…`, "working");
+    } else {
+      this.emitActivity("Waiting for model…", "working");
+    }
 
     try {
       const result = (await this.send("session/prompt", {
@@ -520,6 +920,7 @@ export class GrokAcpAdapter implements AgentProvider {
       })) as { stopReason?: string } | undefined;
 
       this.promptInFlight = false;
+      this.emitActivity(null);
       const stop = result?.stopReason ?? "end_turn";
       if (stop === "cancelled" || this.turnCancelled) {
         this.emit({
@@ -610,7 +1011,7 @@ export class GrokAcpAdapter implements AgentProvider {
     note?: string;
   }> {
     if (this.userTurns.length === 0) {
-      throw new Error("没有可撤回的消息");
+      throw new Error("Nothing to undo");
     }
 
     await this.cancel(this.domainSessionId);
@@ -627,11 +1028,11 @@ export class GrokAcpAdapter implements AgentProvider {
 
       const points = pts?.rewind_points ?? [];
       if (points.length === 0) {
-        note = "Grok 侧暂无 rewind 点，仅界面已撤回";
+        note = "UI undid the turn; Grok had no rewind point";
       } else {
         const last = points[points.length - 1]!;
         const target = last.prompt_index;
-        // conversation_only：尽量只撤对话；执行失败时仍做 UI 撤回
+        // conversation_only first; still emit UI rewind either way
         const result = (await this.send("_x.ai/rewind/execute", {
           sessionId: this.providerSessionId,
           target_prompt_index: target,
@@ -644,11 +1045,10 @@ export class GrokAcpAdapter implements AgentProvider {
 
         if (result?.success) {
           providerOk = true;
-          note = "已同步撤回 Grok 会话上下文";
+          note = undefined;
         } else {
           note =
-            "界面已撤回；Grok rewind 未确认成功，若模型仍提上条内容请新开会话或再说「忽略上一条」";
-          // 再试 all 模式（部分版本 success 标志不可靠）
+            "UI undid the turn; Grok rewind not confirmed — model may still recall the last message";
           try {
             await this.send("_x.ai/rewind/execute", {
               sessionId: this.providerSessionId,
@@ -661,7 +1061,7 @@ export class GrokAcpAdapter implements AgentProvider {
         }
       }
     } catch (e) {
-      note = `界面已撤回；Grok rewind 调用失败：${
+      note = `UI undid the turn; Grok rewind failed: ${
         e instanceof Error ? e.message : String(e)
       }`;
     }
@@ -678,6 +1078,90 @@ export class GrokAcpAdapter implements AgentProvider {
     });
 
     return { restoredText, providerOk, note };
+  }
+
+  /**
+   * Weekly credit usage / billing snapshot (Grok TUI `/usage`).
+   * Not advertised in available_commands under ACP — pager-only there;
+   * exposed via extension `_x.ai/billing`.
+   */
+  async fetchBillingUsage(): Promise<{
+    creditUsagePercent?: number;
+    periodType?: string;
+    periodStart?: string;
+    periodEnd?: string;
+    subscriptionTier?: string;
+    onDemandCap?: number;
+    onDemandUsed?: number;
+    prepaidBalance?: number;
+    raw: unknown;
+  }> {
+    if (!this.isAlive() || !this.providerSessionId) {
+      throw new Error("agent not alive");
+    }
+    const result = (await this.send("_x.ai/billing", {
+      sessionId: this.providerSessionId,
+    })) as {
+      config?: Record<string, unknown>;
+      subscription_tier?: string;
+    };
+    const cfg = result?.config ?? {};
+    const period = (cfg.currentPeriod ?? {}) as Record<string, unknown>;
+    const numVal = (v: unknown): number | undefined => {
+      if (typeof v === "number") return v;
+      if (v && typeof v === "object" && "val" in (v as object)) {
+        const n = Number((v as { val: unknown }).val);
+        return Number.isFinite(n) ? n : undefined;
+      }
+      return undefined;
+    };
+    return {
+      creditUsagePercent:
+        typeof cfg.creditUsagePercent === "number"
+          ? cfg.creditUsagePercent
+          : undefined,
+      periodType: typeof period.type === "string" ? period.type : undefined,
+      periodStart:
+        (typeof period.start === "string" ? period.start : undefined) ??
+        (typeof cfg.billingPeriodStart === "string"
+          ? cfg.billingPeriodStart
+          : undefined),
+      periodEnd:
+        (typeof period.end === "string" ? period.end : undefined) ??
+        (typeof cfg.billingPeriodEnd === "string"
+          ? cfg.billingPeriodEnd
+          : undefined),
+      subscriptionTier: result?.subscription_tier,
+      onDemandCap: numVal(cfg.onDemandCap),
+      onDemandUsed: numVal(cfg.onDemandUsed),
+      prepaidBalance: numVal(cfg.prepaidBalance),
+      raw: result,
+    };
+  }
+
+  /** Show a local system-style reply without hitting the model. */
+  emitLocalReply(userText: string, assistantText: string): void {
+    const at = nowIso();
+    this.userTurns.push(userText);
+    this.emit({
+      type: "UserMessageAppended",
+      sessionId: this.domainSessionId,
+      text: userText,
+      at,
+    });
+    this.emit({
+      type: "MessageChunk",
+      sessionId: this.domainSessionId,
+      role: "assistant",
+      text: assistantText,
+      at,
+    });
+    this.emit({
+      type: "MessageDone",
+      sessionId: this.domainSessionId,
+      role: "assistant",
+      at: nowIso(),
+    });
   }
 
   async respondPermission(requestId: string, allow: boolean): Promise<void> {
@@ -707,6 +1191,16 @@ export class GrokAcpAdapter implements AgentProvider {
 
   async stop(): Promise<void> {
     this.closed = true;
+    for (const term of this.terminals.values()) {
+      if (!term.exited) {
+        try {
+          term.proc.kill("SIGTERM");
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    this.terminals.clear();
     this.rl?.close();
     this.proc?.kill();
     this.proc = null;

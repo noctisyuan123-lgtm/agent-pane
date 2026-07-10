@@ -331,12 +331,22 @@ export function formatToolFinished(
 }
 
 export function formatToolFailed(row: ToolRow, error: string): ToolRow {
+  // Prefer a real tool name — never "Failed: pending: permission …"
+  let base = row.label;
+  if (/^pending:/i.test(base) || base.toLowerCase() === "permission") {
+    base = row.name || row.path || "tool";
+  }
+  const err = (error || "").slice(0, 300);
+  // permission denials: clearer message
+  const niceErr = /permission/i.test(err)
+    ? "Permission denied (allow in the prompt card, or switch to Agent mode)"
+    : err;
   return {
     ...row,
     status: "fail",
-    label: row.label.startsWith("Failed") ? row.label : `Failed: ${row.label}`,
-    error,
-    detailLines: [error.slice(0, 300)],
+    label: base.startsWith("Failed") ? base : `Failed: ${base}`,
+    error: niceErr,
+    detailLines: [niceErr],
   };
 }
 

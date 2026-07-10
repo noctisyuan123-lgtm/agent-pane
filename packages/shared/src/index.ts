@@ -30,7 +30,14 @@ export type DomainEventBase = {
 };
 
 export type DomainEvent =
-  | (DomainEventBase & { type: "SessionStarted"; cwd: string; model?: string })
+  | (DomainEventBase & {
+      type: "SessionStarted";
+      cwd: string;
+      model?: string;
+      /** Re-attached to an existing history session — UI must not wipe messages */
+      resumed?: boolean;
+      providerSessionId?: string;
+    })
   | (DomainEventBase & { type: "SessionEnded"; stopReason: string })
   | (DomainEventBase & { type: "SessionError"; message: string })
   | (DomainEventBase & {
@@ -96,10 +103,47 @@ export type DomainEvent =
       /** Grok 侧 rewind 是否成功 */
       providerOk: boolean;
       note?: string;
+    })
+  /**
+   * Live activity strip (Grok TUI-style: "Compacting…", "Waiting for model…",
+   * "Running sleep 2…"). Not a chat bubble — ephemeral status under the thread.
+   */
+  | (DomainEventBase & {
+      type: "AgentActivity";
+      /** null / empty clears the strip */
+      text: string | null;
+      /** coarse phase for UI styling */
+      phase?:
+        | "idle"
+        | "working"
+        | "thinking"
+        | "tool"
+        | "permission"
+        | "compact"
+        | "queue"
+        | "sleeping"
+        | "error";
     });
 
+/** Agent Pane UI modes → grok agent permission / plan behavior */
+export type AgentMode = "agent" | "auto" | "plan";
+
 export type ClientCommand =
-  | { type: "session.create"; cwd: string; model?: string }
+  | {
+      type: "session.create";
+      cwd: string;
+      model?: string;
+      /** agent=always-approve · auto=default · plan=no edits */
+      permissionMode?: AgentMode | string;
+    }
+  | {
+      /** Re-attach live agent to an existing history session (same id) */
+      type: "session.resume";
+      sessionId: string;
+      cwd: string;
+      model?: string;
+      permissionMode?: AgentMode | string;
+    }
   | {
       type: "session.prompt";
       sessionId: string;
