@@ -2330,8 +2330,16 @@ a {
 }
 
 .send-btn.stop {
-  background: var(--red);
+  /* Frosted light gray — not screaming red */
+  background: rgba(210, 210, 215, 0.22);
+  color: rgba(255, 255, 255, 0.9);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+
+.send-btn.stop:hover:not(:disabled) {
+  background: rgba(220, 220, 225, 0.32);
   color: #fff;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
 }
 
 .mode-pill {
@@ -2498,12 +2506,18 @@ a {
   gap: 9px;
   font-size: 12.5px;
   color: rgba(255, 255, 255, 0.42);
-  padding: 6px 2px 4px;
-  margin: 4px 0 2px;
+  padding: 2px 2px 2px;
+  /* Sit snug under the last bubble (offsets .chat-inner gap: 26px) */
+  margin: -18px 0 0;
   line-height: 1.4;
   user-select: none;
   background: transparent;
   border: none;
+}
+
+/* While waiting, don't reserve the ⋯ slot under the last bubble */
+.chat-inner:has(> .agent-activity) > .chat-turn:last-of-type .msg {
+  padding-bottom: 6px;
 }
 
 .agent-activity-text {
@@ -3163,6 +3177,11 @@ a {
   max-width: 100%;
   overflow-wrap: anywhere;
   word-break: break-word;
+  /* Match denser system medium (right reference), not thin Inter 450 */
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Hiragino Sans GB", system-ui, sans-serif;
+  font-weight: 480;
+  -webkit-font-smoothing: auto;
 }
 
 .msg-attach-row {
@@ -3220,6 +3239,10 @@ a {
   line-height: 1.55;
   white-space: pre-wrap;
   max-width: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Hiragino Sans GB", system-ui, sans-serif;
+  font-weight: 480;
+  -webkit-font-smoothing: auto;
 }
 
 .msg.assistant .bubble p {
@@ -3741,6 +3764,11 @@ a {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
+  /* System medium — denser CJK strokes like the right reference */
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Hiragino Sans GB", system-ui, sans-serif;
+  font-weight: 480;
+  -webkit-font-smoothing: auto;
 }
 
 .assistant-text p {
