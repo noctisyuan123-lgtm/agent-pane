@@ -1,6 +1,6 @@
 # Agent Pane
 
-整窗 Agent UI（Cursor Agent 布局灵感）+ 本机 **Grok ACP** 后端。
+A full-window agent UI (inspired by Cursor’s Agent layout) backed by a local **Grok ACP** bridge.
 
 ```
 React UI  ──WS──►  Bridge  ──Domain Event Store──► UI
@@ -10,76 +10,97 @@ React UI  ──WS──►  Bridge  ──Domain Event Store──► UI
                      └─ Diff Engine (git/fs)
 ```
 
-## 要求
+## Requirements
 
-- Node 20+
-- 已安装并登录 Grok CLI（`~/.grok/bin/grok`）
-- 建议在 **git 仓库** 里工作（Diff / Reject 最稳）
+- Node.js 20+
+- Grok CLI installed and signed in (`~/.grok/bin/grok`)
+- Prefer working inside a **git repository** (Diff / Reject work best there)
 
-## 桌面端（推荐）
+## Desktop (recommended)
 
-已打好 macOS arm64 包：
+Build macOS arm64 bundles with:
+
+```bash
+cd ~/agent-pane
+npm install
+npm run desktop:build
+```
+
+Outputs:
 
 ```text
 apps/desktop/src-tauri/target/release/bundle/macos/Agent Pane.app
 apps/desktop/src-tauri/target/release/bundle/dmg/Agent Pane_0.1.0_aarch64.dmg
 ```
 
-双击 `.app` 即可；启动时会自动拉起本地 Bridge（`127.0.0.1:8787`）。  
-需要本机已安装 **Node**（找得到 `node`）且 **Grok CLI** 在 `~/.grok/bin`。
+Double-click the `.app` to launch. It starts the local Bridge on `127.0.0.1:8787`.  
+You still need **Node** on `PATH` and the **Grok CLI** under `~/.grok/bin`.
 
-重新打包：
+If `cargo` fails to fetch crates, set a working proxy first, for example:
 
 ```bash
-cd ~/agent-pane
-npm install
-# 若 cargo 拉 crates 失败，确保代理可用后：
 export http_proxy=http://127.0.0.1:7892 https_proxy=http://127.0.0.1:7892
 npm run desktop:build
 ```
 
-开发模式（热更新 UI）：
+Dev mode (hot-reload UI):
 
 ```bash
-npm run desktop:dev   # 需另开或自动起 web dev server
+npm run desktop:dev
 ```
 
-## Web 开发模式
+## Web development
 
 ```bash
 cd ~/agent-pane
 npm install
 npm run build -w @agent-pane/shared
 
-# 终端 1
+# Terminal 1
 npm run dev:bridge
 
-# 终端 2
+# Terminal 2
 npm run dev:web
 ```
 
-浏览器打开：http://127.0.0.1:5173
+Open http://127.0.0.1:5173
 
-1. 点 **打开项目…** / 顶栏 **选择**（系统文件夹对话框）或左侧 Recent/Projects  
-2. 中间输入框写需求，点 **Start**（自动新会话 + 发送）  
-3. 或先 **New Agent** 再聊  
+1. Pick a project folder (Open… / header **Choose** / Recent projects)
+2. Type a task in the composer and hit **Start** (creates a session and sends)
+3. Or click **New Agent**, then chat
 
-> **和 Grok Build 的关系：** Agent Pane 走的是 CLI 里的 `grok agent stdio`（ACP 协议），**不依赖** Grok Build TUI 菜单里有没有「Agent 模式」。只要 `~/.grok/bin/grok` 能登录、能跑 agent 即可。 
+> **Relation to Grok Build:** Agent Pane talks to `grok agent stdio` (ACP). It does **not** depend on a TUI “Agent mode” menu entry. As long as `~/.grok/bin/grok` can authenticate and run the agent, you are good.
 
-## 环境变量
+## Features
 
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `GROK_BIN` | `~/.grok/bin/grok` | Grok CLI 路径 |
-| `AGENT_PANE_PORT` | `8787` | Bridge 端口 |
-| `AGENT_PANE_PERMISSION` | `auto` | `auto` 会给 grok `--always-approve` |
-| `VITE_BRIDGE_WS` | `ws://127.0.0.1:8787` | 前端 WS |
+- Streaming chat with tool timeline, thoughts, and task lists
+- Session history, resume, and workspace-bound projects
+- Git/FS diff review (Accept / Reject) via workspace snapshots
+- Hardened tool shells (`bash --noprofile --norc -s`) with healthy PATH
+- Embedded terminal and agent browser panels (desktop)
+- Glass dark UI with translucent tables, code blocks, and composer
 
-## 数据目录
+## Environment variables
 
-- Event Store: `~/.agent-pane/sessions/<id>/events.jsonl`
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GROK_BIN` | `~/.grok/bin/grok` | Path to the Grok CLI |
+| `AGENT_PANE_PORT` | `8787` | Bridge HTTP/WS port |
+| `AGENT_PANE_PERMISSION` | `auto` | `auto` passes `--always-approve` to grok |
+| `VITE_BRIDGE_WS` | `ws://127.0.0.1:8787` | Frontend WebSocket URL |
+
+## Data directories
+
+- Event store: `~/.agent-pane/sessions/<id>/events.jsonl`
 - Snapshots: `~/.agent-pane/snapshots/<id>/`
 
-## Spec
+## Specs & docs
 
-`docs/superpowers/specs/2026-07-09-agent-pane-design.md`
+- [Design spec](docs/superpowers/specs/2026-07-09-agent-pane-design.md)
+- [Embedded terminal & agent browser](docs/superpowers/specs/2026-07-11-embedded-terminal-agent-browser-design.md)
+- [ACP resume research](docs/research/acp-resume-patterns.md)
+- [Open-source UI references](docs/open-source-agent-ui-refs.md)
+
+## License
+
+See the repository for license details if published.

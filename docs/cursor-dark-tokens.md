@@ -31,4 +31,4 @@ Sources:
 | border | `rgba(255,255,255,.06/.10)` | `--glass-border*` |
 | text | white @ 88% / 55% / 32% | `--text*` |
 
-Web 用 `backdrop-filter` 模拟 macOS vibrancy；真 NSVisualEffect 留给 Tauri 后期。
+Web uses `backdrop-filter` to approximate macOS vibrancy; real `NSVisualEffect` is left for the Tauri shell.
