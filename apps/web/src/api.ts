@@ -47,6 +47,29 @@ export function peekHistoryCache(): HistoryGroup[] | null {
   return historyMem?.groups ?? null;
 }
 
+export async function fetchSessionMeta(
+  sessionId: string
+): Promise<SessionMeta | null> {
+  const res = await fetch(
+    `${BRIDGE_HTTP}/api/history/${encodeURIComponent(sessionId)}`
+  );
+  if (res.ok) {
+    const data = (await res.json()) as { meta?: SessionMeta };
+    if (data.meta) return data.meta;
+  }
+  // Fallback for older bridges without GET /api/history/:id
+  if (res.status === 404 || !res.ok) {
+    const groups = await fetchHistory(true);
+    for (const g of groups) {
+      const hit = g.sessions.find((s) => s.sessionId === sessionId);
+      if (hit) return hit;
+    }
+    if (res.status === 404) return null;
+    throw new Error(`Failed to load session meta HTTP ${res.status}`);
+  }
+  return null;
+}
+
 export async function fetchSessionEvents(
   sessionId: string,
   force = true
@@ -96,10 +119,21 @@ export async function patchSessionMeta(
   return data.meta;
 }
 
-export async function forkSessionApi(sessionId: string): Promise<SessionMeta> {
+export async function forkSessionApi(
+  sessionId: string,
+  opts?: { throughUserTurn?: number }
+): Promise<SessionMeta> {
   const res = await fetch(
     `${BRIDGE_HTTP}/api/history/${encodeURIComponent(sessionId)}/fork`,
-    { method: "POST" }
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        opts?.throughUserTurn != null
+          ? { throughUserTurn: opts.throughUserTurn }
+          : {}
+      ),
+    }
   );
   if (!res.ok) throw new Error(await res.text());
   const data = (await res.json()) as { meta: SessionMeta };
@@ -179,12 +213,188 @@ export async function fetchSkills(cwd?: string): Promise<SkillEntry[]> {
   return data.skills ?? [];
 }
 
+export type CustomizeFile = {
+  id: string;
+  name: string;
+  path: string;
+  kind: "rule" | "memory";
+  content: string;
+};
+
+export type GrokMcpServer = {
+  name: string;
+  enabled: boolean;
+  command?: string;
+  args?: string[];
+  env: Record<string, string>;
+};
+
+export type CustomizeMcpState = {
+  grokConfigPath: string;
+  cursorMcpPath: string;
+  grok: GrokMcpServer[];
+  cursorJson: string;
+};
+
+export async function fetchContextUsage(opts: {
+  sessionId?: string;
+  cwd?: string;
+  providerSessionId?: string;
+}): Promise<{
+  used: number;
+  size: number;
+  pct: number;
+  source: "signals";
+} | null> {
+  const q = new URLSearchParams();
+  if (opts.sessionId) q.set("sessionId", opts.sessionId);
+  if (opts.cwd) q.set("cwd", opts.cwd);
+  if (opts.providerSessionId) q.set("providerSessionId", opts.providerSessionId);
+  const res = await fetch(`${BRIDGE_HTTP}/api/context-usage?${q}`);
+  if (!res.ok) return null;
+  const data = (await res.json()) as {
+    ok?: boolean;
+    usage?: {
+      used: number;
+      size: number;
+      pct: number;
+      source: "signals";
+    } | null;
+  };
+  if (!data.ok || !data.usage) return null;
+  return data.usage;
+}
+
+export async function fetchCustomizeFiles(): Promise<CustomizeFile[]> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/customize/files`);
+  if (!res.ok) return [];
+  const data = (await res.json()) as { files: CustomizeFile[] };
+  return data.files ?? [];
+}
+
+export async function saveCustomizeFile(
+  id: string,
+  content: string
+): Promise<CustomizeFile> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/customize/files`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, content }),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(t || `save failed HTTP ${res.status}`);
+  }
+  const data = (await res.json()) as { file: CustomizeFile };
+  return data.file;
+}
+
+export async function fetchCustomizeMcp(): Promise<CustomizeMcpState | null> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/customize/mcp`);
+  if (!res.ok) return null;
+  return (await res.json()) as CustomizeMcpState;
+}
+
+export async function saveCustomizeMcp(input: {
+  grok?: Array<{
+    name: string;
+    enabled?: boolean;
+    env?: Record<string, string>;
+  }>;
+  cursorJson?: string;
+}): Promise<CustomizeMcpState> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/customize/mcp`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    let msg = `save MCP failed HTTP ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body.error) msg = body.error;
+    } catch {
+      /* keep */
+    }
+    throw new Error(msg);
+  }
+  return (await res.json()) as CustomizeMcpState;
+}
+
 export async function rememberPath(p: string): Promise<void> {
   await fetch(`${BRIDGE_HTTP}/api/recent`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path: p }),
   }).catch(() => undefined);
+}
+
+export type FsListEntry = {
+  name: string;
+  path: string;
+  kind: "file" | "dir";
+  size?: number;
+};
+
+export async function listFs(
+  root: string,
+  dirPath = "."
+): Promise<FsListEntry[]> {
+  const q = new URLSearchParams({ root, path: dirPath });
+  const res = await fetch(`${BRIDGE_HTTP}/api/fs/list?${q}`);
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(t || `fs/list failed HTTP ${res.status}`);
+  }
+  const data = (await res.json()) as { entries?: FsListEntry[] };
+  return data.entries ?? [];
+}
+
+export async function revealInFinder(target: string): Promise<void> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/fs/reveal`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: target }),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(t || `reveal failed HTTP ${res.status}`);
+  }
+}
+
+/** Open a local path with the OS default app. */
+export async function openLocalPath(target: string): Promise<void> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/fs/open`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: target }),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(t || `open failed HTTP ${res.status}`);
+  }
+}
+
+/** URL that serves a local file through the bridge (for <img> / preview). */
+export function localFileUrl(absPath: string): string {
+  return `${BRIDGE_HTTP}/api/fs/file?path=${encodeURIComponent(absPath)}`;
+}
+
+export function isImageAttachment(name: string, mime?: string | null): boolean {
+  if (mime && mime.startsWith("image/")) return true;
+  return /\.(png|jpe?g|gif|webp|bmp|svg|heic|avif)$/i.test(name);
+}
+
+export async function openIterm(cwd: string): Promise<void> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/terminal/iterm`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd }),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(t || `iterm failed HTTP ${res.status}`);
+  }
 }
 
 /** Persist a dropped/pasted file for attachment (returns absolute path). */
@@ -203,6 +413,22 @@ export async function uploadAttachment(input: {
     throw new Error(t || `Upload failed HTTP ${res.status}`);
   }
   return (await res.json()) as { path: string; name: string; size: number };
+}
+
+/** Copy an absolute path into ~/.agent-pane/uploads (screenshots / temp files). */
+export async function persistLocalAttachment(
+  absPath: string
+): Promise<{ path: string; name: string; mime?: string }> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/fs/persist`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: absPath }),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(t || `Persist failed HTTP ${res.status}`);
+  }
+  return (await res.json()) as { path: string; name: string; mime?: string };
 }
 
 export function fileToBase64(file: Blob): Promise<string> {

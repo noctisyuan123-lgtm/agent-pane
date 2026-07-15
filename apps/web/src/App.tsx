@@ -5,12 +5,31 @@ import {
   useMemo,
   useRef,
   useState,
+  type MouseEvent as ReactMouseEvent,
 } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { useBridge } from "./useBridge";
+import rehypeHighlight from "rehype-highlight";
+import { AgentBrowserPanel } from "./AgentBrowserPanel";
+import { CustomizePanel } from "./CustomizePanel";
+import { TerminalPanel } from "./TerminalPanel";
+import { SessionWorkingDots } from "./SessionWorkingDots";
+import { WorkspacePicker } from "./WorkspacePicker";
+import {
+  buildContextBreakdown,
+  formatTokenCount,
+} from "./contextUsage";
+import { useBridge, userTurnIndexAt } from "./useBridge";
+import type { AgentMode } from "./useBridge";
+import {
+  effortLabelFor,
+  getEffortFor,
+} from "./modelEffort";
 import { ToolTimeline } from "./ToolTimeline";
+import { renderLiveTurnBody } from "./LiveProcessStack";
+import { groupChatIntoTurns, WorkedForFold } from "./TurnBlocks";
+import type { ChatItem } from "./chatFromEvents";
 import {
   deleteSessionApi,
   fetchHistory,
@@ -21,11 +40,18 @@ import {
   forkSessionApi,
   formatRelTime,
   invalidateHistoryClientCache,
+  isImageAttachment,
+  localFileUrl,
+  openLocalPath,
   patchSessionMeta,
   peekHistoryCache,
+  persistLocalAttachment,
+  listFs,
   pickFolder,
   rememberPath,
+  revealInFinder,
   uploadAttachment,
+  type FsListEntry,
   type HistoryGroup,
   type ProjectEntry,
   type SessionMeta,
@@ -49,33 +75,31 @@ import {
   IconBell,
   IconBook,
   IconBug,
+  IconAsk,
   IconChevron,
+  IconCheck,
   IconCopy,
+  IconCustomize,
+  IconDiff,
+  IconFile,
   IconFolder,
   IconFolderOpen,
   IconFork,
+  IconGlobe,
+  IconLayers,
   IconList,
   IconMoreVertical,
   IconPaperPlane,
   IconPencil,
   IconPin,
   IconPlus,
-  IconQuestion,
   IconRefresh,
-  IconSpark,
+  IconSidebar,
   IconStop,
   IconTerminal,
   IconTrash,
   IconUndo,
 } from "./icons";
-import type { ChatItem } from "./useBridge";
-
-function shortPath(p: string): string {
-  if (!p) return "No project selected";
-  const parts = p.replace(/\/$/, "").split("/").filter(Boolean);
-  if (parts.length <= 2) return p;
-  return parts.slice(-2).join("/");
-}
 
 /** Folder name for home breadcrumb (Cursor-style workspace label). */
 function folderName(p: string): string {
@@ -86,9 +110,19 @@ function folderName(p: string): string {
 
 /** Models from `grok models` on this machine — passed to `grok agent -m`. */
 const MODEL_OPTIONS = [
-  { id: "grok-4.5", label: "Grok 4.5" },
-  { id: "grok-composer-2.5-fast", label: "Composer 2.5" },
+  { id: "grok-4.5", label: "Grok 4.5", supportsEffort: true },
+  {
+    id: "grok-composer-2.5-fast",
+    label: "Composer 2.5",
+    supportsEffort: true,
+  },
 ] as const;
+
+const EFFORT_OPTIONS = [
+  { id: "low" as const, label: "Low" },
+  { id: "medium" as const, label: "Medium" },
+  { id: "high" as const, label: "High" },
+];
 
 const DEFAULT_MODEL = MODEL_OPTIONS[0].id;
 
@@ -98,28 +132,6 @@ const MODEL_CONTEXT_TOKENS: Record<string, number> = {
   "grok-composer-2.5-fast": 128_000,
 };
 const DEFAULT_CONTEXT_TOKENS = 128_000;
-
-/** Rough session token estimate from chat text (~4 chars / token). */
-function estimateSessionTokens(messages: ChatItem[], draft = ""): number {
-  let chars = draft.length;
-  for (const m of messages) {
-    if (
-      m.kind === "user" ||
-      m.kind === "assistant" ||
-      m.kind === "thought" ||
-      m.kind === "status"
-    ) {
-      chars += m.text.length;
-    } else if (m.kind === "tools") {
-      for (const t of m.tools) {
-        chars += (t.label?.length ?? 0) + (t.detailLines?.join("").length ?? 0);
-      }
-    } else if (m.kind === "turn_log") {
-      for (const line of m.lines) chars += line.text.length;
-    }
-  }
-  return Math.max(0, Math.ceil(chars / 4));
-}
 
 /** Cursor / Grok-style agent modes */
 const MODE_OPTIONS = [
@@ -193,14 +205,81 @@ function useAutoGrow(
   ref: React.RefObject<HTMLTextAreaElement | null>,
   value: string,
   opts: { min: number; max: number }
-) {
-  useEffect(() => {
+): boolean {
+  const [crowded, setCrowded] = useState(false);
+  const crowdedRef = useRef(false);
+
+  /**
+   * Crowded = model should drop to bottom-left.
+   * Measure wrap at COMPACT (narrow) width — i.e. with model still on the right.
+   * That way: first line fills until it would wrap → push model down → then grow to 2+ lines.
+   * Decision does not depend on current layout, so no twitch loop.
+   */
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+
+    if (!value.trim()) {
+      if (crowdedRef.current) {
+        crowdedRef.current = false;
+        setCrowded(false);
+      }
+      return;
+    }
+    if (value.includes("\n")) {
+      if (!crowdedRef.current) {
+        crowdedRef.current = true;
+        setCrowded(true);
+      }
+      return;
+    }
+
+    const shell = el.closest(".composer-shell") as HTMLElement | null;
+    const shellW = shell?.clientWidth ?? el.clientWidth;
+    const chip = shell?.querySelector(".model-chip-btn") as HTMLElement | null;
+    const modelW = Math.max(chip?.offsetWidth ?? 0, 120);
+    // plus(28) + send(32) + gaps(~16) + shell pad(~16) + model chip
+    const reserve = 28 + 32 + 16 + 16 + modelW;
+    const narrowTaW = Math.max(100, shellW - reserve);
+
+    const cs = getComputedStyle(el);
+    const probe = document.createElement("div");
+    probe.style.cssText = [
+      "position:absolute",
+      "left:-9999px",
+      "top:0",
+      "visibility:hidden",
+      `width:${narrowTaW}px`,
+      `font:${cs.font}`,
+      `letter-spacing:${cs.letterSpacing}`,
+      `line-height:${cs.lineHeight}`,
+      "white-space:pre-wrap",
+      "word-break:break-word",
+      "padding:0",
+    ].join(";");
+    probe.textContent = value;
+    document.body.appendChild(probe);
+    const h = probe.scrollHeight;
+    document.body.removeChild(probe);
+
+    const lineH = Number.parseFloat(cs.lineHeight) || opts.min || 20;
+    const wrapsNarrow = h > lineH * 1.4;
+    if (wrapsNarrow !== crowdedRef.current) {
+      crowdedRef.current = wrapsNarrow;
+      setCrowded(wrapsNarrow);
+    }
+  }, [value, ref, opts.min]);
+
+  useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
     el.style.height = "auto";
     const next = Math.min(opts.max, Math.max(opts.min, el.scrollHeight));
     el.style.height = `${next}px`;
-  }, [value, ref, opts.min, opts.max]);
+    el.style.overflowY = next >= opts.max - 1 ? "auto" : "hidden";
+  }, [value, crowded, ref, opts.min, opts.max]);
+
+  return crowded;
 }
 
 export function App() {
@@ -213,6 +292,8 @@ export function App() {
   );
   const [expandedCwd, setExpandedCwd] = useState<Record<string, boolean>>({});
   const [manualOpen, setManualOpen] = useState(false);
+  const [wsPickerOpen, setWsPickerOpen] = useState(false);
+  const homeLabelRef = useRef<HTMLButtonElement>(null);
   const [manualPath, setManualPath] = useState("");
   const [picking, setPicking] = useState(false);
   const [showJumpBottom, setShowJumpBottom] = useState(false);
@@ -242,35 +323,61 @@ export function App() {
   const [respMenuPos, setRespMenuPos] = useState<{ x: number; y: number } | null>(
     null
   );
-  /** Which assistant bubble the ⋯ menu is for */
+  /** Which message bubble the ⋯ menu is for */
   const [respMenuTarget, setRespMenuTarget] = useState<{
     text: string;
-    isLast: boolean;
+    messageIndex: number;
+    /** Can mutate timeline (not mid-stream) */
+    canMutate: boolean;
   } | null>(null);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [effortMenuOpen, setEffortMenuOpen] = useState(false);
+  const [customizeOpen, setCustomizeOpen] = useState(false);
+  const modelBtnRef = useRef<HTMLButtonElement>(null);
+  const [rightTab, setRightTab] = useState<
+    "changes" | "browser" | "terminal" | "files" | null
+  >("changes");
+  const [rightOpen, setRightOpen] = useState(true);
+  const [fsRel, setFsRel] = useState(".");
+  const [fsEntries, setFsEntries] = useState<FsListEntry[]>([]);
+  const [fsLoading, setFsLoading] = useState(false);
+  const [fsError, setFsError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<
-    { path: string; name: string; kind: "file" | "folder" }[]
+    { path: string; name: string; kind: "file" | "folder"; mime?: string }[]
   >([]);
+  const [attachPreview, setAttachPreview] = useState<{
+    path: string;
+    name: string;
+  } | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [slashHi, setSlashHi] = useState(0);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const chatRef = useRef<HTMLElement | null>(null);
+  /** Follow new output only while user is pinned near the bottom. */
+  const stickToBottomRef = useRef(true);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const plusBtnRef = useRef<HTMLButtonElement>(null);
   const plusMenuRef = useRef<HTMLDivElement>(null);
-  const respMenuBtnRef = useRef<HTMLButtonElement>(null);
   const composerShellRef = useRef<HTMLDivElement>(null);
   const createFn = useRef(b.createSession);
   createFn.current = b.createSession;
 
   const hasMessages = b.messages.length > 0;
+  /** Resume/history must keep Send — not Stop */
+  const showStop = b.busy && hasMessages && !b.resuming && !b.historyOnly;
   /** 有消息才进对话布局；空会话/新会话 = Cursor 式居中 Home */
   const showHome = !hasMessages;
-  // follow-up bar: single-line grow; home hero: Cursor empty = ~1 line
-  const growMin = showHome ? 18 : 22;
-  const growMax = showHome ? 120 : 140;
-  useAutoGrow(taRef, input, { min: growMin, max: growMax });
+  // Home hero: always roomy toolbar row (model bottom-left); follow-up uses auto crowded
+  const growMin = showHome ? 56 : 22;
+  const growMax = showHome ? 160 : 140;
+  const composerCrowdedAuto = useAutoGrow(taRef, input, {
+    min: growMin,
+    max: growMax,
+  });
+  const composerCrowded = showHome ? true : composerCrowdedAuto;
 
   useEffect(() => {
     if (b.restoredDraft != null) {
@@ -278,6 +385,106 @@ export function App() {
       b.clearRestoredDraft();
     }
   }, [b.restoredDraft, b]);
+
+  useEffect(() => {
+    setFsRel(".");
+    setFsEntries([]);
+    setFsError(null);
+  }, [b.cwd]);
+
+  useEffect(() => {
+    if (rightTab !== "files" || !b.cwd) return;
+    let cancelled = false;
+    setFsLoading(true);
+    setFsError(null);
+    void listFs(b.cwd, fsRel)
+      .then((entries) => {
+        if (!cancelled) setFsEntries(entries);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setFsEntries([]);
+          setFsError(e instanceof Error ? e.message : String(e));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setFsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [rightTab, b.cwd, fsRel]);
+
+  useEffect(() => {
+    if (!usageOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t?.closest(".session-usage")) return;
+      setUsageOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setUsageOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [usageOpen]);
+
+  useEffect(() => {
+    if (!modelMenuOpen && !effortMenuOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t?.closest(".model-picker")) return;
+      setModelMenuOpen(false);
+      setEffortMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setEffortMenuOpen(false);
+        setModelMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [modelMenuOpen, effortMenuOpen]);
+
+  const modelMeta =
+    MODEL_OPTIONS.find((m) => m.id === b.model) ?? MODEL_OPTIONS[0];
+  const effortLabel = effortLabelFor({
+    effort: b.effort,
+    fast: b.effortFast,
+  });
+  const modelChipLabel = `${modelMeta.label} ${effortLabel}`;
+
+  const pickModel = (id: string) => {
+    b.setModel(id);
+    localStorage.setItem("agent-pane-model", id);
+    // Keep menus open — prefs load per model; close by clicking outside
+  };
+
+  const toggleEffortFast = () => {
+    b.setEffortFast(!b.effortFast);
+  };
+
+  const openModelEffortEdit = (e: ReactMouseEvent, modelId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    pickModel(modelId);
+    setModelMenuOpen(true);
+    setEffortMenuOpen(true);
+  };
+
+  const pickEffort = (id: "low" | "medium" | "high") => {
+    b.setEffort(id);
+    // Persist for current model; leave menus open until outside click
+  };
 
   const refreshLists = useCallback(async (forceHistory = false) => {
     const [r, p, h] = await Promise.all([
@@ -294,22 +501,6 @@ export function App() {
     // 首屏强制拉 history，避免空 cache / 以为「记录没了」
     void refreshLists(true);
   }, [refreshLists]);
-
-  // 有会话的项目一律保持可展开；若被误点折起，刷新后仍默认打开
-  useEffect(() => {
-    if (history.length === 0) return;
-    setExpandedCwd((m) => {
-      let changed = false;
-      const next = { ...m };
-      for (const g of history) {
-        if (g.sessions.length > 0 && next[g.cwd] !== true) {
-          next[g.cwd] = true;
-          changed = true;
-        }
-      }
-      return changed ? next : m;
-    });
-  }, [history]);
 
   /** Flat list — always visible, not buried under collapsed project folders */
   const flatSessions = useMemo(() => {
@@ -350,12 +541,31 @@ export function App() {
     [flatSessions, localPins]
   );
 
-  /** Resizable sidebar width (Cursor-style) */
+  /** Left sidebar width (independent of right rail) */
   const [sidebarW, setSidebarW] = useState(() => {
     const n = Number(localStorage.getItem("agent-pane-sidebar-w") || "248");
     return Number.isFinite(n) ? Math.min(420, Math.max(180, n)) : 248;
   });
-  const sidebarDrag = useRef<{ startX: number; startW: number } | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem("agent-pane-sidebar-collapsed") === "1"
+  );
+  /**
+   * Right rail width. Default matches left bar; Terminal/Files/Browser widen;
+   * Changes snaps back to left width.
+   */
+  const [rightRailW, setRightRailW] = useState(() => {
+    const n = Number(localStorage.getItem("agent-pane-right-rail-w") || "");
+    if (Number.isFinite(n) && n > 0) return Math.min(720, Math.max(180, n));
+    const left = Number(localStorage.getItem("agent-pane-sidebar-w") || "248");
+    return Number.isFinite(left) ? Math.min(420, Math.max(180, left)) : 248;
+  });
+  const [railResizing, setRailResizing] = useState(false);
+  const sidebarDrag = useRef<{
+    startX: number;
+    startW: number;
+    /** left = sidebar; right = right-rail */
+    edge: "left" | "right";
+  } | null>(null);
 
   useEffect(() => {
     document.documentElement.style.setProperty(
@@ -366,13 +576,40 @@ export function App() {
   }, [sidebarW]);
 
   useEffect(() => {
+    localStorage.setItem(
+      "agent-pane-sidebar-collapsed",
+      sidebarCollapsed ? "1" : "0"
+    );
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty(
+      "--right-rail-w",
+      `${rightRailW}px`
+    );
+    localStorage.setItem("agent-pane-right-rail-w", String(rightRailW));
+  }, [rightRailW]);
+
+  useEffect(() => {
     const onMove = (e: MouseEvent) => {
       const d = sidebarDrag.current;
       if (!d) return;
-      const next = Math.min(420, Math.max(180, d.startW + (e.clientX - d.startX)));
-      setSidebarW(next);
+      if (d.edge === "left") {
+        const next = Math.min(
+          420,
+          Math.max(180, d.startW + (e.clientX - d.startX))
+        );
+        setSidebarW(next);
+      } else {
+        const next = Math.min(
+          720,
+          Math.max(180, d.startW + (d.startX - e.clientX))
+        );
+        setRightRailW(next);
+      }
     };
     const onUp = () => {
+      if (sidebarDrag.current) setRailResizing(false);
       sidebarDrag.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
@@ -385,6 +622,21 @@ export function App() {
     };
   }, []);
 
+  const openRightTab = (
+    tab: "changes" | "browser" | "terminal" | "files"
+  ) => {
+    setRightOpen(true);
+    setRightTab(tab);
+    if (tab === "changes") {
+      // Snap back to left-bar width
+      setRightRailW(sidebarW);
+    } else if (tab === "terminal" || tab === "files") {
+      setRightRailW((w) => Math.max(w, Math.max(sidebarW + 160, 420)));
+    } else if (tab === "browser") {
+      setRightRailW((w) => Math.max(w, Math.max(sidebarW + 120, 400)));
+    }
+  };
+
   // 有真实对话后再刷 history（空 New Agent 不应进侧栏）
   useEffect(() => {
     if (!b.sessionId || b.messages.length === 0) return;
@@ -392,33 +644,94 @@ export function App() {
     return () => clearTimeout(t);
   }, [b.sessionId, b.messages.length, refreshLists]);
 
-  // auto scroll only when near bottom
-  useEffect(() => {
-    const el = chatRef.current;
-    if (!el) return;
-    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (dist < 120) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-      setShowJumpBottom(false);
-    } else {
-      setShowJumpBottom(true);
-    }
-  }, [b.messages, b.diffs, b.tasks]);
+  const NEAR_BOTTOM_PX = 48;
+  /** Re-pin only when truly at bottom (hysteresis — avoids 一抽一抽). */
+  const REPIN_BOTTOM_PX = 16;
 
-  useEffect(() => {
+  const scrollChatToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
     const el = chatRef.current;
     if (!el) return;
-    const onScroll = () => {
+    if (behavior === "smooth") {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    } else {
+      // Instant — smooth + streaming = 一抽一抽
+      el.scrollTop = el.scrollHeight;
+    }
+    setShowJumpBottom(false);
+  }, []);
+
+  const pinChatToBottom = useCallback(() => {
+    stickToBottomRef.current = true;
+    // After send, DOM grows on next paint — pin now and once more after layout
+    scrollChatToBottom("auto");
+    requestAnimationFrame(() => {
+      if (stickToBottomRef.current) scrollChatToBottom("auto");
+    });
+  }, [scrollChatToBottom]);
+
+  // Stream / layout growth: stick only if user hasn't scrolled away
+  useLayoutEffect(() => {
+    if (!hasMessages) return;
+    if (!stickToBottomRef.current) {
+      const el = chatRef.current;
+      if (el) {
+        const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+        setShowJumpBottom(dist > REPIN_BOTTOM_PX);
+      }
+      return;
+    }
+    scrollChatToBottom("auto");
+  }, [b.messages, b.diffs, b.tasks, b.statusMsg, b.busy, hasMessages, scrollChatToBottom]);
+
+  // User scroll / wheel: release stick when reading history
+  useEffect(() => {
+    const el = chatRef.current;
+    if (!el || !hasMessages) return;
+
+    const syncStickFromPosition = () => {
       const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
-      setShowJumpBottom(dist > 160);
+      if (stickToBottomRef.current) {
+        // Already following — only unpin after clearly leaving the bottom
+        if (dist > NEAR_BOTTOM_PX) {
+          stickToBottomRef.current = false;
+          setShowJumpBottom(true);
+        } else {
+          setShowJumpBottom(false);
+        }
+      } else if (dist <= REPIN_BOTTOM_PX) {
+        // Was reading history — re-pin only when they scroll all the way down
+        stickToBottomRef.current = true;
+        setShowJumpBottom(false);
+      } else {
+        setShowJumpBottom(true);
+      }
     };
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
+
+    const onWheel = (e: WheelEvent) => {
+      // Intentional upward gesture → release immediately (don't wait for threshold)
+      if (e.deltaY < 0) {
+        stickToBottomRef.current = false;
+        setShowJumpBottom(true);
+      }
+    };
+
+    const onTouchMove = () => {
+      requestAnimationFrame(syncStickFromPosition);
+    };
+
+    el.addEventListener("scroll", syncStickFromPosition, { passive: true });
+    el.addEventListener("wheel", onWheel, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", syncStickFromPosition);
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("touchmove", onTouchMove);
+    };
   }, [hasMessages]);
 
   const jumpBottom = () => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    setShowJumpBottom(false);
+    stickToBottomRef.current = true;
+    scrollChatToBottom("smooth");
   };
 
   const selectCwd = async (path: string, opts?: { expand?: boolean }) => {
@@ -426,9 +739,9 @@ export function App() {
     localStorage.setItem("agent-pane-cwd", path);
     await rememberPath(path);
     await refreshLists(false);
-    // 不要强行展开，否则点文件夹折叠会被 selectCwd 再打开
+    // Accordion: only the selected folder stays open
     if (opts?.expand) {
-      setExpandedCwd((m) => ({ ...m, [path]: true }));
+      setExpandedCwd({ [path]: true });
     }
   };
 
@@ -607,12 +920,17 @@ export function App() {
     setPicking(true);
     try {
       const path = await pickFolder();
-      if (path) await selectCwd(path);
+      if (path) await selectCwd(path, { expand: true });
     } catch (e) {
       b.setError(e instanceof Error ? e.message : String(e));
     } finally {
       setPicking(false);
     }
+  };
+
+  const openWorkspacePicker = () => {
+    void refreshLists(false);
+    setWsPickerOpen(true);
   };
 
   const applyLocalSlash = (cmd: string, args: string): boolean => {
@@ -687,6 +1005,10 @@ export function App() {
       b.setError("Select a project folder first");
       return;
     }
+
+    // Sending → always pin chat to bottom (don't fight user later if they scroll up)
+    pinChatToBottom();
+
     // History-only / agent died after idle: resume SAME session, then send
     if (b.sessionId && b.historyOnly) {
       setInput("");
@@ -706,6 +1028,14 @@ export function App() {
       b.createSession();
       return;
     }
+    // Multitask: fork a parallel agent for this send (keep current chat in history)
+    if (b.agentMode === "multitask" && b.messages.length > 0) {
+      setInput("");
+      setAttachments([]);
+      b.queuePromptAfterAttach(trimmed, atts.length ? atts : undefined);
+      b.createSession();
+      return;
+    }
     // Still "live" in UI — bridge will auto-resume if process already died
     setInput("");
     setAttachments([]);
@@ -713,7 +1043,8 @@ export function App() {
   };
 
   const onSubmit = () => {
-    if (b.busy) {
+    // Stop only when a real turn is in flight (not resume / bare New Agent)
+    if (showStop) {
       b.cancel();
       return;
     }
@@ -729,16 +1060,117 @@ export function App() {
 
   const openHist = async (sessionId: string, cwd: string) => {
     await b.openHistorySession(sessionId, cwd);
-    setExpandedCwd((m) => ({ ...m, [cwd]: true }));
+    setExpandedCwd({ [cwd]: true });
     // If open scrubbed a zombie, refresh sidebar so it disappears
     invalidateHistoryClientCache(sessionId);
     await refreshLists(true);
   };
 
-  const setMode = (mode: "agent" | "auto" | "plan") => {
+  // CLI / single-instance: `agent-pane open <sessionId>` → same as sidebar open
+  const openHistRef = useRef(openHist);
+  openHistRef.current = openHist;
+  const connectedRef = useRef(b.connected);
+  connectedRef.current = b.connected;
+  const pendingCliSessionRef = useRef<string | null>(null);
+  const lastCliOpenRef = useRef<{ id: string; at: number } | null>(null);
+
+  useEffect(() => {
+    const openFromCli = async (sessionId: string) => {
+      const id = sessionId.trim();
+      if (!id) return;
+      const now = Date.now();
+      const last = lastCliOpenRef.current;
+      // Cold start emits twice; ignore duplicate within 3s
+      if (last && last.id === id && now - last.at < 3000) return;
+      if (!connectedRef.current) {
+        pendingCliSessionRef.current = id;
+        return;
+      }
+      lastCliOpenRef.current = { id, at: now };
+      pendingCliSessionRef.current = null;
+      try {
+        const { fetchSessionMeta } = await import("./api");
+        const meta = await fetchSessionMeta(id);
+        if (!meta?.cwd) {
+          console.warn("[agent-pane] CLI open: session not found", id);
+          return;
+        }
+        await openHistRef.current(meta.sessionId, meta.cwd);
+      } catch (e) {
+        console.warn("[agent-pane] CLI open failed", e);
+      }
+    };
+
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        if (cancelled) return;
+        unlisten = await listen<{ sessionId?: string }>("open-session", (ev) => {
+          const sid = ev.payload?.sessionId;
+          if (sid) void openFromCli(sid);
+        });
+      } catch {
+        /* browser / non-tauri */
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!b.connected) return;
+    const pending = pendingCliSessionRef.current;
+    if (!pending) return;
+    pendingCliSessionRef.current = null;
+    const now = Date.now();
+    const last = lastCliOpenRef.current;
+    if (last && last.id === pending && now - last.at < 3000) return;
+    lastCliOpenRef.current = { id: pending, at: now };
+    void (async () => {
+      try {
+        const { fetchSessionMeta } = await import("./api");
+        const meta = await fetchSessionMeta(pending);
+        if (!meta?.cwd) return;
+        await openHistRef.current(meta.sessionId, meta.cwd);
+      } catch (e) {
+        console.warn("[agent-pane] CLI open (connected flush) failed", e);
+      }
+    })();
+  }, [b.connected]);
+
+  const setMode = (mode: AgentMode) => {
     b.setAgentMode(mode);
     localStorage.setItem("agent-pane-mode", mode);
   };
+
+  const MODE_CYCLE: AgentMode[] = [
+    "agent",
+    "plan",
+    "debug",
+    "multitask",
+    "auto",
+  ];
+
+  const cycleMode = () => {
+    const i = Math.max(0, MODE_CYCLE.indexOf(b.agentMode));
+    const next = MODE_CYCLE[(i + 1) % MODE_CYCLE.length]!;
+    setMode(next);
+  };
+
+  const modeChipMeta =
+    b.agentMode === "plan"
+      ? { key: "plan" as const, label: "Plan", Icon: IconList }
+      : b.agentMode === "debug"
+        ? { key: "debug" as const, label: "Debug", Icon: IconBug }
+        : b.agentMode === "multitask"
+          ? { key: "multitask" as const, label: "Multitask", Icon: IconLayers }
+          : b.agentMode === "auto"
+            ? { key: "ask" as const, label: "Ask", Icon: IconAsk }
+            : null;
 
   const closePlus = () => {
     setPlusOpen(false);
@@ -877,19 +1309,38 @@ export function App() {
 
   const addPathsAsAttachments = useCallback((paths: string[]) => {
     if (!paths.length) return;
-    setAttachments((prev) => {
-      const next = [...prev];
+    void (async () => {
       for (const p of paths) {
-        if (!p || next.some((a) => a.path === p)) continue;
-        const name = p.split(/[/\\]/).pop() || p;
-        // crude folder heuristic
-        const kind: "file" | "folder" = /\.[a-z0-9]{1,8}$/i.test(name)
-          ? "file"
-          : "file";
-        next.push({ path: p, name, kind });
+        if (!p) continue;
+        let abs = p;
+        let name = p.split(/[/\\]/).pop() || p;
+        // Screenshots / temp paths vanish — copy into uploads first
+        const ephemeral =
+          /TemporaryItems|screencaptureui_|NSIRD_screencapture|\/var\/folders\//i.test(
+            p
+          ) || isImageAttachment(name);
+        if (ephemeral) {
+          try {
+            const saved = await persistLocalAttachment(p);
+            abs = saved.path;
+            name = saved.name || name;
+          } catch {
+            /* keep original path; bridge will try again on send */
+          }
+        }
+        setAttachments((prev) => {
+          if (prev.some((a) => a.path === abs || a.path === p)) return prev;
+          return [
+            ...prev,
+            {
+              path: abs,
+              name,
+              kind: "file" as const,
+            },
+          ];
+        });
       }
-      return next;
-    });
+    })();
   }, []);
 
   const addBlobFiles = useCallback(async (files: FileList | File[]) => {
@@ -911,7 +1362,15 @@ export function App() {
         setAttachments((prev) =>
           prev.some((a) => a.path === up.path)
             ? prev
-            : [...prev, { path: up.path, name: up.name, kind: "file" }]
+            : [
+                ...prev,
+                {
+                  path: up.path,
+                  name: up.name,
+                  kind: "file",
+                  mime: f.type || undefined,
+                },
+              ]
         );
       } catch (e) {
         b.setError(e instanceof Error ? e.message : String(e));
@@ -947,75 +1406,149 @@ export function App() {
     };
   }, [addPathsAsAttachments]);
 
-  /** Session context usage (estimate) — ring under composer like Cursor */
+  /** Session context usage — prefer agent-reported used/size */
   const sessionUsage = useMemo(() => {
-    const used = estimateSessionTokens(b.messages, input);
-    const limit =
+    const fallback =
       MODEL_CONTEXT_TOKENS[b.model] ??
       MODEL_CONTEXT_TOKENS[DEFAULT_MODEL] ??
       DEFAULT_CONTEXT_TOKENS;
-    const pct = Math.min(100, Math.round((used / limit) * 100));
-    return { used, limit, pct };
-  }, [b.messages, b.model, input]);
+    return buildContextBreakdown(b.contextUsage, fallback);
+  }, [b.contextUsage, b.model]);
+
+  const diffStats = useMemo(() => {
+    let add = 0;
+    let del = 0;
+    for (const f of b.diffs) {
+      add += f.additions;
+      del += f.deletions;
+    }
+    return { add, del, files: b.diffs.length };
+  }, [b.diffs]);
 
   const composer = (
     <div
-      ref={composerShellRef}
-      className={`composer-shell ${showHome ? "hero" : "followup"} ${
-        dragOver ? "drag-over" : ""
+      className={`composer-stack ${showHome ? "hero" : "followup"} ${
+        composerCrowded ? "crowded" : "compact"
       }`}
-      onDragEnter={(e) => {
-        e.preventDefault();
-        setDragOver(true);
-      }}
-      onDragOver={(e) => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = "copy";
-        setDragOver(true);
-      }}
-      onDragLeave={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-          setDragOver(false);
-        }
-      }}
-      onDrop={(e) => {
-        e.preventDefault();
-        setDragOver(false);
-        if (e.dataTransfer.files?.length) {
-          void addBlobFiles(e.dataTransfer.files);
-        }
-      }}
     >
+      <div
+        ref={composerShellRef}
+        className={`composer-shell ${showHome ? "hero" : "followup"} ${
+          composerCrowded ? "crowded" : "compact"
+        } ${dragOver ? "drag-over" : ""}`}
+        onDragEnter={(e) => {
+          e.preventDefault();
+          setDragOver(true);
+        }}
+        onDragOver={(e) => {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+          setDragOver(true);
+        }}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+            setDragOver(false);
+          }
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragOver(false);
+          if (e.dataTransfer.files?.length) {
+            void addBlobFiles(e.dataTransfer.files);
+          }
+        }}
+      >
       {attachments.length > 0 && (
         <div className="attach-row">
-          {attachments.map((a) => (
-            <span className="attach-chip" key={a.path} title={a.path}>
-              <span className="attach-chip-name">{a.name}</span>
+          {attachments.map((a) => {
+            const isImg = isImageAttachment(a.name, a.mime);
+            return (
+              <span className="attach-chip" key={a.path} title={a.path}>
+                <button
+                  type="button"
+                  className="attach-chip-open"
+                  onClick={() => {
+                    if (isImg) {
+                      setAttachPreview({ path: a.path, name: a.name });
+                      return;
+                    }
+                    void openLocalPath(a.path).catch((e) =>
+                      b.setError(e instanceof Error ? e.message : String(e))
+                    );
+                  }}
+                >
+                  {isImg ? (
+                    <img
+                      className="attach-chip-thumb"
+                      src={localFileUrl(a.path)}
+                      alt=""
+                      draggable={false}
+                    />
+                  ) : (
+                    <span className="attach-chip-icon" aria-hidden>
+                      {a.kind === "folder" ? (
+                        <IconFolder size={12} />
+                      ) : (
+                        <IconFile size={12} />
+                      )}
+                    </span>
+                  )}
+                  <span className="attach-chip-name">{a.name}</span>
+                </button>
+                <button
+                  type="button"
+                  className="attach-chip-x"
+                  aria-label={`Remove ${a.name}`}
+                  onClick={() =>
+                    setAttachments((prev) =>
+                      prev.filter((x) => x.path !== a.path)
+                    )
+                  }
+                >
+                  ×
+                </button>
+              </span>
+            );
+          })}
+        </div>
+      )}
+      {/* Cursor-style: short → model right of input; long → model bottom-left */}
+      <div
+        className={`composer-main-row ${
+          composerCrowded ? "crowded" : "compact"
+        }`}
+      >
+        <div className="composer-leading">
+          <button
+            ref={plusBtnRef}
+            type="button"
+            className={`plus-btn ${plusOpen ? "open" : ""}`}
+            title="Add modes, skills, tools…"
+            onClick={() => (plusOpen ? closePlus() : openPlusMenu())}
+          >
+            <IconPlus size={15} />
+          </button>
+          {modeChipMeta && (
+            <span
+              className={`mode-chip mode-chip-${modeChipMeta.key}`}
+              title={`${modeChipMeta.label} mode — click × or ⇧Tab to change`}
+            >
+              <modeChipMeta.Icon size={13} />
+              <span className="mode-chip-label">{modeChipMeta.label}</span>
               <button
                 type="button"
-                className="attach-chip-x"
-                aria-label={`Remove ${a.name}`}
-                onClick={() =>
-                  setAttachments((prev) => prev.filter((x) => x.path !== a.path))
-                }
+                className="mode-chip-x"
+                aria-label={`Clear ${modeChipMeta.label} mode`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setMode("agent");
+                }}
               >
                 ×
               </button>
             </span>
-          ))}
+          )}
         </div>
-      )}
-      {/* Cursor-style single row: + | input | model | ↑ */}
-      <div className="composer-main-row">
-        <button
-          ref={plusBtnRef}
-          type="button"
-          className={`plus-btn ${plusOpen ? "open" : ""}`}
-          title="Add modes, skills, tools…"
-          onClick={() => (plusOpen ? closePlus() : openPlusMenu())}
-        >
-          <IconPlus size={15} />
-        </button>
         <div className="composer-ta-wrap">
           {slashParsed.active && slashMatches.length > 0 && (
             <div className="slash-menu" role="listbox">
@@ -1041,7 +1574,7 @@ export function App() {
             className="composer-ta"
             placeholder={
               showHome
-                ? "Plan, Build, / for commands · drop files here"
+                ? "Plan, Build, / for commands — drop files here"
                 : "Send follow-up"
             }
             rows={1}
@@ -1068,6 +1601,12 @@ export function App() {
                 e.nativeEvent.isComposing ||
                 (e.nativeEvent as KeyboardEvent).keyCode === 229 ||
                 e.key === "Process";
+              // ⇧Tab — cycle Agent → Plan → Debug → Multitask → Ask
+              if (e.key === "Tab" && e.shiftKey && !ime && !slashParsed.active) {
+                e.preventDefault();
+                cycleMode();
+                return;
+              }
               if (slashParsed.active && slashMatches.length > 0 && !ime) {
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
@@ -1098,69 +1637,194 @@ export function App() {
                   }
                 }
               }
+              if (e.key === "Escape" && !ime) {
+                closePlus();
+                setModelMenuOpen(false);
+                setEffortMenuOpen(false);
+                if (slashParsed.active) setInput("");
+                return;
+              }
+              // Explicit Shift+Enter newline — WKWebView sometimes skips default
+              if (e.key === "Enter" && e.shiftKey && !ime) {
+                e.preventDefault();
+                const ta = e.currentTarget;
+                const start = ta.selectionStart ?? input.length;
+                const end = ta.selectionEnd ?? start;
+                const next =
+                  input.slice(0, start) + "\n" + input.slice(end);
+                setInput(next);
+                requestAnimationFrame(() => {
+                  const el = taRef.current;
+                  if (!el) return;
+                  const pos = start + 1;
+                  el.selectionStart = pos;
+                  el.selectionEnd = pos;
+                });
+                return;
+              }
               if (e.key === "Enter" && !e.shiftKey) {
                 if (ime) return;
                 e.preventDefault();
                 onSubmit();
               }
-              if (e.key === "Escape" && !ime) {
-                closePlus();
-                if (slashParsed.active) setInput("");
-              }
             }}
           />
         </div>
-        <label
-          className="model-chip"
-          title="Model for the next turn / New Agent"
+        <div
+          className={`model-picker ${modelMenuOpen ? "open" : ""} ${
+            composerCrowded ? "dock-left" : "dock-right"
+          }`}
         >
-          <select
-            className="model-select"
-            value={
-              MODEL_OPTIONS.some((m) => m.id === b.model)
-                ? b.model
-                : DEFAULT_MODEL
-            }
-            onChange={(e) => {
-              const next = e.target.value;
-              b.setModel(next);
-              localStorage.setItem("agent-pane-model", next);
+          <button
+            ref={modelBtnRef}
+            type="button"
+            className="model-chip-btn"
+            title="Model & effort for the next New Agent / resume"
+            onClick={() => {
+              setModelMenuOpen((v) => {
+                const next = !v;
+                // Model list is primary; effort opens via Edit on a model row
+                if (!next) setEffortMenuOpen(false);
+                return next;
+              });
+              closePlus();
             }}
           >
-            {MODEL_OPTIONS.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.label}
-              </option>
-            ))}
-          </select>
-        </label>
+            <span className="model-chip-label">{modelChipLabel}</span>
+            <IconChevron size={12} className="model-chip-chevron" />
+          </button>
+          {(effortMenuOpen || modelMenuOpen) && (
+            <div className="model-menu" role="listbox">
+              {modelMenuOpen && (
+                <div className="model-menu-list">
+                  {MODEL_OPTIONS.map((m) => {
+                    const selected = b.model === m.id;
+                    const rowLabel = selected
+                      ? effortLabel
+                      : effortLabelFor(getEffortFor(m.id));
+                    return (
+                      <button
+                        key={m.id}
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        className={`model-menu-item ${selected ? "selected" : ""}`}
+                        onClick={() => pickModel(m.id)}
+                      >
+                        <span className="model-menu-name">{m.label}</span>
+                        <span className="model-menu-effort">{rowLabel}</span>
+                        <span
+                          className={`model-menu-check-slot ${
+                            selected ? "on" : ""
+                          }`}
+                          aria-hidden={!selected}
+                        >
+                          {selected && (
+                            <IconCheck size={14} className="model-menu-check" />
+                          )}
+                        </span>
+                        <button
+                          type="button"
+                          className="effort-edit-btn"
+                          title="Edit effort for this model"
+                          onClick={(e) => openModelEffortEdit(e, m.id)}
+                        >
+                          Edit
+                        </button>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {effortMenuOpen && (
+                <div className="effort-menu" role="menu">
+                  <div className="effort-menu-title">Effort</div>
+                  {EFFORT_OPTIONS.map((e) => {
+                    const selected = !b.effortFast && b.effort === e.id;
+                    return (
+                      <button
+                        key={e.id}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={selected}
+                        className={`effort-menu-item ${
+                          selected ? "selected" : ""
+                        }`}
+                        onClick={() => pickEffort(e.id)}
+                      >
+                        <span>{e.label}</span>
+                        {selected && <IconCheck size={14} />}
+                      </button>
+                    );
+                  })}
+                  <div className="effort-menu-sep" />
+                  <div className="effort-menu-title">Options</div>
+                  <label className="effort-fast-row">
+                    <span>Fast</span>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={b.effortFast}
+                      className={`toggle-switch ${b.effortFast ? "on" : ""}`}
+                      onClick={toggleEffortFast}
+                    >
+                      <i />
+                    </button>
+                  </label>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
         <button
           type="button"
-          className={`send-btn ${b.busy ? "stop" : ""}`}
+          className={`send-btn ${showStop ? "stop" : ""}`}
           onClick={onSubmit}
           disabled={
             !b.connected ||
-            (!b.busy && !input.trim() && attachments.length === 0)
+            (!showStop && !input.trim() && attachments.length === 0)
           }
-          title={b.busy ? "Stop" : showHome ? "Start" : "Send"}
+          title={showStop ? "Stop" : showHome ? "Start" : "Send"}
         >
-          {b.busy ? <IconStop size={13} /> : <IconArrowUp size={15} />}
+          {showStop ? <IconStop size={13} /> : <IconArrowUp size={15} />}
         </button>
       </div>
-      {/* Under-composer: no This Mac; session usage ring on the right */}
+      {dragOver && (
+        <div className="drop-overlay" aria-hidden>
+          Drop files or images
+        </div>
+      )}
+      </div>
+      {/* Outside the glass input — Cursor-style footer */}
       <div className="composer-meta-row">
         {b.historyOnly ? (
           <span className="hist-hint">
             {b.sessionId
-              ? "Disconnected · send resumes this chat"
+              ? "Idle · send continues this chat"
               : "History · pick a session or New Agent"}
           </span>
         ) : (
           <span className="grow" />
         )}
         <span
-          className="session-usage"
-          title={`Session context · ~${sessionUsage.used.toLocaleString()} / ${sessionUsage.limit.toLocaleString()} tokens (estimate)`}
+          className={`session-usage ${usageOpen ? "open" : ""}`}
+          title={
+            sessionUsage.fromAgent
+              ? `Context · ${sessionUsage.used.toLocaleString()} / ${sessionUsage.limit.toLocaleString()} tokens`
+              : "Context usage · waiting for agent report"
+          }
+          role="button"
+          tabIndex={0}
+          onClick={(e) => {
+            e.stopPropagation();
+            setUsageOpen((v) => !v);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setUsageOpen((v) => !v);
+            }
+          }}
         >
           <svg
             className="session-usage-ring"
@@ -1184,31 +1848,151 @@ export function App() {
               r="6"
               fill="none"
               strokeWidth="2"
-              strokeDasharray={`${(sessionUsage.pct / 100) * 37.7} 37.7`}
+              strokeDasharray={`${
+                sessionUsage.fromAgent ? (sessionUsage.pct / 100) * 37.7 : 0
+              } 37.7`}
               strokeLinecap="round"
               transform="rotate(-90 8 8)"
             />
           </svg>
-          <span className="session-usage-pct">{sessionUsage.pct}%</span>
+          <span className="session-usage-pct">
+            {sessionUsage.fromAgent ? `${sessionUsage.pct}%` : "—"}
+          </span>
+          {usageOpen && (
+            <div
+              className="context-usage-pop"
+              role="dialog"
+              aria-label="Context Usage"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="context-usage-head">
+                <span className="context-usage-title">Context Usage</span>
+                <div className="context-usage-head-actions">
+                  <button
+                    type="button"
+                    className="context-usage-close"
+                    aria-label="Close"
+                    onClick={() => setUsageOpen(false)}
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+              <div className="context-usage-summary">
+                <span>
+                  {sessionUsage.fromAgent
+                    ? `${sessionUsage.pct}% Full`
+                    : "No agent data yet"}
+                </span>
+                <span>
+                  {sessionUsage.fromAgent
+                    ? `${formatTokenCount(sessionUsage.used)} / ${formatTokenCount(sessionUsage.limit)} Tokens`
+                    : `Window ${formatTokenCount(sessionUsage.limit)}`}
+                </span>
+              </div>
+              <div className="context-usage-bar" aria-hidden>
+                {sessionUsage.fromAgent
+                  ? sessionUsage.slices.map((s) =>
+                      s.tokens > 0 ? (
+                        <i
+                          key={s.id}
+                          style={{
+                            flexGrow: Math.max(s.tokens, 1),
+                            background: s.color,
+                          }}
+                        />
+                      ) : null
+                    )
+                  : (
+                    <i
+                      style={{
+                        flexGrow: 1,
+                        background: "rgba(255,255,255,0.08)",
+                      }}
+                    />
+                  )}
+              </div>
+              <ul className="context-usage-list">
+                {sessionUsage.slices.map((s) => (
+                  <li key={s.id}>
+                    <span
+                      className="context-usage-swatch"
+                      style={{ background: s.color }}
+                    />
+                    <span className="context-usage-label">
+                      {s.label}
+                      {s.estimated ? (
+                        <span className="context-usage-est"> —</span>
+                      ) : null}
+                    </span>
+                    <span className="context-usage-n">
+                      {formatTokenCount(s.tokens)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <p className="context-usage-footnote">
+                {sessionUsage.fromAgent
+                  ? sessionUsage.sourceLabel?.includes("Estimated")
+                    ? `Estimated from the visible transcript (~${formatTokenCount(sessionUsage.used)}). Grok live meters only track the resumed agent session (often a short digest), so imports can look tiny until you send and /session-info refreshes.`
+                    : `${sessionUsage.sourceLabel ?? "From agent"} · ${formatTokenCount(sessionUsage.used)} / ${formatTokenCount(sessionUsage.limit)}. Grok counts system + skills + MCP/tool schemas + reminders — not just the visible chat bubbles, so a short flirt can still sit at a few %.`
+                  : "Watching ~/.grok/sessions/…/signals.json after connect. Numbers appear once Grok writes the file (usually after a turn)."}
+              </p>
+            </div>
+          )}
         </span>
       </div>
-      {dragOver && (
-        <div className="drop-overlay" aria-hidden>
-          Drop files or images
-        </div>
-      )}
     </div>
   );
 
+  const startWindowDrag = (e: ReactMouseEvent) => {
+    if (e.button !== 0) return;
+    const detail = e.detail;
+    void (async () => {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const win = getCurrentWindow();
+        if (detail === 2) await win.toggleMaximize();
+        else await win.startDragging();
+      } catch {
+        /* browser / non-tauri */
+      }
+    })();
+  };
+
   return (
-    <div className="shell">
-      {/* macOS Overlay titlebar: drag strip (lights sit over sidebar) */}
-      <div className="titlebar-drag" data-tauri-drag-region />
-      <aside className="sidebar" style={{ width: sidebarW }}>
+      <div
+        className={`shell${customizeOpen ? " customize-mode" : ""}${
+          sidebarCollapsed ? " sidebar-collapsed" : ""
+        }`}
+      >
+      {/* Drag only over sidebar chrome — not over chat/scrollbar */}
+      <div
+        className="titlebar-drag"
+        data-tauri-drag-region
+        aria-hidden
+        onMouseDown={startWindowDrag}
+      />
+      <button
+        type="button"
+        className="sidebar-toggle"
+        title={sidebarCollapsed ? "Show sidebar" : "Collapse sidebar"}
+        aria-label={sidebarCollapsed ? "Show sidebar" : "Collapse sidebar"}
+        aria-pressed={!sidebarCollapsed}
+        onClick={() => setSidebarCollapsed((v) => !v)}
+      >
+        <IconSidebar size={16} />
+      </button>
+      <aside
+        className={`sidebar${sidebarCollapsed ? " collapsed" : ""}`}
+        style={sidebarCollapsed ? undefined : { width: sidebarW }}
+        aria-hidden={sidebarCollapsed}
+      >
         <button
           type="button"
           className="side-btn primary"
           onClick={() => {
+            setCustomizeOpen(false);
             if (!b.cwd) {
               b.setError("Select a project folder first");
               void onBrowse();
@@ -1235,6 +2019,14 @@ export function App() {
           <IconTerminal className="ico" />
           Enter path…
         </button>
+        <button
+          type="button"
+          className={`side-btn ${customizeOpen ? "primary" : ""}`}
+          onClick={() => setCustomizeOpen((v) => !v)}
+        >
+          <IconCustomize className="ico" />
+          Customize
+        </button>
 
         <div className="side-list">
           {/* Cursor Agents: Pinned → Repositories (folders nest chats). No separate Chats / Recent. */}
@@ -1248,6 +2040,8 @@ export function App() {
                   key={s.sessionId}
                   className={`side-item session row nested ${
                     b.sessionId === s.sessionId ? "active" : ""
+                  } ${
+                    b.busy && b.sessionId === s.sessionId ? "working" : ""
                   }`}
                 >
                   <button
@@ -1256,6 +2050,9 @@ export function App() {
                     onClick={() => void openHist(s.sessionId, s.cwd)}
                     title={`${s.title || "Untitled"}\n${s.cwd}`}
                   >
+                    {b.busy && b.sessionId === s.sessionId && (
+                      <SessionWorkingDots />
+                    )}
                     <span className="name">{s.title || "Untitled"}</span>
                     <span className="meta">{formatRelTime(s.updatedAt)}</span>
                   </button>
@@ -1332,7 +2129,11 @@ export function App() {
                       open ? "expanded" : ""
                     }`}
                     onClick={() => {
-                      setExpandedCwd((m) => ({ ...m, [g.cwd]: !open }));
+                      // Accordion: only one folder open at a time
+                      setExpandedCwd((m) => {
+                        if (open) return { ...m, [g.cwd]: false };
+                        return { [g.cwd]: true };
+                      });
                       if (g.cwd !== b.cwd) void selectCwd(g.cwd);
                     }}
                     title={g.cwd}
@@ -1350,6 +2151,10 @@ export function App() {
                         key={s.sessionId}
                         className={`side-item session row nested ${
                           b.sessionId === s.sessionId ? "active" : ""
+                        } ${
+                          b.busy && b.sessionId === s.sessionId
+                            ? "working"
+                            : ""
                         }`}
                       >
                         <button
@@ -1358,6 +2163,9 @@ export function App() {
                           onClick={() => void openHist(s.sessionId, s.cwd)}
                           title={s.title}
                         >
+                          {b.busy && b.sessionId === s.sessionId && (
+                            <SessionWorkingDots />
+                          )}
                           <span className="name">{s.title || "Untitled"}</span>
                           <span className="meta">
                             {formatRelTime(s.updatedAt)}
@@ -1400,7 +2208,11 @@ export function App() {
           aria-label="Resize sidebar"
           onMouseDown={(e) => {
             e.preventDefault();
-            sidebarDrag.current = { startX: e.clientX, startW: sidebarW };
+            sidebarDrag.current = {
+              startX: e.clientX,
+              startW: sidebarW,
+              edge: "left",
+            };
             document.body.style.cursor = "col-resize";
             document.body.style.userSelect = "none";
           }}
@@ -1408,16 +2220,12 @@ export function App() {
       </aside>
 
       <div className="stage">
-        <div className="stage-top">
-          <div className="workspace-chip">
-            <strong title={b.cwd || undefined}>{shortPath(b.cwd)}</strong>
-            <button type="button" onClick={() => void onBrowse()}>
-              {picking ? "…" : "Browse"}
-            </button>
-          </div>
-          <div className="spacer" />
-        </div>
-
+        <div
+          className="stage-drag"
+          data-tauri-drag-region
+          aria-hidden
+          onMouseDown={startWindowDrag}
+        />
         {statusLocal && !b.error && (
           <div className="status-banner">{statusLocal}</div>
         )}
@@ -1426,40 +2234,79 @@ export function App() {
             {b.error}
           </div>
         )}
-        {/* Live activity lives in the chat thread (CLI-style), not a top banner */}
 
-        {showHome ? (
+        {customizeOpen ? (
+          <CustomizePanel
+            connected={b.connected}
+            bridgeLabel="Bridge · Grok ACP"
+            model={modelMeta.label}
+            effortLabel={effortLabel}
+            agentMode={b.agentMode}
+            onClose={() => setCustomizeOpen(false)}
+          />
+        ) : showHome ? (
           <div className="home">
             <div className="home-stack">
-              <button
-                type="button"
-                className="home-label"
-                title={
-                  b.cwd
-                    ? b.cwd
-                    : "Open a project folder — this label follows the workspace"
-                }
-                onClick={() => void onBrowse()}
-              >
-                <span className="home-label-name">
-                  {b.cwd ? folderName(b.cwd) : "Select project"}
-                </span>
-                <span className="home-label-chev" aria-hidden>
-                  ▾
-                </span>
-              </button>
+              <div className="home-label-wrap">
+                <button
+                  ref={homeLabelRef}
+                  type="button"
+                  className={`home-label ${wsPickerOpen ? "open" : ""}`}
+                  title={
+                    b.cwd
+                      ? b.cwd
+                      : "Open a project folder — this label follows the workspace"
+                  }
+                  onClick={() =>
+                    wsPickerOpen
+                      ? setWsPickerOpen(false)
+                      : openWorkspacePicker()
+                  }
+                >
+                  <span className="home-label-name">
+                    {b.cwd ? folderName(b.cwd) : "Select project"}
+                  </span>
+                  <span className="home-label-chev" aria-hidden>
+                    ▾
+                  </span>
+                </button>
+                <WorkspacePicker
+                  open={wsPickerOpen}
+                  cwd={b.cwd}
+                  recent={recent}
+                  anchorRef={homeLabelRef}
+                  onClose={() => setWsPickerOpen(false)}
+                  onSelect={(path) => {
+                    setWsPickerOpen(false);
+                    void selectCwd(path, { expand: true });
+                  }}
+                  onOpenFolder={() => {
+                    setWsPickerOpen(false);
+                    void onBrowse();
+                  }}
+                  onSoon={(label) => {
+                    setWsPickerOpen(false);
+                    setStatusLocal(`${label} — coming soon`);
+                  }}
+                />
+              </div>
               {composer}
               <div className="pills">
                 <button
                   type="button"
-                  className="pill"
-                  title="Plan mode — design before editing"
+                  className={`pill ${b.agentMode === "plan" ? "active" : ""}`}
+                  title="Plan mode — outline steps without editing files (⇧Tab cycles modes)"
                   onClick={() => {
+                    if (!b.cwd.trim()) {
+                      openWorkspacePicker();
+                      setStatusLocal("Pick a project folder first");
+                      return;
+                    }
                     setMode("plan");
-                    setInput(
-                      (prev) =>
-                        prev.trim() ||
-                        "Plan a clean approach for the next change. List steps, risks, and files to touch before editing."
+                    setInput((prev) =>
+                      prev.trim()
+                        ? prev
+                        : "Plan a clean approach for the next change. List steps, risks, and files to touch before editing."
                     );
                     requestAnimationFrame(() => taRef.current?.focus());
                   }}
@@ -1470,24 +2317,21 @@ export function App() {
                 <button
                   type="button"
                   className="pill"
-                  title="Start a parallel agent session"
+                  title="Start a fresh parallel agent session (current chat stays in history)"
                   onClick={() => {
-                    if (b.cwd) b.createSession();
-                    else void onBrowse();
+                    if (!b.cwd.trim()) {
+                      openWorkspacePicker();
+                      setStatusLocal("Pick a project folder for the new agent");
+                      return;
+                    }
+                    setMode("multitask");
+                    setInput("");
+                    setAttachments([]);
+                    b.createSession();
+                    requestAnimationFrame(() => taRef.current?.focus());
                   }}
                 >
                   Multitask
-                </button>
-                <button
-                  type="button"
-                  className="pill"
-                  title="Browse skills"
-                  onClick={() => {
-                    openPlusMenu();
-                    void loadSkills();
-                  }}
-                >
-                  Skills
                 </button>
               </div>
             </div>
@@ -1501,69 +2345,104 @@ export function App() {
               }}
             >
               <div className="chat-inner">
-              {b.messages.map((m, idx) => {
-                if (m.kind === "user") {
-                  return (
-                    <div className="msg user" key={m.id}>
-                      <div className="label-row">
-                        <div className="label">You</div>
-                      </div>
-                      <div className="bubble">{m.text}</div>
-                    </div>
-                  );
-                }
-                if (m.kind === "thought") {
-                  return (
-                    <details className="tl-thought" key={m.id}>
-                      <summary>
-                        <span className="tl-chev">▸</span>
-                        Thought briefly
-                      </summary>
-                      <div className="tl-thought-body">{m.text}</div>
-                    </details>
-                  );
-                }
-                if (m.kind === "status") {
-                  return (
-                    <div className="msg-status" key={m.id}>
-                      {m.text}
-                    </div>
-                  );
-                }
-                if (m.kind === "tools") {
-                  return <ToolTimeline key={m.id} tools={m.tools} />;
-                }
-                if (m.kind === "turn_log") {
-                  return (
-                    <div className="turn-log" key={m.id}>
-                      {m.lines.map((line, i) => (
-                        <div
-                          key={`${m.id}-${i}`}
-                          className={`turn-log-line ${line.tone}`}
-                        >
-                          <span className="turn-log-dia" aria-hidden>
-                            ◆
-                          </span>
-                          <span className="turn-log-text">{line.text}</span>
-                        </div>
-                      ))}
-                    </div>
-                  );
-                }
-                // Every assistant gets ⋯ ; Retry/Undo/Edit only on the last
-                let lastAsstIdx = -1;
-                for (let i = b.messages.length - 1; i >= 0; i--) {
-                  if (b.messages[i]!.kind === "assistant") {
-                    lastAsstIdx = i;
-                    break;
+              {groupChatIntoTurns(b.messages, { busy: b.busy }).map((turn) => {
+                const flatIndex = (item: ChatItem) =>
+                  b.messages.findIndex((x) => x.id === item.id);
+
+                const openRespMenu = (
+                  e: ReactMouseEvent,
+                  text: string,
+                  item: ChatItem
+                ) => {
+                  e.stopPropagation();
+                  const r = (
+                    e.currentTarget as HTMLButtonElement
+                  ).getBoundingClientRect();
+                  const menuW = 160;
+                  const menuH = 200;
+                  let x = r.left;
+                  let y = r.bottom + 4;
+                  if (x + menuW > window.innerWidth - 8) {
+                    x = Math.max(8, window.innerWidth - menuW - 8);
                   }
-                }
-                const isLastAssistant = lastAsstIdx === idx;
-                return (
+                  if (y + menuH > window.innerHeight - 8) {
+                    y = Math.max(8, r.top - menuH - 4);
+                  }
+                  setRespMenuTarget({
+                    text,
+                    messageIndex: Math.max(0, flatIndex(item)),
+                    canMutate: !b.busy,
+                  });
+                  setRespMenuPos({ x, y });
+                  setRespMenuOpen(true);
+                };
+
+                const renderProcessItem = (m: ChatItem) => {
+                  if (m.kind === "thought") {
+                    const preview = m.text.trim();
+                    if (!preview) return null;
+                    const label =
+                      preview.length < 40
+                        ? "Thought briefly"
+                        : `Thought for ${Math.max(1, Math.round(preview.length / 48))}s`;
+                    return (
+                      <details className="tl-thought" key={m.id}>
+                        <summary>
+                          <span className="tl-meta-label">{label}</span>
+                          <span className="tl-meta-chev">▾</span>
+                        </summary>
+                        <div className="tl-thought-body">{m.text}</div>
+                      </details>
+                    );
+                  }
+                  if (m.kind === "status") {
+                    return (
+                      <div className="msg-status" key={m.id}>
+                        {m.text}
+                      </div>
+                    );
+                  }
+                  if (m.kind === "tools") {
+                    return (
+                      <ToolTimeline
+                        key={m.id}
+                        tools={m.tools}
+                        defaultOpen={turn.isLive}
+                        liveMaxRows={turn.isLive ? 2 : undefined}
+                      />
+                    );
+                  }
+                  if (m.kind === "turn_log") {
+                    if (turn.process.some((x) => x.kind === "tools")) {
+                      return null;
+                    }
+                    return (
+                      <div className="turn-log" key={m.id}>
+                        {m.lines.map((line, i) => (
+                          <div
+                            key={`${m.id}-${i}`}
+                            className={`turn-log-line ${line.tone}`}
+                          >
+                            <span className="turn-log-dia" aria-hidden>
+                              ◆
+                            </span>
+                            <span className="turn-log-text">{line.text}</span>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  }
+                  return null;
+                };
+
+                const renderReply = (
+                  m: Extract<ChatItem, { kind: "assistant" }>
+                ) => (
                   <div className="msg assistant" key={m.id}>
                     <div className="assistant-text">
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm]}
+                        rehypePlugins={[rehypeHighlight]}
                         components={{
                           table: ({ children }) => (
                             <div className="md-table-wrap">
@@ -1577,37 +2456,117 @@ export function App() {
                     </div>
                     <div className="resp-actions">
                       <button
-                        ref={isLastAssistant ? respMenuBtnRef : undefined}
                         type="button"
                         className="resp-more-btn"
                         title="Message actions"
                         aria-label="Message actions"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const r = (
-                            e.currentTarget as HTMLButtonElement
-                          ).getBoundingClientRect();
-                          const menuW = 160;
-                          const menuH = 160;
-                          let x = r.left;
-                          let y = r.bottom + 4;
-                          if (x + menuW > window.innerWidth - 8) {
-                            x = Math.max(8, window.innerWidth - menuW - 8);
-                          }
-                          if (y + menuH > window.innerHeight - 8) {
-                            y = Math.max(8, r.top - menuH - 4);
-                          }
-                          setRespMenuTarget({
-                            text: m.text,
-                            isLast: isLastAssistant && !b.busy,
-                          });
-                          setRespMenuPos({ x, y });
-                          setRespMenuOpen(true);
-                        }}
+                        onClick={(e) => openRespMenu(e, m.text, m)}
                       >
                         <IconMoreVertical size={16} />
                       </button>
                     </div>
+                  </div>
+                );
+
+                const user = turn.user;
+                return (
+                  <div className="chat-turn" key={turn.key}>
+                    {user && (
+                      <div className="msg user" key={user.id}>
+                        <div className="label-row">
+                          <div className="label">You</div>
+                        </div>
+                        {(user.attachments ?? []).length > 0 && (
+                          <div className="msg-attach-row">
+                            {(user.attachments ?? []).map((a) => {
+                              const name =
+                                a.path.split(/[/\\]/).pop() || a.path;
+                              const isImg = isImageAttachment(name);
+                              return isImg ? (
+                                <button
+                                  type="button"
+                                  className="msg-attach-img"
+                                  key={a.path}
+                                  title={a.path}
+                                  onClick={() =>
+                                    setAttachPreview({
+                                      path: a.path,
+                                      name,
+                                    })
+                                  }
+                                >
+                                  <img
+                                    src={localFileUrl(a.path)}
+                                    alt={name}
+                                    draggable={false}
+                                  />
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="msg-attach-file"
+                                  key={a.path}
+                                  title={a.path}
+                                  onClick={() =>
+                                    void openLocalPath(a.path).catch((e) =>
+                                      b.setError(
+                                        e instanceof Error
+                                          ? e.message
+                                          : String(e)
+                                      )
+                                    )
+                                  }
+                                >
+                                  <IconFile size={12} />
+                                  <span>{name}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                        {user.text.trim() &&
+                          user.text !== "(attached files)" && (
+                            <div className="bubble">{user.text}</div>
+                          )}
+                        <div className="resp-actions">
+                          <button
+                            type="button"
+                            className="resp-more-btn"
+                            title="Message actions"
+                            aria-label="Message actions"
+                            onClick={(e) =>
+                              openRespMenu(e, user.text, user)
+                            }
+                          >
+                            <IconMoreVertical size={16} />
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {/* Live: preserve interleaved stream order */}
+                    {turn.isLive ? (
+                      <div className="worked-live">
+                        {renderLiveTurnBody(
+                          turn.body,
+                          renderProcessItem,
+                          renderReply
+                        )}
+                      </div>
+                    ) : (
+                      <>
+                        {/* Process only under Worked for — never the reply */}
+                        <WorkedForFold
+                          workedMs={turn.workedMs}
+                          isLive={false}
+                        >
+                          {turn.process.map((item) =>
+                            renderProcessItem(item)
+                          )}
+                        </WorkedForFold>
+                        {/* Assistant body always visible */}
+                        {turn.replies.map((item) => renderReply(item))}
+                      </>
+                    )}
                   </div>
                 );
               })}
@@ -1697,18 +2656,10 @@ export function App() {
                 </div>
               )}
 
-              {/* CLI-style: particle orbit + "Waiting for response… 2.2s" */}
+              {/* Cursor-style text shimmer while waiting */}
               {(b.busy || Boolean(b.statusMsg)) && (
                 <div className="agent-activity" aria-live="polite">
-                  <span className="agent-activity-particles" aria-hidden>
-                    <i />
-                    <i />
-                    <i />
-                    <i />
-                    <i />
-                    <i />
-                  </span>
-                  <span className="agent-activity-text">
+                  <span className="agent-activity-text agent-activity-shimmer">
                     {(() => {
                       const base =
                         b.statusMsg ||
@@ -1740,7 +2691,7 @@ export function App() {
                 onClick={jumpBottom}
                 title="Jump to bottom"
               >
-                <IconArrowDown size={16} />
+                <IconArrowDown size={12} />
               </button>
             )}
 
@@ -1748,6 +2699,274 @@ export function App() {
           </>
         )}
       </div>
+
+      {/* Cursor-style right rail — hidden on New Agent / empty home / Customize */}
+      {!showHome && !customizeOpen && (
+      <aside
+        className={`right-rail ${rightOpen ? "open" : "collapsed"}${
+          railResizing ? " resizing" : ""
+        }`}
+        style={
+          rightOpen
+            ? { width: rightRailW, minWidth: rightRailW }
+            : undefined
+        }
+      >
+        {rightOpen && (
+          <div
+            className="right-rail-resizer"
+            title="Drag to resize"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              document.body.style.cursor = "col-resize";
+              document.body.style.userSelect = "none";
+              setRailResizing(true);
+              sidebarDrag.current = {
+                startX: e.clientX,
+                startW: rightRailW,
+                edge: "right",
+              };
+            }}
+          />
+        )}
+        <div className="right-rail-head">
+          <span className="right-rail-title">
+            On {folderName(b.cwd) || "workspace"}
+          </span>
+          <button
+            type="button"
+            className="right-rail-toggle"
+            title={rightOpen ? "Collapse panel" : "Expand panel"}
+            onClick={() => setRightOpen((v) => !v)}
+          >
+            <IconChevron
+              size={14}
+              className={rightOpen ? "chev-right" : "chev-left"}
+            />
+          </button>
+        </div>
+        <nav className="right-rail-nav">
+          <button
+            type="button"
+            className={`right-rail-item ${rightTab === "changes" ? "active" : ""}`}
+            onClick={() => openRightTab("changes")}
+          >
+            <IconDiff size={15} />
+            <span className="right-rail-label">Changes</span>
+            {(diffStats.add > 0 || diffStats.del > 0) && (
+              <span className="right-rail-stats">
+                <span className="add">+{diffStats.add}</span>
+                <span className="del">−{diffStats.del}</span>
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            className={`right-rail-item ${rightTab === "browser" ? "active" : ""}`}
+            onClick={() => openRightTab("browser")}
+          >
+            <IconGlobe size={15} />
+            <span className="right-rail-label">Browser</span>
+          </button>
+          <button
+            type="button"
+            className={`right-rail-item ${rightTab === "terminal" ? "active" : ""}`}
+            onClick={() => openRightTab("terminal")}
+          >
+            <IconTerminal size={15} />
+            <span className="right-rail-label">Terminal</span>
+          </button>
+          <button
+            type="button"
+            className={`right-rail-item ${rightTab === "files" ? "active" : ""}`}
+            onClick={() => openRightTab("files")}
+          >
+            <IconFile size={15} />
+            <span className="right-rail-label">Files</span>
+          </button>
+        </nav>
+        {rightOpen && (
+          <div className="right-rail-body">
+            {rightTab === "changes" && (
+              <>
+                {b.diffs.length === 0 ? (
+                  <div className="right-rail-empty">No pending changes</div>
+                ) : (
+                  <>
+                    <div className="right-rail-actions">
+                      <button
+                        type="button"
+                        className="accept"
+                        onClick={() => b.acceptDiff("*")}
+                      >
+                        Keep All
+                      </button>
+                      <button
+                        type="button"
+                        className="reject"
+                        onClick={() => b.rejectDiff("*")}
+                      >
+                        Undo All
+                      </button>
+                    </div>
+                    {b.diffs.map((f) => (
+                      <div className="right-diff-card" key={f.path}>
+                        <header>
+                          <span className="path" title={f.path}>
+                            {f.path.split("/").pop() || f.path}
+                          </span>
+                          <span className="stats">
+                            <span className="add">+{f.additions}</span>{" "}
+                            <span className="del">−{f.deletions}</span>
+                          </span>
+                        </header>
+                        {f.patch && (
+                          <pre className="right-diff-patch">{f.patch}</pre>
+                        )}
+                        <div className="actions">
+                          <button
+                            type="button"
+                            className="accept"
+                            onClick={() => b.acceptDiff(f.path)}
+                          >
+                            Accept
+                          </button>
+                          <button
+                            type="button"
+                            className="reject"
+                            onClick={() => b.rejectDiff(f.path)}
+                          >
+                            Reject
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </>
+                )}
+              </>
+            )}
+            {rightTab === "browser" && (
+              <AgentBrowserPanel
+                active={rightOpen && rightTab === "browser"}
+              />
+            )}
+            {rightTab === "terminal" &&
+              (b.cwd ? (
+                <TerminalPanel
+                  cwd={b.cwd}
+                  active={rightOpen && rightTab === "terminal"}
+                />
+              ) : (
+                <div className="right-rail-empty">先选一个项目</div>
+              ))}
+            {rightTab === "files" && (
+              <div className="right-rail-panel">
+                {!b.cwd ? (
+                  <div className="right-rail-empty">
+                    Open a project to browse files
+                  </div>
+                ) : (
+                  <>
+                    <div className="fs-toolbar">
+                      <button
+                        type="button"
+                        className="fs-nav"
+                        disabled={fsRel === "." || fsLoading}
+                        title="Parent folder"
+                        onClick={() => {
+                          if (fsRel === "." || !fsRel) return;
+                          const parts = fsRel.split("/").filter(Boolean);
+                          parts.pop();
+                          setFsRel(parts.length ? parts.join("/") : ".");
+                        }}
+                      >
+                        ↑
+                      </button>
+                      <span className="fs-crumb" title={fsRel}>
+                        {fsRel === "." ? folderName(b.cwd) : fsRel}
+                      </span>
+                      <button
+                        type="button"
+                        className="fs-nav"
+                        title="Reveal in Finder"
+                        onClick={() => {
+                          const abs =
+                            fsRel === "."
+                              ? b.cwd
+                              : `${b.cwd.replace(/\/$/, "")}/${fsRel}`;
+                          void revealInFinder(abs).catch(() => undefined);
+                        }}
+                      >
+                        ↗
+                      </button>
+                    </div>
+                    {fsError && (
+                      <div className="right-rail-hint err">{fsError}</div>
+                    )}
+                    {fsLoading ? (
+                      <div className="right-rail-empty">Loading…</div>
+                    ) : fsEntries.length === 0 ? (
+                      <div className="right-rail-empty">Empty folder</div>
+                    ) : (
+                      <ul className="fs-list">
+                        {fsEntries.map((ent) => (
+                          <li key={ent.path}>
+                            <button
+                              type="button"
+                              className="fs-row"
+                              onClick={() => {
+                                if (ent.kind === "dir") {
+                                  const rel =
+                                    fsRel === "."
+                                      ? ent.name
+                                      : `${fsRel}/${ent.name}`;
+                                  setFsRel(rel);
+                                } else {
+                                  void revealInFinder(ent.path).catch(
+                                    () => undefined
+                                  );
+                                }
+                              }}
+                              onContextMenu={(e) => {
+                                e.preventDefault();
+                                void revealInFinder(ent.path).catch(
+                                  () => undefined
+                                );
+                              }}
+                              title={
+                                ent.kind === "dir"
+                                  ? "Open folder"
+                                  : "Reveal in Finder"
+                              }
+                            >
+                              {ent.kind === "dir" ? (
+                                <IconFolder size={14} />
+                              ) : (
+                                <IconFile size={14} />
+                              )}
+                              <span className="fs-name">{ent.name}</span>
+                              {ent.kind === "file" && ent.size != null && (
+                                <span className="fs-size">
+                                  {ent.size < 1024
+                                    ? `${ent.size} B`
+                                    : ent.size < 1024 * 1024
+                                      ? `${(ent.size / 1024).toFixed(1)} KB`
+                                      : `${(ent.size / (1024 * 1024)).toFixed(1)} MB`}
+                                </span>
+                              )}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </aside>
+      )}
 
       {respMenuOpen &&
         respMenuPos &&
@@ -1781,15 +3000,16 @@ export function App() {
               >
                 <IconCopy size={14} /> Copy
               </button>
-              {respMenuTarget?.isLast && (
+              {respMenuTarget?.canMutate && (
                 <>
                   <button
                     type="button"
                     role="menuitem"
                     onClick={() => {
+                      const idx = respMenuTarget.messageIndex;
                       setRespMenuOpen(false);
                       setRespMenuTarget(null);
-                      b.retryLast();
+                      b.retryAt(idx);
                     }}
                   >
                     <IconRefresh size={14} /> Retry
@@ -1798,9 +3018,10 @@ export function App() {
                     type="button"
                     role="menuitem"
                     onClick={() => {
+                      const idx = respMenuTarget.messageIndex;
                       setRespMenuOpen(false);
                       setRespMenuTarget(null);
-                      b.undoLast();
+                      b.undoAt(idx);
                     }}
                   >
                     <IconUndo size={14} /> Undo
@@ -1809,16 +3030,111 @@ export function App() {
                     type="button"
                     role="menuitem"
                     onClick={() => {
+                      const idx = respMenuTarget.messageIndex;
                       setRespMenuOpen(false);
                       setRespMenuTarget(null);
-                      b.editLast();
+                      b.editAt(idx);
                       requestAnimationFrame(() => taRef.current?.focus());
                     }}
                   >
                     <IconPencil size={14} /> Edit
                   </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      const idx = respMenuTarget.messageIndex;
+                      const sid = b.sessionId;
+                      setRespMenuOpen(false);
+                      setRespMenuTarget(null);
+                      if (!sid) {
+                        b.setError("No session to fork");
+                        return;
+                      }
+                      const turn = userTurnIndexAt(b.messages, idx);
+                      if (turn < 0) {
+                        b.setError("Nothing to fork");
+                        return;
+                      }
+                      void (async () => {
+                        try {
+                          const meta = await forkSessionApi(sid, {
+                            throughUserTurn: turn,
+                          });
+                          await refreshLists(true);
+                          await openHist(meta.sessionId, meta.cwd);
+                          setStatusLocal("Forked");
+                        } catch (e) {
+                          b.setError(
+                            e instanceof Error ? e.message : String(e)
+                          );
+                        }
+                      })();
+                    }}
+                  >
+                    <IconFork size={14} /> Fork
+                  </button>
                 </>
               )}
+            </div>
+          </>,
+          document.body
+        )}
+
+      {attachPreview &&
+        createPortal(
+          <div
+            className="attach-lightbox"
+            role="dialog"
+            aria-modal="true"
+            aria-label={attachPreview.name}
+            tabIndex={-1}
+            ref={(n) => n?.focus()}
+            onClick={() => setAttachPreview(null)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setAttachPreview(null);
+            }}
+          >
+            <img
+              className="attach-lightbox-img"
+              src={localFileUrl(attachPreview.path)}
+              alt={attachPreview.name}
+              draggable={false}
+              onClick={(e) => e.stopPropagation()}
+            />
+            <div className="attach-lightbox-cap">{attachPreview.name}</div>
+          </div>,
+          document.body
+        )}
+
+      {b.notice &&
+        createPortal(
+          <>
+            <div
+              className="menu-backdrop"
+              onClick={() => b.clearNotice()}
+              onKeyDown={() => undefined}
+            />
+            <div className="notice-panel" role="dialog" aria-label={b.notice.title}>
+              <div className="notice-panel-head">
+                <span>{b.notice.title}</span>
+                <button
+                  type="button"
+                  className="context-usage-close"
+                  aria-label="Close"
+                  onClick={() => b.clearNotice()}
+                >
+                  ×
+                </button>
+              </div>
+              <div className="notice-panel-body assistant-text">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  rehypePlugins={[rehypeHighlight]}
+                >
+                  {b.notice.body}
+                </ReactMarkdown>
+              </div>
             </div>
           </>,
           document.body
@@ -1845,6 +3161,12 @@ export function App() {
                   role="menuitem"
                   className={b.agentMode === "plan" ? "active" : ""}
                   onClick={() => {
+                    if (!b.cwd.trim()) {
+                      closePlus();
+                      openWorkspacePicker();
+                      setStatusLocal("Pick a project folder first");
+                      return;
+                    }
                     setMode("plan");
                     setInput(
                       (prev) =>
@@ -1863,8 +3185,9 @@ export function App() {
                 <button
                   type="button"
                   role="menuitem"
+                  className={b.agentMode === "debug" ? "active" : ""}
                   onClick={() => {
-                    setMode("agent");
+                    setMode("debug");
                     setInput(
                       (prev) =>
                         prev.trim() ||
@@ -1875,17 +3198,32 @@ export function App() {
                   }}
                 >
                   <IconBug size={14} /> Debug
+                  {b.agentMode === "debug" && (
+                    <span className="plus-check">✓</span>
+                  )}
                 </button>
                 <button
                   type="button"
                   role="menuitem"
+                  className={b.agentMode === "multitask" ? "active" : ""}
                   onClick={() => {
                     closePlus();
-                    if (b.cwd) b.createSession();
-                    else void onBrowse();
+                    if (!b.cwd.trim()) {
+                      openWorkspacePicker();
+                      setStatusLocal("Pick a project folder for the new agent");
+                      return;
+                    }
+                    setMode("multitask");
+                    setInput("");
+                    setAttachments([]);
+                    b.createSession();
+                    requestAnimationFrame(() => taRef.current?.focus());
                   }}
                 >
-                  <IconSpark size={14} /> Multitask
+                  <IconLayers size={14} /> Multitask
+                  {b.agentMode === "multitask" && (
+                    <span className="plus-check">✓</span>
+                  )}
                 </button>
                 <button
                   type="button"
@@ -1896,7 +3234,7 @@ export function App() {
                     closePlus();
                   }}
                 >
-                  <IconQuestion size={14} /> Ask
+                  <IconAsk size={14} /> Ask
                   {b.agentMode === "auto" && (
                     <span className="plus-check">✓</span>
                   )}

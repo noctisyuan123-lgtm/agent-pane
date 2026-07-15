@@ -96,10 +96,15 @@ export type DomainEvent =
     })
   | (DomainEventBase & { type: "SnapshotTaken"; snapshotId: string })
   | (DomainEventBase & { type: "SnapshotRestored"; snapshotId: string })
-  /** 撤回上一条用户消息及其后的 agent 输出 */
+  /**
+   * Conversation rewound: discard user turn `userTurnIndex` and everything after.
+   * UI keeps chat items before that user bubble.
+   */
   | (DomainEventBase & {
       type: "SessionRewound";
       restoredText: string;
+      /** 0-based user turn that was removed (and all later turns) */
+      userTurnIndex: number;
       /** Grok 侧 rewind 是否成功 */
       providerOk: boolean;
       note?: string;
@@ -123,16 +128,46 @@ export type DomainEvent =
         | "queue"
         | "sleeping"
         | "error";
+    })
+  /**
+   * Agent-reported context window fill (ACP `usage_update` or Grok compact).
+   * Aggregate only — providers rarely expose Cursor-style per-bucket splits.
+   */
+  | (DomainEventBase & {
+      type: "ContextUsage";
+      /** Tokens currently in the model context */
+      used: number;
+      /** Effective context window size */
+      size: number;
+      /** Where the numbers came from */
+      source:
+        | "acp"
+        | "compact"
+        | "compact_done"
+        | "signals"
+        | "session_info";
+      /** Optional precomputed % from Grok */
+      pct?: number;
+      /** Grok ACP session id these numbers belong to */
+      providerSessionId?: string;
     });
 
-/** Agent Pane UI modes → grok agent permission / plan behavior */
-export type AgentMode = "agent" | "auto" | "plan";
+/**
+ * Composer UI modes (Cursor-style chips).
+ * Bridge permission: plan→plan, auto→ask, others→agent.
+ */
+export type AgentMode = "agent" | "auto" | "plan" | "debug" | "multitask";
+
+/** Grok `--reasoning-effort` / `--effort` levels we expose in UI */
+export type ReasoningEffort = "low" | "medium" | "high";
 
 export type ClientCommand =
   | {
       type: "session.create";
       cwd: string;
       model?: string;
+      /** Grok reasoning effort (`--effort`) */
+      effort?: ReasoningEffort | string;
       /** agent=always-approve · auto=default · plan=no edits */
       permissionMode?: AgentMode | string;
     }
@@ -142,6 +177,7 @@ export type ClientCommand =
       sessionId: string;
       cwd: string;
       model?: string;
+      effort?: ReasoningEffort | string;
       permissionMode?: AgentMode | string;
     }
   | {
@@ -149,11 +185,18 @@ export type ClientCommand =
       sessionId: string;
       text: string;
       attachments?: ContextRef[];
+      /** Update live permission for this turn (plan / ask / agent) */
+      permissionMode?: AgentMode | string;
     }
   | { type: "session.cancel"; sessionId: string }
   | { type: "session.replay"; sessionId: string; fromSeq?: number }
   /** 撤回最近一条用户消息（停生成 + UI/尽力 rewind provider） */
   | { type: "session.undoLast"; sessionId: string }
+  /**
+   * Rewind to before user turn `userTurnIndex` (0-based).
+   * Removes that user message and everything after (Claude Code Undo/Retry/Edit).
+   */
+  | { type: "session.rewindTo"; sessionId: string; userTurnIndex: number }
   | { type: "permission.respond"; requestId: string; allow: boolean }
   | { type: "diff.accept"; sessionId: string; filePath: string | "*" }
   | { type: "diff.reject"; sessionId: string; filePath: string | "*" }
@@ -164,7 +207,15 @@ export type ServerMessage =
   | { type: "event"; event: DomainEvent }
   | { type: "replay"; sessionId: string; events: DomainEvent[] }
   | { type: "error"; message: string }
-  | { type: "status"; message: string };
+  | { type: "status"; message: string }
+  /** Ephemeral UI panel — not persisted into chat / model context */
+  | {
+      type: "notice";
+      kind: "usage" | "info";
+      title: string;
+      /** Markdown body */
+      body: string;
+    };
 
 export function nowIso(): string {
   return new Date().toISOString();

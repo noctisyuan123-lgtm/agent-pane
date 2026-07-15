@@ -2,6 +2,9 @@
   "name": "agent-pane",
   "private": true,
   "version": "0.1.0",
+  "bin": {
+    "agent-pane": "./scripts/agent-pane"
+  },
   "workspaces": [
     "packages/*",
     "apps/*",

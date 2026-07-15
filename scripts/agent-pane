@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Open an Agent Pane session in the desktop app (same as sidebar click).
+# Also imports Grok CLI / Claude-import sessions into Pane history when needed.
+#
+# Usage:
+#   agent-pane open <sessionId>
+#   agent-pane list
+#   agent-pane import <sessionId> [--force]
+set -euo pipefail
+
+PANE_SESSIONS="${HOME}/.agent-pane/sessions"
+GROK_SESSIONS="${HOME}/.grok/sessions"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+IMPORT_PY="${ROOT}/scripts/lib/import_grok_session.py"
+
+usage() {
+  echo "Usage:" >&2
+  echo "  agent-pane open <sessionId>     Open in desktop (imports from Grok if needed)" >&2
+  echo "  agent-pane import <sessionId>   Import Grok/Claude-import session into Pane only" >&2
+  echo "  agent-pane list                 List recent Pane sessions" >&2
+  echo "" >&2
+  echo "sessionId may be:" >&2
+  echo "  • Agent Pane id   (~/.agent-pane/sessions/<id>/)" >&2
+  echo "  • Grok CLI id     (~/.grok/sessions/<cwd-enc>/<id>/) — auto-imported on open" >&2
+  exit 1
+}
+
+resolve_bin() {
+  if [[ -n "${AGENT_PANE_BIN:-}" && -x "${AGENT_PANE_BIN}" ]]; then
+    echo "${AGENT_PANE_BIN}"
+    return
+  fi
+  local candidates=(
+    "/Applications/Agent Pane.app/Contents/MacOS/agent-pane"
+    "${ROOT}/apps/desktop/src-tauri/target/release/agent-pane"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -x "$c" ]]; then
+      echo "$c"
+      return
+    fi
+  done
+  echo "Agent Pane binary not found. Install the app or set AGENT_PANE_BIN." >&2
+  exit 1
+}
+
+resolve_pane_session() {
+  local sid="$1"
+  local meta="${PANE_SESSIONS}/${sid}/meta.json"
+  if [[ -f "$meta" ]]; then
+    echo "$sid"
+    return 0
+  fi
+  python3 - "$sid" "$PANE_SESSIONS" <<'PY'
+import json, pathlib, sys
+want, root = sys.argv[1], pathlib.Path(sys.argv[2])
+for meta in root.glob("*/meta.json"):
+    try:
+        o = json.loads(meta.read_text())
+    except Exception:
+        continue
+    if o.get("providerSessionId") == want:
+        print(o.get("sessionId") or meta.parent.name)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+find_grok_session_dirs() {
+  local sid="$1"
+  find "$GROK_SESSIONS" -maxdepth 2 -type d -name "$sid" 2>/dev/null || true
+}
+
+ensure_imported() {
+  local sid="$1"
+  local force="${2:-}"
+  if [[ ! -f "$IMPORT_PY" ]]; then
+    echo "import helper missing: $IMPORT_PY" >&2
+    exit 1
+  fi
+  if [[ "$force" == "1" ]]; then
+    python3 "$IMPORT_PY" "$sid" --force
+  else
+    python3 "$IMPORT_PY" "$sid"
+  fi
+}
+
+list_sessions() {
+  python3 - "$PANE_SESSIONS" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+if not root.is_dir():
+    print("No Pane sessions yet (~/.agent-pane/sessions).")
+    raise SystemExit(0)
+metas = sorted(root.glob("*/meta.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+if not metas:
+    print("No Pane sessions yet.")
+    raise SystemExit(0)
+print(f"{'SESSION_ID':<38}  {'UPDATED':<20}  TITLE")
+for meta in metas[:40]:
+    try:
+        o = json.loads(meta.read_text())
+    except Exception:
+        continue
+    sid = o.get("sessionId") or meta.parent.name
+    title = (o.get("title") or "(untitled)").replace("\n", " ")[:48]
+    updated = (o.get("updatedAt") or "")[:19].replace("T", " ")
+    mark = " ★" if o.get("importedFrom") == "grok" else ""
+    print(f"{sid:<38}  {updated:<20}  {title}{mark}")
+PY
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  list)
+    list_sessions
+    ;;
+  import)
+    sid="${2:-}"
+    [[ -n "$sid" ]] || usage
+    force=0
+    [[ "${3:-}" == "--force" ]] && force=1
+    grok_hits="$(find_grok_session_dirs "$sid")"
+    if [[ -z "$grok_hits" && ! -f "${PANE_SESSIONS}/${sid}/meta.json" ]]; then
+      echo "session not found in Grok or Pane: ${sid}" >&2
+      exit 1
+    fi
+    ensure_imported "$sid" "$force"
+    ;;
+  open)
+    sid="${2:-}"
+    [[ -n "$sid" ]] || usage
+
+    resolved="$(resolve_pane_session "$sid" || true)"
+    if [[ -z "$resolved" ]]; then
+      grok_hits="$(find_grok_session_dirs "$sid")"
+      if [[ -n "$grok_hits" ]]; then
+        echo "Grok session detected — importing into Agent Pane…" >&2
+        ensure_imported "$sid" 0
+        resolved="$sid"
+      else
+        echo "session not found in Agent Pane or Grok: ${sid}" >&2
+        echo "Tip: agent-pane list" >&2
+        exit 1
+      fi
+    fi
+
+    if [[ "$resolved" != "$sid" ]]; then
+      echo "resolved providerSessionId → Pane session ${resolved}" >&2
+    fi
+
+    # Ensure events exist (re-import if meta-only)
+    if [[ ! -f "${PANE_SESSIONS}/${resolved}/events.jsonl" ]]; then
+      grok_hits="$(find_grok_session_dirs "$resolved")"
+      if [[ -n "$grok_hits" ]]; then
+        ensure_imported "$resolved" 0
+      fi
+    fi
+
+    bin="$(resolve_bin)"
+    exec "$bin" --session="$resolved"
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage
+    ;;
+esac

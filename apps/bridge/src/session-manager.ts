@@ -5,11 +5,13 @@ import { GrokAcpAdapter } from "./grok-acp-adapter.js";
 import { WorkspaceSnapshotService } from "./workspace-snapshot.js";
 import { DiffEngine, fileFingerprint } from "./diff-engine.js";
 import {
+  invalidateHistoryListCache,
   invalidateSessionEventsCache,
   loadSessionEvents,
   pruneDraftSessions,
   readMeta,
   upsertMeta,
+  writeMeta,
 } from "./history-index.js";
 
 export type Broadcast = (msg: unknown) => void;
@@ -18,6 +20,7 @@ type LiveSession = {
   domainSessionId: string;
   cwd: string;
   model?: string;
+  effort?: string;
   /** agent | auto | plan | ask | default … */
   permissionMode: string;
   providerSessionId?: string;
@@ -30,10 +33,25 @@ type LiveSession = {
 };
 
 function modeUsesAlwaysApprove(mode: string): boolean {
-  // agent / always / yolo → full auto-approve tools
+  // agent / debug / multitask / always / yolo → full auto-approve tools
   // auto / ask / default / plan → let grok prompt (plan also restricts via prompt)
   const m = mode.toLowerCase();
-  return m === "agent" || m === "always" || m === "always-approve" || m === "yolo";
+  return (
+    m === "agent" ||
+    m === "debug" ||
+    m === "multitask" ||
+    m === "always" ||
+    m === "always-approve" ||
+    m === "yolo"
+  );
+}
+
+/** UI modes → stored permissionMode (plan preamble / tool gate) */
+function normalizePermissionMode(mode?: string): string {
+  const m = (mode ?? "agent").toLowerCase();
+  if (m === "plan") return "plan";
+  if (m === "auto" || m === "ask") return "auto";
+  return "agent";
 }
 
 /** Compact transcript so a fresh ACP session can continue the chat. */
@@ -115,6 +133,41 @@ export class SessionManager {
       return ephemeral;
     }
 
+    // Rewind: truncate disk first, then broadcast (don't persist SessionRewound —
+    // the truncated jsonl is the source of truth, Claude Code style).
+    if (event.type === "SessionRewound") {
+      try {
+        this.store.truncateBeforeUserTurn(
+          event.sessionId,
+          event.userTurnIndex
+        );
+      } catch {
+        /* still notify UI */
+      }
+      invalidateSessionEventsCache(event.sessionId);
+      try {
+        const kept = this.store.list(event.sessionId, 0);
+        const msgCount = kept.filter((e) => e.type === "UserMessageAppended")
+          .length;
+        const live = this.live.get(event.sessionId);
+        const prev = readMeta(event.sessionId);
+        if (prev) {
+          writeMeta({
+            ...prev,
+            cwd: live?.cwd || prev.cwd,
+            messageCount: msgCount,
+            updatedAt: new Date().toISOString(),
+          });
+          invalidateHistoryListCache();
+        }
+      } catch {
+        /* non-fatal */
+      }
+      const ephemeral = { ...event, seq: 0 } as StoredEvent;
+      this.broadcast({ type: "event", event: ephemeral });
+      return ephemeral;
+    }
+
     const stored = this.store.append(event);
     this.broadcast({ type: "event", event: stored });
     invalidateSessionEventsCache(event.sessionId);
@@ -165,7 +218,8 @@ export class SessionManager {
         await this.createSession(
           cmd.cwd,
           cmd.model,
-          cmd.permissionMode ?? this.permissionMode
+          cmd.permissionMode ?? this.permissionMode,
+          cmd.effort
         );
         break;
       case "session.resume":
@@ -173,11 +227,17 @@ export class SessionManager {
           sessionId: cmd.sessionId,
           cwd: cmd.cwd,
           model: cmd.model,
+          effort: cmd.effort,
           permissionMode: cmd.permissionMode ?? this.permissionMode,
         });
         break;
       case "session.prompt":
-        await this.prompt(cmd.sessionId, cmd.text, cmd.attachments);
+        await this.prompt(
+          cmd.sessionId,
+          cmd.text,
+          cmd.attachments,
+          cmd.permissionMode
+        );
         break;
       case "session.cancel":
         await this.live.get(cmd.sessionId)?.adapter.cancel(cmd.sessionId);
@@ -185,11 +245,30 @@ export class SessionManager {
       case "session.undoLast": {
         const live = this.live.get(cmd.sessionId);
         if (!live) {
-          this.broadcast({ type: "error", message: "Unknown session" });
+          // Offline / history: still truncate disk + notify UI
+          this.rewindOffline(cmd.sessionId, -1);
           break;
         }
         try {
           await live.adapter.undoLastTurn();
+        } catch (e) {
+          this.broadcast({
+            type: "error",
+            message: e instanceof Error ? e.message : String(e),
+          });
+        }
+        break;
+      }
+      case "session.rewindTo": {
+        const live = this.live.get(cmd.sessionId);
+        if (!live) {
+          this.rewindOffline(cmd.sessionId, cmd.userTurnIndex);
+          break;
+        }
+        try {
+          // Ensure turn list matches disk (resume may have empty local turns)
+          this.hydrateAdapterTurns(live.adapter, cmd.sessionId);
+          await live.adapter.rewindToUserTurn(cmd.userTurnIndex);
         } catch (e) {
           this.broadcast({
             type: "error",
@@ -227,6 +306,47 @@ export class SessionManager {
     }
   }
 
+  private hydrateAdapterTurns(
+    adapter: GrokAcpAdapter,
+    sessionId: string
+  ): void {
+    const texts = this.store
+      .list(sessionId, 0)
+      .filter((e) => e.type === "UserMessageAppended")
+      .map((e) => (e as { text?: string }).text ?? "");
+    adapter.hydrateUserTurns(texts);
+  }
+
+  /**
+   * History-only / dead agent rewind: truncate events + broadcast SessionRewound.
+   * `userTurnIndex` -1 means last user turn.
+   */
+  private rewindOffline(sessionId: string, userTurnIndex: number): void {
+    const events = this.store.list(sessionId, 0);
+    const userTexts = events
+      .filter((e) => e.type === "UserMessageAppended")
+      .map((e) => (e as { text?: string }).text ?? "");
+    if (userTexts.length === 0) {
+      this.broadcast({ type: "error", message: "Nothing to undo" });
+      return;
+    }
+    const idx =
+      userTurnIndex < 0 ? userTexts.length - 1 : Math.floor(userTurnIndex);
+    if (idx < 0 || idx >= userTexts.length) {
+      this.broadcast({ type: "error", message: "Invalid turn to undo" });
+      return;
+    }
+    this.publish({
+      type: "SessionRewound",
+      sessionId,
+      restoredText: userTexts[idx]!,
+      userTurnIndex: idx,
+      providerOk: false,
+      note: "UI undid the turn (agent not attached)",
+      at: nowIso(),
+    });
+  }
+
   /** 关掉所有（或指定 cwd）旧 adapter，避免 grok agent 进程堆僵尸 */
   private async stopLiveSessions(filterCwd?: string): Promise<void> {
     const entries = [...this.live.entries()];
@@ -244,6 +364,21 @@ export class SessionManager {
   private wireAdapter(adapter: GrokAcpAdapter): void {
     adapter.onEvent((e) => {
       this.publish(e);
+      if (e.type === "ContextUsage" && e.providerSessionId) {
+        const live = this.live.get(e.sessionId);
+        if (live && live.providerSessionId !== e.providerSessionId) {
+          live.providerSessionId = e.providerSessionId;
+          try {
+            upsertMeta({
+              sessionId: e.sessionId,
+              cwd: live.cwd,
+              providerSessionId: e.providerSessionId,
+            });
+          } catch {
+            /* non-fatal */
+          }
+        }
+      }
       if (e.type === "ToolFinished" || e.type === "MessageDone") {
         const sid = e.sessionId;
         setTimeout(() => this.refreshDiff(sid), 300);
@@ -261,12 +396,15 @@ export class SessionManager {
   private async createSession(
     cwd: string,
     model?: string,
-    permissionMode?: string
+    permissionMode?: string,
+    effort?: string
   ): Promise<void> {
     // 先清旧会话——这是「New Agent 点了像死了」的主因
     await this.stopLiveSessions();
 
-    const mode = (permissionMode ?? this.permissionMode ?? "agent").toLowerCase();
+    const mode = normalizePermissionMode(
+      permissionMode ?? this.permissionMode ?? "agent"
+    );
     this.permissionMode = mode;
 
     this.broadcast({
@@ -285,11 +423,13 @@ export class SessionManager {
       resumed?: boolean;
       cwd: string;
       model?: string;
+      effort?: string;
     };
     try {
       started = await adapter.start({
         cwd,
         model,
+        effort,
         // adapter maps ask/default → no --always-approve; else always-approve
         permissionMode: modeUsesAlwaysApprove(mode) ? "auto" : "ask",
       });
@@ -308,6 +448,7 @@ export class SessionManager {
       domainSessionId,
       cwd,
       model,
+      effort,
       permissionMode: mode,
       providerSessionId,
       adapter,
@@ -323,6 +464,13 @@ export class SessionManager {
       providerSessionId,
       at: nowIso(),
     });
+
+    // Immediate context fill from Grok signals.json (watcher also keeps it fresh)
+    try {
+      (adapter as { publishSignalsUsageOnce?: () => boolean }).publishSignalsUsageOnce?.();
+    } catch {
+      /* non-fatal */
+    }
 
     // Persist provider id as soon as agent is up (needed for later resume)
     // Only touch meta if session already has history (avoid empty drafts in list)
@@ -365,6 +513,7 @@ export class SessionManager {
     sessionId: string;
     cwd: string;
     model?: string;
+    effort?: string;
     permissionMode?: string;
   }): Promise<void> {
     const { sessionId, cwd } = opts;
@@ -395,7 +544,9 @@ export class SessionManager {
       this.live.delete(sessionId);
     }
 
-    const mode = (opts.permissionMode ?? this.permissionMode ?? "agent").toLowerCase();
+    const mode = normalizePermissionMode(
+      opts.permissionMode ?? this.permissionMode ?? "agent"
+    );
     this.permissionMode = mode;
     const meta = readMeta(sessionId);
     const providerSessionId =
@@ -424,6 +575,7 @@ export class SessionManager {
 
     const resumeCwd = cwd || meta?.cwd || existing?.cwd || "";
     const resumeModel = opts.model ?? existing?.model;
+    const resumeEffort = opts.effort ?? existing?.effort;
     let started: {
       providerSessionId: string;
       domainSessionId: string;
@@ -433,6 +585,7 @@ export class SessionManager {
       started = await adapter.start({
         cwd: resumeCwd,
         model: resumeModel,
+        effort: resumeEffort,
         permissionMode: modeUsesAlwaysApprove(mode) ? "auto" : "ask",
         domainSessionId: sessionId,
         // Keep id for bookkeeping; start() no longer session/load (prompt hang).
@@ -440,9 +593,15 @@ export class SessionManager {
         resumed: true,
       });
     } catch (e) {
+      const raw = e instanceof Error ? e.message : String(e);
+      // Don't slap a generic "启动超时" hint on auth/login errors
+      const hint =
+        /timed out/i.test(raw) && !/登录|login|Authentication|认证/i.test(raw)
+          ? "（可再点 Send 重试）"
+          : "";
       this.broadcast({
         type: "error",
-        message: `恢复会话失败: ${e instanceof Error ? e.message : String(e)}`,
+        message: `恢复会话失败: ${raw}${hint}`,
       });
       return;
     }
@@ -457,11 +616,13 @@ export class SessionManager {
       domainSessionId: sessionId,
       cwd: resumeCwd,
       model: resumeModel,
+      effort: resumeEffort,
       permissionMode: mode,
       providerSessionId: loadedProvider,
       adapter,
       acceptedFp: new Map(),
     });
+    this.hydrateAdapterTurns(adapter, sessionId);
 
     this.publish({
       type: "SessionStarted",
@@ -472,6 +633,12 @@ export class SessionManager {
       providerSessionId: loadedProvider,
       at: nowIso(),
     });
+
+    try {
+      (adapter as { publishSignalsUsageOnce?: () => boolean }).publishSignalsUsageOnce?.();
+    } catch {
+      /* non-fatal */
+    }
 
     // Always refresh provider id on disk after successful resume
     upsertMeta({
@@ -498,7 +665,8 @@ export class SessionManager {
   private async prompt(
     sessionId: string,
     text: string,
-    attachments?: { path: string; kind: "file" | "folder" }[]
+    attachments?: { path: string; kind: "file" | "folder" }[],
+    permissionMode?: string
   ): Promise<void> {
     let live = this.live.get(sessionId);
     // Idle / process died: auto-resume same history session before prompting
@@ -508,7 +676,9 @@ export class SessionManager {
         sessionId,
         cwd: live?.cwd || meta?.cwd || "",
         model: live?.model,
-        permissionMode: live?.permissionMode,
+        effort: live?.effort,
+        permissionMode:
+          permissionMode ?? live?.permissionMode,
       });
       live = this.live.get(sessionId);
       if (!live || !live.adapter.isAlive()) {
@@ -518,6 +688,10 @@ export class SessionManager {
         });
         return;
       }
+    }
+
+    if (permissionMode) {
+      live.permissionMode = normalizePermissionMode(permissionMode);
     }
 
     // `/usage` is a Grok TUI/pager command — not handled by ACP session/prompt
@@ -571,7 +745,13 @@ export class SessionManager {
           lines.push(`Prepaid balance: ${u.prepaidBalance}`);
         }
         lines.push("", "_Source: Grok `_x.ai/billing` (same as TUI `/usage`)._");
-        live.adapter.emitLocalReply(text.trim(), lines.join("\n"));
+        // Ephemeral panel — do NOT inject into chat / next-turn context
+        this.broadcast({
+          type: "notice",
+          kind: "usage",
+          title: `Usage · ${u.subscriptionTier || "Grok"}`,
+          body: lines.join("\n"),
+        });
         this.broadcast({ type: "status", message: " " }); // clear strip
       } catch (e) {
         this.broadcast({
@@ -612,6 +792,7 @@ export class SessionManager {
           sessionId,
           cwd: live.cwd || meta?.cwd || "",
           model: live.model,
+          effort: live.effort,
           permissionMode: live.permissionMode,
         });
         const again = this.live.get(sessionId);

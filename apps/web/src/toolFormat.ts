@@ -336,7 +336,7 @@ export function formatToolFailed(row: ToolRow, error: string): ToolRow {
   if (/^pending:/i.test(base) || base.toLowerCase() === "permission") {
     base = row.name || row.path || "tool";
   }
-  const err = (error || "").slice(0, 300);
+  const err = tidyToolError(error).slice(0, 300);
   // permission denials: clearer message
   const niceErr = /permission/i.test(err)
     ? "Permission denied (allow in the prompt card, or switch to Agent mode)"
@@ -348,6 +348,68 @@ export function formatToolFailed(row: ToolRow, error: string): ToolRow {
     error: niceErr,
     detailLines: [niceErr],
   };
+}
+
+/** Strip ACP JSON wrappers / truncate noise for Failed turn-log lines. */
+export function tidyToolError(raw: string): string {
+  const s = (raw || "").trim();
+  if (!s) return "failed";
+  // Already plain text
+  if (!s.startsWith("[") && !s.startsWith("{")) return s;
+  try {
+    const parsed = JSON.parse(s) as unknown;
+    const text = extractTextFromUnknown(parsed);
+    if (text) return text;
+  } catch {
+    /* keep raw */
+  }
+  // Regex fallback for truncated JSON like [{"type":"content",...,"text":"Cannot read…
+  const m = s.match(/"text"\s*:\s*"((?:\\.|[^"\\])*)/);
+  if (m?.[1]) {
+    try {
+      return JSON.parse(`"${m[1]}"`) as string;
+    } catch {
+      return m[1].replace(/\\n/g, "\n").replace(/\\"/g, '"');
+    }
+  }
+  return s;
+}
+
+function extractTextFromUnknown(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (!v || typeof v !== "object") return "";
+  if (Array.isArray(v)) {
+    return v.map(extractTextFromUnknown).filter(Boolean).join("\n").trim();
+  }
+  const o = v as Record<string, unknown>;
+  if (typeof o.text === "string" && o.text.trim()) return o.text;
+  if (o.content != null) {
+    const inner = extractTextFromUnknown(o.content);
+    if (inner) return inner;
+  }
+  for (const key of ["message", "error", "output"] as const) {
+    const x = o[key];
+    if (typeof x === "string" && x.trim()) return x;
+    if (x && typeof x === "object") {
+      const inner = extractTextFromUnknown(x);
+      if (inner) return inner;
+    }
+  }
+  return "";
+}
+
+/** Sum +/− across all tools in a group (for summary chip). */
+export function aggregateToolDiffStats(tools: ToolRow[]): {
+  additions: number;
+  deletions: number;
+} {
+  let additions = 0;
+  let deletions = 0;
+  for (const t of tools) {
+    if (t.additions != null) additions += t.additions;
+    if (t.deletions != null) deletions += t.deletions;
+  }
+  return { additions, deletions };
 }
 
 /** Collapse tool list into Cursor-style summary for the group header. */
@@ -372,17 +434,26 @@ export function summarizeToolGroup(tools: ToolRow[]): string {
     (t) =>
       t.kind === "execute" ||
       t.name.includes("run") ||
-      t.name.includes("shell")
+      t.name.includes("shell") ||
+      t.label.startsWith("Ran ")
   ).length;
 
+  // Cursor-style: "Edited 4 files, ran 2 commands" / "Explored 3 files, 2 searches"
   const parts: string[] = [];
-  if (searches) parts.push(`explored ${searches} search${searches > 1 ? "es" : ""}`);
-  if (reads) parts.push(`read ${reads} file${reads > 1 ? "s" : ""}`);
-  if (edits) parts.push(`edited ${edits} file${edits > 1 ? "s" : ""}`);
+  if (edits && !reads && !searches) {
+    parts.push(`Edited ${edits} file${edits > 1 ? "s" : ""}`);
+  } else if (reads || searches || edits) {
+    const bits: string[] = [];
+    const fileish = reads + edits;
+    if (fileish) bits.push(`${fileish} file${fileish > 1 ? "s" : ""}`);
+    if (searches) bits.push(`${searches} search${searches > 1 ? "es" : ""}`);
+    parts.push(`Explored ${bits.join(", ")}`);
+  }
   if (runs) parts.push(`ran ${runs} command${runs > 1 ? "s" : ""}`);
-  if (!parts.length) parts.push(`${tools.length} step${tools.length > 1 ? "s" : ""}`);
+  if (!parts.length) {
+    parts.push(`${tools.length} step${tools.length > 1 ? "s" : ""}`);
+  }
 
-  // capitalize first
   const s = parts.join(", ");
   return s.charAt(0).toUpperCase() + s.slice(1);
 }

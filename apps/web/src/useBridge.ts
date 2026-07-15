@@ -10,17 +10,28 @@ import {
   formatToolFailed,
   formatToolFinished,
   formatToolStarted,
+  tidyToolError,
   type ToolRow,
 } from "./toolFormat";
 import {
   eventsToChatItems,
   formatDurationSec,
+  sliceMessagesBeforeUserTurn,
+  userTextAtTurn,
+  userTurnIndexAt,
   type ChatItem,
   type TurnLogLine,
 } from "./chatFromEvents";
+import { parseSessionInfoUsage } from "./contextUsage";
 
 export type { ChatItem, TurnLogLine } from "./chatFromEvents";
-export { eventsToChatItems, formatDurationSec } from "./chatFromEvents";
+export {
+  eventsToChatItems,
+  formatDurationSec,
+  sliceMessagesBeforeUserTurn,
+  userTextAtTurn,
+  userTurnIndexAt,
+} from "./chatFromEvents";
 export type { ToolRow };
 
 export type PermissionReq = {
@@ -29,7 +40,21 @@ export type PermissionReq = {
   summary: string;
 };
 
-export type AgentMode = "agent" | "auto" | "plan";
+import {
+  getEffortFor,
+  migrateLegacyEffort,
+  setEffortFor,
+  type EffortLevel,
+} from "./modelEffort";
+
+export type AgentMode = "agent" | "auto" | "plan" | "debug" | "multitask";
+
+/** Map UI mode → ACP permissionMode sent to bridge */
+export function permissionModeFor(mode: AgentMode): "agent" | "auto" | "plan" {
+  if (mode === "plan") return "plan";
+  if (mode === "auto") return "auto";
+  return "agent";
+}
 
 const WS_URL = import.meta.env.VITE_BRIDGE_WS ?? "ws://127.0.0.1:8787";
 
@@ -98,23 +123,85 @@ export function useBridge() {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{
+    kind: "usage" | "info";
+    title: string;
+    body: string;
+  } | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [cwd, setCwd] = useState(localStorage.getItem("agent-pane-cwd") || "");
-  const [model, setModel] = useState(
+  const [model, setModelState] = useState(
     () => localStorage.getItem("agent-pane-model") || "grok-4.5"
+  );
+  const [effort, setEffortState] = useState<EffortLevel>(() => {
+    const mid = localStorage.getItem("agent-pane-model") || "grok-4.5";
+    migrateLegacyEffort(mid);
+    return getEffortFor(mid).effort;
+  });
+  const [effortFast, setEffortFastState] = useState(() => {
+    const mid = localStorage.getItem("agent-pane-model") || "grok-4.5";
+    return getEffortFor(mid).fast;
+  });
+
+  const setModel = useCallback((id: string) => {
+    setModelState(id);
+    localStorage.setItem("agent-pane-model", id);
+    const pref = getEffortFor(id);
+    setEffortState(pref.effort);
+    setEffortFastState(pref.fast);
+  }, []);
+
+  const setEffort = useCallback(
+    (level: EffortLevel) => {
+      setEffortState(level);
+      setEffortFastState(false);
+      setEffortFor(model, { effort: level, fast: false });
+    },
+    [model]
+  );
+
+  const setEffortFast = useCallback(
+    (fast: boolean) => {
+      setEffortFastState(fast);
+      setEffortFor(model, { effort, fast });
+    },
+    [model, effort]
   );
   const [agentMode, setAgentMode] = useState<AgentMode>(() => {
     const raw = localStorage.getItem("agent-pane-mode") || "agent";
-    return raw === "auto" || raw === "plan" || raw === "agent" ? raw : "agent";
+    return raw === "auto" ||
+      raw === "plan" ||
+      raw === "agent" ||
+      raw === "debug" ||
+      raw === "multitask"
+      ? raw
+      : "agent";
   });
   const [messages, setMessages] = useState<ChatItem[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [diffs, setDiffs] = useState<DiffFileMeta[]>([]);
   const [permissions, setPermissions] = useState<PermissionReq[]>([]);
   const [busy, setBusy] = useState(false);
+  const [contextUsage, setContextUsage] = useState<{
+    used: number;
+    size: number;
+    source:
+      | "acp"
+      | "compact"
+      | "compact_done"
+      | "signals"
+      | "session_info"
+      | "estimate";
+    at?: string;
+    pct?: number;
+  } | null>(null);
   const [restoredDraft, setRestoredDraft] = useState<string | null>(null);
+  /** True while session.resume is in flight — must NOT flip Send→Stop */
+  const [resuming, setResuming] = useState(false);
   /** 打开历史回放：尚无 live agent，发消息前会新开会话 */
   const [historyOnly, setHistoryOnly] = useState(false);
+  const historyOnlyRef = useRef(false);
+  historyOnlyRef.current = historyOnly;
   const assistantBuf = useRef("");
   const assistantLiveId = useRef("a-live");
   const thoughtLiveId = useRef("t-live");
@@ -134,6 +221,8 @@ export function useBridge() {
   const turnLogRef = useRef<TurnLogLine[]>([]);
   const thoughtStartRef = useRef<number | null>(null);
   const toolStartRef = useRef(new Map<string, number>());
+  /** Wall-clock start of current user turn (Worked for Xs) */
+  const turnStartedAtRef = useRef<number | null>(null);
   /** When current busy wait began (for "Waiting for response… 2.2s") */
   const busySinceRef = useRef<number | null>(null);
   const [busyElapsed, setBusyElapsed] = useState(0);
@@ -149,9 +238,11 @@ export function useBridge() {
   const sessionIdRef = useRef<string | null>(null);
   sessionIdRef.current = sessionId;
   /** After SessionRewound: retry resends, edit fills composer, undo just restores */
-  const afterRewindRef = useRef<null | { kind: "retry" | "edit" | "undo"; text: string }>(
-    null
-  );
+  const afterRewindRef = useRef<null | {
+    kind: "retry" | "edit" | "undo";
+    text: string;
+    userTurnIndex: number;
+  }>(null);
 
   // Tick elapsed while busy for CLI-style "Waiting for response… 1.2s"
   useEffect(() => {
@@ -249,6 +340,9 @@ export function useBridge() {
         if (event.model) setModel(event.model);
         setError(null);
         setStatusMsg(null);
+        setResuming(false);
+        // Don't keep a previous chat's usage ring on this session
+        if (!replayingRef.current) setContextUsage(null);
         if (!replayingRef.current) {
           // Resume re-attaches without wiping the timeline we just loaded
           if (event.resumed) {
@@ -272,6 +366,7 @@ export function useBridge() {
             setMessages([]);
             setTasks([]);
             setDiffs([]);
+            setContextUsage(null);
             assistantBuf.current = "";
             thoughtBufMap.current.clear();
             postToolsAssistantId.current = null;
@@ -297,14 +392,28 @@ export function useBridge() {
         break;
 
       case "UserMessageAppended":
-        setMessages((m) => [
-          ...m,
-          {
-            kind: "user",
-            text: event.text,
-            id: `u-${event.sessionId}-${turnTag}`,
-          },
-        ]);
+        setMessages((m) => {
+          // Drop optimistic bubble with same text (resume/create queue)
+          const withoutOpt = m.filter(
+            (x) =>
+              !(
+                x.kind === "user" &&
+                x.id.startsWith("u-optimistic-") &&
+                x.text === event.text
+              )
+          );
+          return [
+            ...withoutOpt,
+            {
+              kind: "user",
+              text: event.text,
+              id: `u-${event.sessionId}-${turnTag}`,
+              attachments: event.attachments?.length
+                ? event.attachments
+                : undefined,
+            },
+          ];
+        });
         if (!replayingRef.current) setBusy(true);
         assistantBuf.current = "";
         thoughtBufMap.current.clear();
@@ -313,6 +422,7 @@ export function useBridge() {
         turnLogRef.current = [];
         thoughtStartRef.current = null;
         toolStartRef.current.clear();
+        turnStartedAtRef.current = Date.now();
         // new live assistant id each user turn (unique even when seq repeats)
         assistantLiveId.current = `a-${event.sessionId}-${turnTag}`;
         thoughtLiveId.current = `t-${event.sessionId}-${turnTag}`;
@@ -351,7 +461,8 @@ export function useBridge() {
       }
 
       case "ThoughtChunk": {
-        // 用 ref 累加，避免 StrictMode 双跑
+        // After MessageDone, ignore residual thought stream (was spawning extra bubbles)
+        if (turnDoneRef.current) break;
         if (thoughtStartRef.current == null) {
           thoughtStartRef.current = Date.now();
         }
@@ -388,6 +499,18 @@ export function useBridge() {
           setMessages((m) => collapseDuplicateAssistants(m));
         }
         pushTurnLog();
+        {
+          const t0 = turnStartedAtRef.current;
+          const ms = t0 != null ? Math.max(0, Date.now() - t0) : 0;
+          if (ms > 0) {
+            const id = `worked-${sessionIdRef.current ?? "live"}-${Date.now()}`;
+            setMessages((m) => [
+              ...m,
+              { kind: "worked" as const, id, ms },
+            ]);
+          }
+          turnStartedAtRef.current = null;
+        }
         turnDoneRef.current = true;
         setBusy(false);
         break;
@@ -399,6 +522,10 @@ export function useBridge() {
           break;
         }
         sealThoughtLogLine();
+        // Seal this thought bubble; further thinking after tools gets a new id
+        thoughtBufMap.current.delete(thoughtLiveId.current);
+        thoughtLiveId.current = `t-${event.sessionId}-pretool-${event.seq ?? Date.now()}`;
+        thoughtStartRef.current = null;
         // Pre-tool agent chatter → muted status, not a full reply bubble
         const sealedBuf = assistantBuf.current;
         const liveId = assistantLiveId.current;
@@ -488,6 +615,47 @@ export function useBridge() {
         break;
       }
 
+      case "ContextUsage": {
+        setContextUsage((prev) => {
+          // Don't let a stale signals read overwrite a higher session-info reading
+          if (
+            prev &&
+            event.source === "signals" &&
+            prev.source === "session_info" &&
+            event.used + 500 < prev.used
+          ) {
+            return prev;
+          }
+          // History/import estimate: ignore tiny live signals until a real turn
+          // reports comparable usage (resume digest sessions look ~2%).
+          if (
+            prev &&
+            prev.source === "estimate" &&
+            historyOnlyRef.current &&
+            event.source === "signals" &&
+            event.used + 2_000 < prev.used * 0.5
+          ) {
+            return prev;
+          }
+          if (
+            prev &&
+            event.source === "signals" &&
+            event.used + 500 < prev.used &&
+            prev.source !== "compact_done"
+          ) {
+            return prev;
+          }
+          return {
+            used: event.used,
+            size: event.size,
+            source: event.source,
+            at: event.at,
+            pct: event.pct,
+          };
+        });
+        break;
+      }
+
       case "ToolFinished": {
         const started = toolStartRef.current.get(event.toolId);
         const dur = started
@@ -519,7 +687,7 @@ export function useBridge() {
       case "ToolFailed":
         turnLogRef.current.push({
           tone: "fail",
-          text: `Failed: ${(event.error || "tool").slice(0, 80)}`,
+          text: `Failed: ${tidyToolError(event.error || "tool").slice(0, 120)}`,
         });
         setMessages((m) =>
           m.map((item) => {
@@ -572,12 +740,23 @@ export function useBridge() {
         else setDiffs((d) => d.filter((f) => f.path !== event.filePath));
         break;
       case "SessionError":
+        setResuming(false);
+        // Idle agent exit is expected — don't flash a red error, just mark resumable
+        if (
+          /exited|disconnect|not alive|EPIPE/i.test(event.message) &&
+          !/fail|无法|error|崩溃/i.test(event.message)
+        ) {
+          setBusy(false);
+          setStatusMsg(null);
+          setHistoryOnly(true);
+          break;
+        }
         setError(event.message);
         setBusy(false);
         setStatusMsg(null);
         // agent 挂了 / 断线：标 historyOnly，下次 Send 会 resume 同一 session
         if (
-          /exited|disconnect|Unknown session|not started|ECONN|not running|not alive|resume|timed out/i.test(
+          /exited|disconnect|Unknown session|not started|ECONN|not running|not alive|resume|timed out|Authentication|认证/i.test(
             event.message
           )
         ) {
@@ -586,6 +765,8 @@ export function useBridge() {
         break;
       case "SessionEnded":
         setBusy(false);
+        setResuming(false);
+        setStatusMsg(null);
         // Idle death / stop — keep timeline, allow resume on next send
         if (
           event.stopReason &&
@@ -595,7 +776,10 @@ export function useBridge() {
         }
         break;
       case "SessionRewound": {
+        const turnIdx =
+          typeof event.userTurnIndex === "number" ? event.userTurnIndex : -1;
         setMessages((m) => {
+          if (turnIdx >= 0) return sliceMessagesBeforeUserTurn(m, turnIdx);
           let lastUser = -1;
           for (let i = m.length - 1; i >= 0; i--) {
             if (m[i]!.kind === "user") {
@@ -618,7 +802,6 @@ export function useBridge() {
         if (action?.kind === "retry" && text && sessionIdRef.current) {
           setRestoredDraft(null);
           setError(null);
-          // Re-send same user turn after UI rewind
           const sid = sessionIdRef.current;
           window.setTimeout(() => {
             setBusy(true);
@@ -628,7 +811,6 @@ export function useBridge() {
           setRestoredDraft(text);
           setError(null);
         } else {
-          // Plain undo — put text back in composer for convenience
           setRestoredDraft(event.restoredText);
           if (event.note && !event.providerOk) {
             setError(event.note);
@@ -674,9 +856,26 @@ export function useBridge() {
           } else if (msg.type === "error") {
             setError(msg.message);
             setBusy(false);
+            setResuming(false);
             setStatusMsg(null);
+            // Resume/create failed before SessionStarted — put queued text back
+            const pending = pendingPromptRef.current;
+            if (pending?.text?.trim()) {
+              setRestoredDraft(pending.text);
+              pendingPromptRef.current = null;
+              setMessages((m) =>
+                m.filter(
+                  (x) =>
+                    !(
+                      x.kind === "user" &&
+                      x.id.startsWith("u-optimistic-") &&
+                      x.text === pending.text
+                    )
+                )
+              );
+            }
             if (
-              /Unknown session|not found|exited|disconnect|恢复|resume|timeout/i.test(
+              /Unknown session|not found|exited|disconnect|恢复|resume|timeout|Authentication|认证/i.test(
                 msg.message
               )
             ) {
@@ -684,6 +883,12 @@ export function useBridge() {
             }
           } else if (msg.type === "status") {
             setStatusMsg(msg.message?.trim() ? msg.message : null);
+          } else if (msg.type === "notice") {
+            setNotice({
+              kind: msg.kind,
+              title: msg.title,
+              body: msg.body,
+            });
           }
         } catch {
           /* ignore */
@@ -708,9 +913,26 @@ export function useBridge() {
         text: text.trim(),
         attachments: attachments?.length ? attachments : undefined,
       };
+      // Optimistic user bubble while resume/create runs (removed if real
+      // UserMessageAppended arrives with same text, or on resume failure).
+      const t = text.trim() || (attachments?.length ? "(attached files)" : "");
+      if (t || attachments?.length) {
+        const oid = `u-optimistic-${Date.now()}`;
+        setMessages((m) => [
+          ...m,
+          {
+            kind: "user",
+            text: t || "(attached files)",
+            id: oid,
+            attachments: attachments?.length ? attachments : undefined,
+          },
+        ]);
+      }
     },
     []
   );
+
+  const effectiveEffort = effortFast ? "minimal" : effort;
 
   const createSession = useCallback(() => {
     if (!cwd.trim()) {
@@ -719,16 +941,21 @@ export function useBridge() {
     }
     localStorage.setItem("agent-pane-cwd", cwd.trim());
     if (model) localStorage.setItem("agent-pane-model", model);
+    localStorage.setItem("agent-pane-effort", effort);
+    localStorage.setItem("agent-pane-effort-fast", effortFast ? "1" : "0");
     localStorage.setItem("agent-pane-mode", agentMode);
     setMessages([]);
     setTasks([]);
     setDiffs([]);
     setPermissions([]);
+    setContextUsage(null);
     setHistoryOnly(false);
     setSessionId(null); // 清掉旧 id，避免发到死会话
-    setBusy(true);
+    // Only mark busy (red Stop) when a prompt is queued — bare New Agent is idle
+    const willPrompt = Boolean(pendingPromptRef.current);
+    setBusy(willPrompt);
     setError(null);
-    setStatusMsg("Starting Grok agent…");
+    setStatusMsg(willPrompt ? "Starting Grok agent…" : null);
     assistantBuf.current = "";
     thoughtBufMap.current.clear();
     postToolsAssistantId.current = null;
@@ -738,9 +965,10 @@ export function useBridge() {
       type: "session.create",
       cwd: cwd.trim(),
       model: model.trim() || undefined,
-      permissionMode: agentMode,
+      effort: effectiveEffort,
+      permissionMode: permissionModeFor(agentMode),
     });
-  }, [cwd, model, agentMode, send]);
+  }, [cwd, model, effort, effortFast, effectiveEffort, agentMode, send]);
 
   /** Re-attach live agent to a history session (keep same sessionId + messages). */
   const resumeSession = useCallback(
@@ -748,45 +976,74 @@ export function useBridge() {
       if (!histSessionId) return;
       localStorage.setItem("agent-pane-cwd", histCwd.trim() || cwd);
       if (model) localStorage.setItem("agent-pane-model", model);
+      localStorage.setItem("agent-pane-effort", effort);
+      localStorage.setItem("agent-pane-effort-fast", effortFast ? "1" : "0");
       localStorage.setItem("agent-pane-mode", agentMode);
+      setResuming(true);
       setBusy(true);
       setError(null);
       setStatusMsg("正在恢复会话…");
-      // Safety: if resume never completes, unlock UI
+      // Hard unlock if resume never completes (auth hang / silent stall)
       window.setTimeout(() => {
-        setStatusMsg((s) =>
-          s && /恢复|Resuming|连接/i.test(s)
-            ? null
-            : s
-        );
-      }, 50_000);
+        setResuming((r) => {
+          if (!r) return r;
+          setBusy(false);
+          setStatusMsg(null);
+          setHistoryOnly(true);
+          const pending = pendingPromptRef.current;
+          if (pending?.text?.trim()) {
+            setRestoredDraft(pending.text);
+            pendingPromptRef.current = null;
+            setMessages((m) =>
+              m.filter(
+                (x) =>
+                  !(
+                    x.kind === "user" &&
+                    x.id.startsWith("u-optimistic-") &&
+                    x.text === pending.text
+                  )
+              )
+            );
+          }
+          setError(
+            "恢复超时 — 请再点 Send，或终端跑 grok login 后重试"
+          );
+          return false;
+        });
+      }, 45_000);
       send({
         type: "session.resume",
         sessionId: histSessionId,
         cwd: (histCwd || cwd).trim(),
         model: model.trim() || undefined,
-        permissionMode: agentMode,
+        effort: effectiveEffort,
+        permissionMode: permissionModeFor(agentMode),
       });
     },
-    [cwd, model, agentMode, send]
+    [cwd, model, effort, effortFast, effectiveEffort, agentMode, send]
   );
 
-  /** 从历史打开：只回放事件到 UI（继续聊请再 Start 新会话或同一 cwd 新 Agent） */
+  /**
+   * Open from history: local event replay only (Cursor-style).
+   * Does NOT spawn Grok / session/new — that happens lazily on Send via resumeSession.
+   */
   const openHistorySession = useCallback(
     async (histSessionId: string, histCwd: string) => {
       try {
         setError(null);
+        setStatusMsg(null);
         setBusy(true);
+        // Drop any queued prompt from a previous resume attempt
+        pendingPromptRef.current = null;
         const { fetchSessionEvents, deleteSessionApi, invalidateHistoryClientCache } =
           await import("./api");
-        // 强制拉盘 + 清空去重表，否则二次打开会被 seenSeq 全滤掉
+        // Force disk read + clear dedupe so re-open isn't filtered by seenSeq
         const events = (await fetchSessionEvents(
           histSessionId,
           true
         )) as DomainEvent[];
         const hasUser = events.some((e) => e.type === "UserMessageAppended");
         if (!events.length || !hasUser) {
-          // Zombie sidebar entry (deleted / empty) — scrub and leave history
           try {
             await deleteSessionApi(histSessionId);
           } catch {
@@ -808,12 +1065,69 @@ export function useBridge() {
         setSessionId(histSessionId);
         setCwd(histCwd);
         localStorage.setItem("agent-pane-cwd", histCwd);
-        // Pure rebuild from file order — never drop the last turn via seq dedupe
-        // or setState-loop replay. This is why every session's last respond must show.
         const built = eventsToChatItems(events);
         setMessages(built);
-        // Seed with full unique keys (seq alone collides after old resumes)
+        let lastUsage: {
+          used: number;
+          size: number;
+          source:
+            | "acp"
+            | "compact"
+            | "compact_done"
+            | "signals"
+            | "session_info"
+            | "estimate";
+          at?: string;
+          pct?: number;
+        } | null = null;
+        let assistantScan = "";
+        let infoProviderId: string | undefined;
+        const takeUsage = (
+          next: NonNullable<typeof lastUsage>
+        ): void => {
+          if (
+            lastUsage &&
+            next.source === "signals" &&
+            lastUsage.source === "session_info" &&
+            next.used + 500 < lastUsage.used
+          ) {
+            return;
+          }
+          if (
+            lastUsage &&
+            next.source === "signals" &&
+            next.used + 500 < lastUsage.used &&
+            lastUsage.source !== "compact_done"
+          ) {
+            return;
+          }
+          lastUsage = next;
+        };
         for (const e of events) {
+          if (e.type === "MessageChunk" && typeof e.text === "string") {
+            assistantScan += e.text;
+          } else if (e.type === "MessageDone") {
+            const info = parseSessionInfoUsage(assistantScan);
+            assistantScan = "";
+            if (info?.providerSessionId) infoProviderId = info.providerSessionId;
+            if (info && info.size > 0) {
+              takeUsage({
+                used: info.used,
+                size: info.size,
+                source: "session_info",
+                pct: info.pct,
+              });
+            }
+          } else if (e.type === "ContextUsage") {
+            takeUsage({
+              used: e.used,
+              size: e.size,
+              source: e.source,
+              at: e.at,
+              pct: e.pct,
+            });
+            if (e.providerSessionId) infoProviderId = e.providerSessionId;
+          }
           const th =
             typeof (e as { text?: string }).text === "string"
               ? (e as { text: string }).text.slice(0, 24)
@@ -822,6 +1136,77 @@ export function useBridge() {
             `${histSessionId}:${e.seq ?? "x"}:${e.at ?? ""}:${e.type}:${th}`
           );
         }
+        // Local transcript size — CLI imports / history often lack matching signals
+        // (resume creates a fresh Grok id with digest-only context).
+        const { estimateMessagesTokens } = await import("./contextUsage");
+        const estimated = estimateMessagesTokens(built);
+        const fallbackSize = 500_000;
+        try {
+          const { fetchContextUsage } = await import("./api");
+          const u = await fetchContextUsage({
+            sessionId: histSessionId,
+            cwd: histCwd,
+            providerSessionId: infoProviderId,
+          });
+          if (u) {
+            // Tiny signals vs fat transcript → digest resume; prefer estimate
+            const signalsTooSmall =
+              estimated > 8_000 && u.used + 2_000 < estimated * 0.5;
+            if (signalsTooSmall) {
+              takeUsage({
+                used: estimated,
+                size: u.size > 0 ? u.size : fallbackSize,
+                source: "estimate",
+                pct: Math.min(
+                  100,
+                  Math.round(
+                    (estimated / (u.size > 0 ? u.size : fallbackSize)) * 100
+                  )
+                ),
+              });
+            } else {
+              takeUsage({
+                used: u.used,
+                size: u.size,
+                source: u.source,
+                pct: u.pct,
+              });
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        if (!lastUsage && estimated > 0) {
+          lastUsage = {
+            used: estimated,
+            size: fallbackSize,
+            source: "estimate",
+            pct: Math.min(100, Math.round((estimated / fallbackSize) * 100)),
+          };
+        }
+        // takeUsage mutates lastUsage outside TS control-flow tracking
+        const usageNow = lastUsage;
+        if (
+          usageNow &&
+          usageNow.source !== "session_info" &&
+          estimated > 8_000 &&
+          usageNow.used + 2_000 < estimated * 0.5
+        ) {
+          lastUsage = {
+            used: estimated,
+            size: usageNow.size > 0 ? usageNow.size : fallbackSize,
+            source: "estimate",
+            pct: Math.min(
+              100,
+              Math.round(
+                (estimated /
+                  (usageNow.size > 0 ? usageNow.size : fallbackSize)) *
+                  100
+              )
+            ),
+          };
+        }
+        setContextUsage(lastUsage);
         setHistoryOnly(true);
         setBusy(false);
       } catch (e) {
@@ -849,9 +1234,10 @@ export function useBridge() {
         sessionId,
         text: text.trim() || (attachments?.length ? "(attached files)" : ""),
         attachments: attachments?.length ? attachments : undefined,
+        permissionMode: permissionModeFor(agentMode),
       });
     },
-    [send, sessionId]
+    [send, sessionId, agentMode]
   );
 
   const cancel = useCallback(() => {
@@ -867,20 +1253,10 @@ export function useBridge() {
     return null;
   }, [messages]);
 
-  /** Slice UI timeline before last user turn (works offline / historyOnly). */
-  const rewindUiToBeforeLastUser = useCallback(() => {
-    const text = lastUserText() || "";
-    setMessages((m) => {
-      let lastUser = -1;
-      for (let i = m.length - 1; i >= 0; i--) {
-        if (m[i]!.kind === "user") {
-          lastUser = i;
-          break;
-        }
-      }
-      if (lastUser < 0) return m;
-      return m.slice(0, lastUser);
-    });
+  /** Slice UI timeline before a given user turn (works offline / historyOnly). */
+  const rewindUiToUserTurn = useCallback((userTurnIndex: number) => {
+    const text = userTextAtTurn(messages, userTurnIndex) || "";
+    setMessages((m) => sliceMessagesBeforeUserTurn(m, userTurnIndex));
     setTasks([]);
     setPermissions([]);
     setBusy(false);
@@ -888,85 +1264,133 @@ export function useBridge() {
     thoughtBufMap.current.clear();
     postToolsAssistantId.current = null;
     return text;
-  }, [lastUserText]);
+  }, [messages]);
+
+  const rewindToTurn = useCallback(
+    (
+      userTurnIndex: number,
+      kind: "undo" | "retry" | "edit"
+    ) => {
+      if (!sessionId) {
+        setError("Nothing to undo");
+        return;
+      }
+      const text = userTextAtTurn(messages, userTurnIndex);
+      if (!text?.trim() && kind !== "undo") {
+        setError("No user message at that turn");
+        return;
+      }
+      if (historyOnly) {
+        if (kind === "retry") {
+          // Persist truncate, then resume + re-send (agent not attached)
+          afterRewindRef.current = null;
+          const restored = text || rewindUiToUserTurn(userTurnIndex);
+          send({ type: "session.rewindTo", sessionId, userTurnIndex });
+          setMessages((m) => sliceMessagesBeforeUserTurn(m, userTurnIndex));
+          setError(null);
+          pendingPromptRef.current = { text: restored };
+          setBusy(true);
+          setStatusMsg("正在恢复会话…");
+          send({
+            type: "session.resume",
+            sessionId,
+            cwd: cwd.trim(),
+            model: model.trim() || undefined,
+            effort: effectiveEffort,
+            permissionMode: permissionModeFor(agentMode),
+          });
+        } else {
+          afterRewindRef.current = {
+            kind,
+            text: text || "",
+            userTurnIndex,
+          };
+          send({ type: "session.rewindTo", sessionId, userTurnIndex });
+        }
+        return;
+      }
+      afterRewindRef.current = {
+        kind,
+        text: text || "",
+        userTurnIndex,
+      };
+      send({ type: "session.rewindTo", sessionId, userTurnIndex });
+    },
+    [
+      send,
+      sessionId,
+      historyOnly,
+      messages,
+      rewindUiToUserTurn,
+      cwd,
+      model,
+      effectiveEffort,
+      agentMode,
+    ]
+  );
 
   const undoLast = useCallback(() => {
-    if (!sessionId) {
+    const idx = userTurnIndexAt(messages, messages.length - 1);
+    if (idx < 0) {
       setError("Nothing to undo");
       return;
     }
-    // History / dead agent: still undo in the UI so ⋯ isn't a dead button
-    if (historyOnly) {
-      const text = rewindUiToBeforeLastUser();
-      setRestoredDraft(text);
-      setError(null);
-      return;
-    }
-    afterRewindRef.current = {
-      kind: "undo",
-      text: lastUserText() || "",
-    };
-    send({ type: "session.undoLast", sessionId });
-  }, [send, sessionId, historyOnly, lastUserText, rewindUiToBeforeLastUser]);
+    rewindToTurn(idx, "undo");
+  }, [messages, rewindToTurn]);
 
   const retryLast = useCallback(() => {
-    if (!sessionId) {
+    const idx = userTurnIndexAt(messages, messages.length - 1);
+    if (idx < 0) {
       setError("Nothing to retry");
       return;
     }
-    const text = lastUserText();
-    if (!text?.trim()) {
-      setError("No user message to retry");
-      return;
-    }
-    if (historyOnly) {
-      // Offline: rewind UI, then resume + re-send
-      rewindUiToBeforeLastUser();
-      setError(null);
-      pendingPromptRef.current = { text };
-      setBusy(true);
-      setStatusMsg("正在恢复会话…");
-      send({
-        type: "session.resume",
-        sessionId,
-        cwd: cwd.trim(),
-        model: model.trim() || undefined,
-        permissionMode: agentMode,
-      });
-      return;
-    }
-    afterRewindRef.current = { kind: "retry", text };
-    send({ type: "session.undoLast", sessionId });
-  }, [
-    send,
-    sessionId,
-    historyOnly,
-    lastUserText,
-    rewindUiToBeforeLastUser,
-    cwd,
-    model,
-    agentMode,
-  ]);
+    rewindToTurn(idx, "retry");
+  }, [messages, rewindToTurn]);
 
   const editLast = useCallback(() => {
-    if (!sessionId) {
+    const idx = userTurnIndexAt(messages, messages.length - 1);
+    if (idx < 0) {
       setError("Nothing to edit");
       return;
     }
-    const text = lastUserText();
-    if (!text?.trim()) {
-      setError("No user message to edit");
-      return;
-    }
-    if (historyOnly) {
-      rewindUiToBeforeLastUser();
-      setRestoredDraft(text);
-      setError(null);
-      return;
-    }
-    afterRewindRef.current = { kind: "edit", text };
-    send({ type: "session.undoLast", sessionId });
-  }, [send, sessionId, historyOnly, lastUserText, rewindUiToBeforeLastUser]);
+    rewindToTurn(idx, "edit");
+  }, [messages, rewindToTurn]);
+
+  const undoAt = useCallback(
+    (messageIndex: number) => {
+      const idx = userTurnIndexAt(messages, messageIndex);
+      if (idx < 0) {
+        setError("Nothing to undo");
+        return;
+      }
+      rewindToTurn(idx, "undo");
+    },
+    [messages, rewindToTurn]
+  );
+
+  const retryAt = useCallback(
+    (messageIndex: number) => {
+      const idx = userTurnIndexAt(messages, messageIndex);
+      if (idx < 0) {
+        setError("Nothing to retry");
+        return;
+      }
+      rewindToTurn(idx, "retry");
+    },
+    [messages, rewindToTurn]
+  );
+
+  const editAt = useCallback(
+    (messageIndex: number) => {
+      const idx = userTurnIndexAt(messages, messageIndex);
+      if (idx < 0) {
+        setError("Nothing to edit");
+        return;
+      }
+      rewindToTurn(idx, "edit");
+    },
+    [messages, rewindToTurn]
+  );
 
   const clearRestoredDraft = useCallback(() => setRestoredDraft(null), []);
 
@@ -998,6 +1422,8 @@ export function useBridge() {
     error,
     setError,
     statusMsg,
+    notice,
+    clearNotice: () => setNotice(null),
     /** ms since busy started — for "Waiting for response… 2.2s" */
     busyElapsed,
     sessionId,
@@ -1005,13 +1431,21 @@ export function useBridge() {
     setCwd,
     model,
     setModel,
+    effort,
+    setEffort,
+    effortFast,
+    setEffortFast,
+    effectiveEffort,
     agentMode,
     setAgentMode,
     messages,
+    contextUsage,
     tasks,
     diffs,
     permissions,
     busy,
+    /** Resume in flight — Send must stay Send, not Stop */
+    resuming,
     historyOnly,
     restoredDraft,
     clearRestoredDraft,
@@ -1024,6 +1458,9 @@ export function useBridge() {
     undoLast,
     retryLast,
     editLast,
+    undoAt,
+    retryAt,
+    editAt,
     respondPermission,
     acceptDiff,
     rejectDiff,

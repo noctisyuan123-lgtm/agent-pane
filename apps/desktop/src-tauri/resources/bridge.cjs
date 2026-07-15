@@ -5,8 +5,15 @@ var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
 var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+};
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
 };
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
@@ -3704,6 +3711,849 @@ var require_websocket_server = __commonJS({
   }
 });
 
+// ../bridge/src/browser-mcp-config.ts
+var browser_mcp_config_exports = {};
+__export(browser_mcp_config_exports, {
+  browserMcpServers: () => browserMcpServers
+});
+function moduleDir() {
+  const fromEnv = process.env.AGENT_PANE_BRIDGE_DIR;
+  if (fromEnv && import_node_fs5.default.existsSync(fromEnv)) return fromEnv;
+  try {
+    if (import_meta?.url) {
+      return import_node_path5.default.dirname((0, import_node_url.fileURLToPath)(import_meta.url));
+    }
+  } catch {
+  }
+  const entry = process.argv[1];
+  if (entry) {
+    try {
+      return import_node_path5.default.dirname(import_node_fs5.default.realpathSync(entry));
+    } catch {
+      return import_node_path5.default.dirname(import_node_path5.default.resolve(entry));
+    }
+  }
+  return process.cwd();
+}
+function resolveBrowserMcpScript() {
+  const fromEnv = process.env.AGENT_PANE_BROWSER_MCP;
+  if (fromEnv && import_node_fs5.default.existsSync(fromEnv)) return fromEnv;
+  const here = moduleDir();
+  const candidates = [
+    import_node_path5.default.join(here, "browser-mcp.cjs"),
+    import_node_path5.default.join(here, "resources", "browser-mcp.cjs"),
+    import_node_path5.default.join(here, "..", "browser-mcp.cjs"),
+    import_node_path5.default.join(here, "..", "resources", "browser-mcp.cjs"),
+    import_node_path5.default.join(here, "browser-mcp.ts"),
+    import_node_path5.default.resolve(process.cwd(), "apps/bridge/src/browser-mcp.ts"),
+    import_node_path5.default.resolve(process.cwd(), "apps/desktop/sidecar/browser-mcp.cjs"),
+    import_node_path5.default.resolve(
+      process.cwd(),
+      "apps/desktop/src-tauri/resources/browser-mcp.cjs"
+    )
+  ];
+  for (const p of candidates) {
+    if (import_node_fs5.default.existsSync(p)) return p;
+  }
+  return null;
+}
+function browserMcpServers(httpBase = `http://${process.env.AGENT_PANE_HOST ?? "127.0.0.1"}:${process.env.AGENT_PANE_PORT ?? "8787"}`) {
+  const script = resolveBrowserMcpScript();
+  if (!script) {
+    console.warn("[agent-pane] browser-mcp script not found \u2014 MCP tools disabled");
+    return [];
+  }
+  const env = [{ name: "AGENT_PANE_HTTP", value: httpBase }];
+  if (script.endsWith(".cjs") || script.endsWith(".js")) {
+    return [
+      {
+        name: "agent-pane-browser",
+        command: process.execPath,
+        args: [script],
+        env
+      }
+    ];
+  }
+  try {
+    const req = (0, import_node_module.createRequire)(import_node_path5.default.resolve(process.cwd(), "package.json"));
+    const tsxCli = req.resolve("tsx/cli");
+    return [
+      {
+        name: "agent-pane-browser",
+        command: process.execPath,
+        args: [tsxCli, script],
+        env
+      }
+    ];
+  } catch {
+    return [
+      {
+        name: "agent-pane-browser",
+        command: "npx",
+        args: ["tsx", script],
+        env
+      }
+    ];
+  }
+}
+var import_node_fs5, import_node_path5, import_node_module, import_node_url, import_meta;
+var init_browser_mcp_config = __esm({
+  "../bridge/src/browser-mcp-config.ts"() {
+    "use strict";
+    import_node_fs5 = __toESM(require("node:fs"), 1);
+    import_node_path5 = __toESM(require("node:path"), 1);
+    import_node_module = require("node:module");
+    import_node_url = require("node:url");
+    import_meta = {};
+  }
+});
+
+// ../bridge/src/history-index.ts
+function readPinSet() {
+  try {
+    if (!import_node_fs9.default.existsSync(PINS_PATH)) return /* @__PURE__ */ new Set();
+    const raw = JSON.parse(import_node_fs9.default.readFileSync(PINS_PATH, "utf8"));
+    if (Array.isArray(raw)) return new Set(raw.map(String));
+    if (raw && typeof raw === "object") {
+      const o = raw;
+      if (Array.isArray(o.ids)) return new Set(o.ids.map(String));
+      return new Set(Object.keys(o).filter((k) => o[k]));
+    }
+  } catch {
+  }
+  return /* @__PURE__ */ new Set();
+}
+function writePinSet(ids) {
+  ensureRoot();
+  const dir = import_node_path9.default.dirname(PINS_PATH);
+  import_node_fs9.default.mkdirSync(dir, { recursive: true });
+  import_node_fs9.default.writeFileSync(
+    PINS_PATH,
+    JSON.stringify({ ids: [...ids] }, null, 2),
+    "utf8"
+  );
+  invalidateHistoryListCache();
+}
+function isPinned(sessionId) {
+  return readPinSet().has(sessionId);
+}
+function setPinned(sessionId, pinned) {
+  const set = readPinSet();
+  if (pinned) set.add(sessionId);
+  else set.delete(sessionId);
+  writePinSet(set);
+}
+function invalidateHistoryListCache() {
+  listCache = null;
+}
+function invalidateSessionEventsCache(sessionId) {
+  if (sessionId) eventsCache.delete(sessionId);
+  else eventsCache.clear();
+}
+function ensureRoot() {
+  import_node_fs9.default.mkdirSync(ROOT, { recursive: true });
+}
+function metaPath(sessionId) {
+  return import_node_path9.default.join(ROOT, sessionId, "meta.json");
+}
+function eventsPath(sessionId) {
+  return import_node_path9.default.join(ROOT, sessionId, "events.jsonl");
+}
+function ensureTitle(sessionId, title) {
+  const t = (title || "").trim();
+  if (t && t !== "Untitled") return t.slice(0, 80);
+  const derived = deriveMetaFromEvents(sessionId);
+  const d = (derived?.title || "").trim();
+  if (d && d !== "New session" && d !== "Untitled") return d.slice(0, 80);
+  return t || "New session";
+}
+function readMeta(sessionId) {
+  try {
+    const p = metaPath(sessionId);
+    if (!import_node_fs9.default.existsSync(p)) return null;
+    const meta = JSON.parse(import_node_fs9.default.readFileSync(p, "utf8"));
+    meta.pinned = isPinned(sessionId) || !!meta.pinned;
+    meta.title = ensureTitle(sessionId, meta.title);
+    return meta;
+  } catch {
+    return null;
+  }
+}
+function writeMeta(meta) {
+  ensureRoot();
+  const dir = import_node_path9.default.join(ROOT, meta.sessionId);
+  import_node_fs9.default.mkdirSync(dir, { recursive: true });
+  const fixed = {
+    ...meta,
+    title: ensureTitle(meta.sessionId, meta.title),
+    pinned: isPinned(meta.sessionId) || !!meta.pinned
+  };
+  import_node_fs9.default.writeFileSync(metaPath(meta.sessionId), JSON.stringify(fixed, null, 2), "utf8");
+  invalidateHistoryListCache();
+}
+function upsertMeta(patch) {
+  const prev = readMeta(patch.sessionId);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const prevTitle = (prev?.title || "").trim();
+  const patchTitle = (patch.title || "").trim().slice(0, 80);
+  const keepTitle = prevTitle && prevTitle !== "New session" && prevTitle !== "Untitled" && (prev?.messageCount ?? 0) > 0;
+  const title = keepTitle ? prevTitle : patchTitle || prevTitle || "New session";
+  const meta = {
+    sessionId: patch.sessionId,
+    cwd: patch.cwd ?? prev?.cwd ?? "",
+    title: ensureTitle(patch.sessionId, title),
+    createdAt: prev?.createdAt ?? now,
+    updatedAt: now,
+    messageCount: (prev?.messageCount ?? 0) + (patch.bumpMessage ? 1 : 0),
+    providerSessionId: patch.providerSessionId ?? prev?.providerSessionId,
+    // Pin from dedicated store (never lost on upsert)
+    pinned: isPinned(patch.sessionId) || !!prev?.pinned,
+    unread: prev?.unread,
+    archived: prev?.archived
+  };
+  writeMeta(meta);
+  return meta;
+}
+function deriveMetaFromEvents(sessionId) {
+  const p = eventsPath(sessionId);
+  if (!import_node_fs9.default.existsSync(p)) return null;
+  let cwd = "";
+  let title = "New session";
+  let createdAt = "";
+  let updatedAt = "";
+  let messageCount = 0;
+  let firstUser = "";
+  try {
+    const lines = import_node_fs9.default.readFileSync(p, "utf8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line);
+        if (!createdAt && e.at) createdAt = e.at;
+        if (e.at) updatedAt = e.at;
+        if (e.type === "SessionStarted") {
+          cwd = e.cwd ?? cwd;
+        }
+        if (e.type === "UserMessageAppended") {
+          messageCount++;
+          const t = e.text ?? "";
+          if (!firstUser && t) firstUser = t;
+        }
+      } catch {
+      }
+    }
+  } catch {
+    return null;
+  }
+  if (!createdAt) return null;
+  return {
+    sessionId,
+    cwd,
+    title: (firstUser || title).slice(0, 80),
+    createdAt,
+    updatedAt: updatedAt || createdAt,
+    messageCount
+  };
+}
+function listHistory(force = false) {
+  if (!force && listCache && Date.now() - listCache.at < LIST_TTL_MS) {
+    return listCache.groups;
+  }
+  ensureRoot();
+  const sessions2 = [];
+  let dirs = [];
+  try {
+    dirs = import_node_fs9.default.readdirSync(ROOT);
+  } catch {
+    listCache = { at: Date.now(), groups: [] };
+    return [];
+  }
+  for (const id of dirs) {
+    const dir = import_node_path9.default.join(ROOT, id);
+    try {
+      if (!import_node_fs9.default.statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    if (!hasReplayableEvents(id)) {
+      try {
+        const metaOnly = readMeta(id);
+        const ev = eventsPath(id);
+        const emptyOrMissing = !import_node_fs9.default.existsSync(ev) || import_node_fs9.default.statSync(ev).size === 0;
+        if (metaOnly && emptyOrMissing) {
+          import_node_fs9.default.rmSync(dir, { recursive: true, force: true });
+        }
+      } catch {
+      }
+      continue;
+    }
+    let meta = readMeta(id);
+    if (!meta) {
+      meta = deriveMetaFromEvents(id);
+      if (meta && !isDraftSession(meta)) {
+        meta.pinned = isPinned(id);
+        writeMeta(meta);
+      }
+    } else {
+      if (meta.pinned && !isPinned(id)) setPinned(id, true);
+      const before = JSON.stringify({ t: meta.title, p: meta.pinned });
+      meta = {
+        ...meta,
+        title: ensureTitle(id, meta.title),
+        pinned: isPinned(id) || !!meta.pinned
+      };
+      const after = JSON.stringify({ t: meta.title, p: meta.pinned });
+      if (before !== after && !isDraftSession(meta)) writeMeta(meta);
+    }
+    if (meta && !isDraftSession(meta)) sessions2.push(meta);
+  }
+  sessions2.sort(
+    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+  );
+  const byCwd = /* @__PURE__ */ new Map();
+  const active = sessions2.filter((s) => !s.archived && !isDraftSession(s));
+  for (const s of active) {
+    const key = s.cwd || "(unknown)";
+    const list = byCwd.get(key) ?? [];
+    list.push(s);
+    byCwd.set(key, list);
+  }
+  for (const list of byCwd.values()) {
+    list.sort((a, b) => {
+      if (!!b.pinned !== !!a.pinned) return a.pinned ? -1 : 1;
+      return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+    });
+  }
+  const groups = [];
+  for (const [cwd, list] of byCwd) {
+    groups.push({
+      cwd,
+      name: cwd === "(unknown)" ? "Unknown" : import_node_path9.default.basename(cwd) || cwd,
+      sessions: list
+    });
+  }
+  groups.sort((a, b) => {
+    const ta = a.sessions[0] ? new Date(a.sessions[0].updatedAt).getTime() : 0;
+    const tb = b.sessions[0] ? new Date(b.sessions[0].updatedAt).getTime() : 0;
+    return tb - ta;
+  });
+  listCache = { at: Date.now(), groups };
+  return groups;
+}
+function loadSessionEvents(sessionId, force = false) {
+  const p = eventsPath(sessionId);
+  if (!import_node_fs9.default.existsSync(p)) return [];
+  let mtimeMs = 0;
+  try {
+    mtimeMs = import_node_fs9.default.statSync(p).mtimeMs;
+  } catch {
+    return [];
+  }
+  const hit = eventsCache.get(sessionId);
+  if (!force && hit && hit.mtimeMs === mtimeMs && Date.now() - hit.at < EVENTS_TTL_MS) {
+    return hit.events;
+  }
+  const events = [];
+  const lines = import_node_fs9.default.readFileSync(p, "utf8").split("\n").filter(Boolean);
+  for (const line of lines) {
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+    }
+  }
+  eventsCache.set(sessionId, { at: Date.now(), mtimeMs, events });
+  return events;
+}
+function patchMeta(sessionId, patch) {
+  let prev = readMeta(sessionId);
+  if (!prev) {
+    prev = deriveMetaFromEvents(sessionId) ?? null;
+  }
+  if (!prev) return null;
+  const next = {
+    ...prev,
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  if (patch.title != null && String(patch.title).trim()) {
+    next.title = String(patch.title).trim().slice(0, 80);
+  }
+  if (typeof patch.pinned === "boolean") {
+    setPinned(sessionId, patch.pinned);
+    next.pinned = patch.pinned;
+  } else {
+    next.pinned = isPinned(sessionId) || !!prev.pinned;
+  }
+  if (typeof patch.unread === "boolean") next.unread = patch.unread;
+  if (typeof patch.archived === "boolean") next.archived = patch.archived;
+  if (patch.cwd != null) next.cwd = patch.cwd;
+  next.title = ensureTitle(sessionId, next.title);
+  writeMeta(next);
+  return next;
+}
+function deleteSession(sessionId) {
+  const dir = import_node_path9.default.join(ROOT, sessionId);
+  try {
+    if (import_node_fs9.default.existsSync(dir)) {
+      import_node_fs9.default.rmSync(dir, { recursive: true, force: true });
+    }
+  } catch (e) {
+    console.error("[history] deleteSession failed", sessionId, e);
+    return false;
+  }
+  try {
+    if (import_node_fs9.default.existsSync(dir)) {
+      import_node_fs9.default.rmSync(dir, { recursive: true, force: true });
+    }
+  } catch {
+  }
+  try {
+    if (isPinned(sessionId)) setPinned(sessionId, false);
+  } catch {
+  }
+  invalidateHistoryListCache();
+  invalidateSessionEventsCache(sessionId);
+  return true;
+}
+function isDraftSession(meta) {
+  return (meta.messageCount ?? 0) <= 0;
+}
+function hasReplayableEvents(sessionId) {
+  const p = eventsPath(sessionId);
+  if (!import_node_fs9.default.existsSync(p)) return false;
+  try {
+    const lines = import_node_fs9.default.readFileSync(p, "utf8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line);
+        if (e.type === "UserMessageAppended") return true;
+      } catch {
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+function pruneDraftSessions(opts) {
+  ensureRoot();
+  let removed = 0;
+  let dirs = [];
+  try {
+    dirs = import_node_fs9.default.readdirSync(ROOT);
+  } catch {
+    return 0;
+  }
+  for (const id of dirs) {
+    if (opts?.keepSessionId && id === opts.keepSessionId) continue;
+    const dir = import_node_path9.default.join(ROOT, id);
+    try {
+      if (!import_node_fs9.default.statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const meta = readMeta(id) ?? deriveMetaFromEvents(id);
+    if (!meta || !isDraftSession(meta)) continue;
+    if (opts?.cwd && meta.cwd && meta.cwd !== opts.cwd) continue;
+    if (deleteSession(id)) removed++;
+  }
+  return removed;
+}
+function sliceEventsByUserTurn(events, opts) {
+  let turn = -1;
+  const out = [];
+  for (const e of events) {
+    if (e.type === "SessionRewound") continue;
+    if (e.type === "UserMessageAppended") {
+      turn++;
+      if (opts.beforeTurn != null && turn === opts.beforeTurn) break;
+      if (opts.throughTurn != null && turn > opts.throughTurn) break;
+    }
+    out.push(e);
+  }
+  return out;
+}
+function forkSession(sessionId, opts) {
+  const events = loadSessionEvents(sessionId, true);
+  if (!events.length) return null;
+  const prev = readMeta(sessionId) ?? deriveMetaFromEvents(sessionId);
+  if (!prev) return null;
+  const sliced = typeof opts?.throughUserTurn === "number" ? sliceEventsByUserTurn(events, { throughTurn: opts.throughUserTurn }) : events.filter((e) => e.type !== "SessionRewound");
+  if (!sliced.length) return null;
+  const newId = (0, import_node_crypto4.randomUUID)();
+  const dir = import_node_path9.default.join(ROOT, newId);
+  import_node_fs9.default.mkdirSync(dir, { recursive: true });
+  const lines = sliced.map(
+    (e, i) => JSON.stringify({ ...e, sessionId: newId, seq: i + 1 })
+  );
+  import_node_fs9.default.writeFileSync(import_node_path9.default.join(dir, "events.jsonl"), lines.join("\n") + "\n", "utf8");
+  const messageCount = sliced.filter((e) => e.type === "UserMessageAppended").length;
+  const firstUser = sliced.find((e) => e.type === "UserMessageAppended");
+  const meta = {
+    ...prev,
+    sessionId: newId,
+    title: `${(firstUser?.text || prev.title).slice(0, 60)} (fork)`,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    messageCount,
+    pinned: false,
+    unread: false,
+    archived: false,
+    // New branch — don't inherit stale provider id (resume starts fresh)
+    providerSessionId: void 0
+  };
+  writeMeta(meta);
+  invalidateSessionEventsCache(newId);
+  invalidateHistoryListCache();
+  return meta;
+}
+var import_node_fs9, import_node_os6, import_node_path9, import_node_crypto4, ROOT, PINS_PATH, listCache, LIST_TTL_MS, eventsCache, EVENTS_TTL_MS;
+var init_history_index = __esm({
+  "../bridge/src/history-index.ts"() {
+    "use strict";
+    import_node_fs9 = __toESM(require("node:fs"), 1);
+    import_node_os6 = __toESM(require("node:os"), 1);
+    import_node_path9 = __toESM(require("node:path"), 1);
+    import_node_crypto4 = require("node:crypto");
+    ROOT = import_node_path9.default.join(import_node_os6.default.homedir(), ".agent-pane", "sessions");
+    PINS_PATH = import_node_path9.default.join(import_node_os6.default.homedir(), ".agent-pane", "pins.json");
+    listCache = null;
+    LIST_TTL_MS = 12e3;
+    eventsCache = /* @__PURE__ */ new Map();
+    EVENTS_TTL_MS = 6e4;
+  }
+});
+
+// ../bridge/src/grok-session-import.ts
+var grok_session_import_exports = {};
+__export(grok_session_import_exports, {
+  findGrokSessionDir: () => findGrokSessionDir,
+  importGrokSession: () => importGrokSession
+});
+function extractText(content) {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((x) => {
+      if (!x || typeof x !== "object") return "";
+      const o = x;
+      if (o.type === "text" || o.type === "summary_text" || o.text != null) {
+        return String(o.text ?? "");
+      }
+      return "";
+    }).join("");
+  }
+  return String(content);
+}
+function reasoningText(obj) {
+  const summary = obj.summary;
+  if (Array.isArray(summary)) {
+    const parts = summary.map((x) => {
+      if (!x || typeof x !== "object") return "";
+      const o = x;
+      if (o.type === "summary_text" || o.text != null) return String(o.text ?? "");
+      return "";
+    }).filter(Boolean);
+    if (parts.length) return parts.join("\n");
+  }
+  return extractText(obj.content ?? obj.text);
+}
+function isNoiseUser(text) {
+  const t = text.trim();
+  if (!t) return true;
+  if (t.startsWith("<local-command")) return true;
+  if (t.startsWith("<command-name>") || t.startsWith("<command-message>")) {
+    return true;
+  }
+  return false;
+}
+function trunc(s, n = 4e3) {
+  if (s.length <= n) return s;
+  return `${s.slice(0, n - 20)}
+\u2026(truncated)`;
+}
+function findGrokSessionDir(sessionId) {
+  if (!import_node_fs11.default.existsSync(GROK_ROOT)) return null;
+  for (const ent of import_node_fs11.default.readdirSync(GROK_ROOT, { withFileTypes: true })) {
+    if (!ent.isDirectory()) continue;
+    const cand = import_node_path11.default.join(GROK_ROOT, ent.name, sessionId);
+    if (import_node_fs11.default.existsSync(import_node_path11.default.join(cand, "chat_history.jsonl"))) return cand;
+  }
+  return null;
+}
+function importGrokSession(sessionId, opts) {
+  const id = sessionId.trim();
+  if (!id) throw new Error("sessionId required");
+  const eventsPath2 = import_node_path11.default.join(PANE_ROOT, id, "events.jsonl");
+  if (import_node_fs11.default.existsSync(eventsPath2) && !opts?.force) {
+    const meta2 = readMeta(id);
+    if (meta2) {
+      return {
+        ok: true,
+        skipped: true,
+        sessionId: id,
+        meta: meta2,
+        reason: "already imported"
+      };
+    }
+  }
+  const grokDir = findGrokSessionDir(id);
+  if (!grokDir) throw new Error(`grok session not found: ${id}`);
+  let summary = {};
+  try {
+    summary = JSON.parse(
+      import_node_fs11.default.readFileSync(import_node_path11.default.join(grokDir, "summary.json"), "utf8")
+    );
+  } catch {
+  }
+  const cwd = (summary.info?.cwd || summary.cwd || "").trim() || import_node_os8.default.homedir();
+  const createdAt = summary.created_at || (/* @__PURE__ */ new Date()).toISOString();
+  const updatedAt = summary.updated_at || createdAt;
+  const model = summary.current_model_id || void 0;
+  const lines = import_node_fs11.default.readFileSync(import_node_path11.default.join(grokDir, "chat_history.jsonl"), "utf8").split("\n").filter(Boolean);
+  const events = [];
+  let seq = 0;
+  let userCount = 0;
+  let title = "";
+  const openTools = /* @__PURE__ */ new Map();
+  const push = (ev) => {
+    seq += 1;
+    events.push({
+      ...ev,
+      seq,
+      sessionId: id,
+      at: ev.at ?? createdAt
+    });
+  };
+  push({
+    type: "SessionStarted",
+    cwd,
+    model,
+    providerSessionId: id,
+    resumed: true
+  });
+  for (const raw of lines) {
+    let obj;
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    const typ = obj.type;
+    if (typ === "user") {
+      const text = extractText(obj.content).trim();
+      if (isNoiseUser(text)) continue;
+      userCount += 1;
+      if (!title) title = text.replace(/\n/g, " ").trim().slice(0, 80);
+      push({ type: "UserMessageAppended", text });
+    } else if (typ === "reasoning") {
+      const text = reasoningText(obj).trim();
+      if (text) push({ type: "ThoughtChunk", text });
+    } else if (typ === "assistant") {
+      const text = extractText(obj.content).trim();
+      if (text) {
+        push({ type: "MessageChunk", role: "assistant", text });
+        push({ type: "MessageDone", role: "assistant" });
+      }
+      const toolCalls = obj.tool_calls;
+      if (Array.isArray(toolCalls)) {
+        for (const tc of toolCalls) {
+          if (!tc || typeof tc !== "object") continue;
+          const tco = tc;
+          const tid = String(tco.id || `tool-${seq}`);
+          const name = String(tco.name || "tool");
+          const args = typeof tco.arguments === "string" ? tco.arguments : JSON.stringify(tco.arguments ?? "");
+          openTools.set(tid, name);
+          push({
+            type: "ToolStarted",
+            toolId: tid,
+            title: name,
+            kind: name,
+            inputSummary: trunc(args, 1500)
+          });
+        }
+      }
+    } else if (typ === "tool_result") {
+      const tid = String(obj.tool_call_id || `tool-result-${seq}`);
+      const out = extractText(obj.content);
+      openTools.delete(tid);
+      push({
+        type: "ToolFinished",
+        toolId: tid,
+        outputSummary: trunc(out, 4e3)
+      });
+    }
+  }
+  if (userCount === 0) {
+    throw new Error(`no user messages in grok chat_history: ${grokDir}`);
+  }
+  if (!title) title = `Imported ${id.slice(0, 8)}`;
+  if (events.length) {
+    events[0].at = createdAt;
+    events[events.length - 1].at = updatedAt;
+  }
+  import_node_fs11.default.mkdirSync(import_node_path11.default.join(PANE_ROOT, id), { recursive: true });
+  import_node_fs11.default.writeFileSync(
+    eventsPath2,
+    events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    "utf8"
+  );
+  const meta = {
+    sessionId: id,
+    cwd,
+    title,
+    createdAt,
+    updatedAt,
+    messageCount: userCount,
+    providerSessionId: id
+  };
+  writeMeta(meta);
+  try {
+    const raw = JSON.parse(import_node_fs11.default.readFileSync(import_node_path11.default.join(PANE_ROOT, id, "meta.json"), "utf8"));
+    raw.importedFrom = "grok";
+    raw.sourceKind = summary.session_kind || "grok";
+    import_node_fs11.default.writeFileSync(
+      import_node_path11.default.join(PANE_ROOT, id, "meta.json"),
+      JSON.stringify(raw, null, 2) + "\n",
+      "utf8"
+    );
+  } catch {
+  }
+  invalidateSessionEventsCache(id);
+  invalidateHistoryListCache();
+  return {
+    ok: true,
+    skipped: false,
+    sessionId: id,
+    meta: readMeta(id) ?? meta,
+    events: events.length,
+    userMessages: userCount,
+    grokDir
+  };
+}
+var import_node_fs11, import_node_os8, import_node_path11, GROK_ROOT, PANE_ROOT;
+var init_grok_session_import = __esm({
+  "../bridge/src/grok-session-import.ts"() {
+    "use strict";
+    import_node_fs11 = __toESM(require("node:fs"), 1);
+    import_node_os8 = __toESM(require("node:os"), 1);
+    import_node_path11 = __toESM(require("node:path"), 1);
+    init_history_index();
+    GROK_ROOT = import_node_path11.default.join(import_node_os8.default.homedir(), ".grok", "sessions");
+    PANE_ROOT = import_node_path11.default.join(import_node_os8.default.homedir(), ".agent-pane", "sessions");
+  }
+});
+
+// ../bridge/src/browser-session.ts
+var browser_session_exports = {};
+__export(browser_session_exports, {
+  getBrowserSession: () => getBrowserSession
+});
+function assertHttpUrl(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    throw new Error("Invalid URL");
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error("Only http: and https: URLs are allowed");
+  }
+}
+function getBrowserSession() {
+  if (!singleton) singleton = new BrowserSession();
+  return singleton;
+}
+var BrowserSession, singleton;
+var init_browser_session = __esm({
+  "../bridge/src/browser-session.ts"() {
+    "use strict";
+    BrowserSession = class {
+      browser = null;
+      page = null;
+      lastScreenshot = "";
+      lastError;
+      url = "";
+      title = "";
+      async ensurePage() {
+        if (this.page) return this.page;
+        try {
+          const pw = await new Function("return import('playwright')")();
+          const browser = await pw.chromium.launch({ headless: true });
+          this.browser = browser;
+          this.page = await browser.newPage();
+          this.lastError = void 0;
+          return this.page;
+        } catch (e) {
+          this.lastError = "Playwright not available. Install with: npx playwright install chromium";
+          throw e;
+        }
+      }
+      async refreshScreenshot() {
+        if (!this.page) return;
+        try {
+          const buf = await this.page.screenshot({ type: "png" });
+          this.lastScreenshot = buf.toString("base64");
+          this.lastError = void 0;
+        } catch (e) {
+          this.lastError = e instanceof Error ? e.message : String(e);
+        }
+      }
+      async navigate(url) {
+        assertHttpUrl(url);
+        const page = await this.ensurePage();
+        await page.goto(url, { waitUntil: "domcontentloaded" });
+        this.url = page.url();
+        this.title = await page.title();
+        await this.refreshScreenshot();
+      }
+      async back() {
+        const page = await this.ensurePage();
+        await page.goBack({ waitUntil: "domcontentloaded" });
+        this.url = page.url();
+        this.title = await page.title();
+        await this.refreshScreenshot();
+      }
+      async screenshot() {
+        const page = await this.ensurePage();
+        const buf = await page.screenshot({ type: "png" });
+        this.lastScreenshot = buf.toString("base64");
+        return this.lastScreenshot;
+      }
+      async snapshot() {
+        const page = await this.ensurePage();
+        try {
+          if (page.accessibility?.snapshot) {
+            const tree = await page.accessibility.snapshot();
+            return JSON.stringify(tree, null, 2);
+          }
+        } catch {
+        }
+        return page.evaluate(() => document.body?.innerText ?? "");
+      }
+      async click(selector) {
+        const page = await this.ensurePage();
+        await page.click(selector);
+        this.url = page.url();
+        this.title = await page.title();
+        await this.refreshScreenshot();
+      }
+      async type(selector, text) {
+        const page = await this.ensurePage();
+        await page.fill(selector, text);
+        await this.refreshScreenshot();
+      }
+      getState() {
+        return {
+          url: this.url,
+          title: this.title,
+          screenshotBase64: this.lastScreenshot,
+          ...this.lastError ? { error: this.lastError } : {}
+        };
+      }
+    };
+    singleton = null;
+  }
+});
+
 // ../bridge/src/index.ts
 var import_node_http = __toESM(require("node:http"), 1);
 
@@ -3821,6 +4671,42 @@ var EventStore = class {
     this.memory.delete(sessionId);
     this.seqBySession.delete(sessionId);
   }
+  /**
+   * Rewrite events.jsonl. Used after rewind (drop discarded turns) and tests.
+   * Reassigns seq 1..N to keep the file tidy.
+   */
+  replaceAll(sessionId, events) {
+    this.ensureSessionLoaded(sessionId);
+    const stored = events.map((e, i) => ({
+      ...e,
+      sessionId,
+      seq: i + 1
+    }));
+    this.memory.set(sessionId, stored);
+    this.seqBySession.set(sessionId, stored.length);
+    const p = this.eventsPath(sessionId, true);
+    const body = stored.length === 0 ? "" : stored.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    import_node_fs.default.writeFileSync(p, body, "utf8");
+    return stored;
+  }
+  /**
+   * Keep events before the Nth UserMessageAppended (0-based).
+   * Drops that user turn and everything after (Claude Code Undo).
+   */
+  truncateBeforeUserTurn(sessionId, userTurnIndex) {
+    const list = this.list(sessionId, 0);
+    let turn = -1;
+    const kept = [];
+    for (const e of list) {
+      if (e.type === "SessionRewound") continue;
+      if (e.type === "UserMessageAppended") {
+        turn++;
+        if (turn === userTurnIndex) break;
+      }
+      kept.push(e);
+    }
+    return this.replaceAll(sessionId, kept);
+  }
   listSessions() {
     if (!import_node_fs.default.existsSync(this.root)) return [];
     return import_node_fs.default.readdirSync(this.root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort();
@@ -3828,11 +4714,434 @@ var EventStore = class {
 };
 
 // ../bridge/src/grok-acp-adapter.ts
-var import_node_child_process = require("node:child_process");
+var import_node_child_process2 = require("node:child_process");
 var readline = __toESM(require("node:readline"), 1);
-var import_node_fs2 = __toESM(require("node:fs"), 1);
-var import_node_path2 = __toESM(require("node:path"), 1);
+var import_node_fs6 = __toESM(require("node:fs"), 1);
+var import_node_path6 = __toESM(require("node:path"), 1);
 var import_node_crypto = require("node:crypto");
+var import_node_child_process3 = require("node:child_process");
+
+// ../bridge/src/grok-signals-watcher.ts
+var import_node_fs2 = __toESM(require("node:fs"), 1);
+var import_node_os2 = __toESM(require("node:os"), 1);
+var import_node_path2 = __toESM(require("node:path"), 1);
+function resolveGrokSignalsPaths(cwd, providerSessionId) {
+  if (!cwd?.trim() || !providerSessionId?.trim()) return [];
+  const home = import_node_os2.default.homedir();
+  const sessionsRoot = import_node_path2.default.join(home, ".grok", "sessions");
+  const roots = /* @__PURE__ */ new Set();
+  const abs = import_node_path2.default.resolve(cwd.trim());
+  roots.add(abs);
+  try {
+    roots.add(import_node_fs2.default.realpathSync(abs));
+  } catch {
+  }
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  const push = (p) => {
+    if (seen.has(p)) return;
+    seen.add(p);
+    out.push(p);
+  };
+  for (const root of roots) {
+    push(
+      import_node_path2.default.join(
+        sessionsRoot,
+        encodeURIComponent(root),
+        providerSessionId,
+        "signals.json"
+      )
+    );
+  }
+  try {
+    if (import_node_fs2.default.existsSync(sessionsRoot)) {
+      for (const ent of import_node_fs2.default.readdirSync(sessionsRoot, { withFileTypes: true })) {
+        if (!ent.isDirectory() || !ent.name.startsWith("%")) continue;
+        push(
+          import_node_path2.default.join(sessionsRoot, ent.name, providerSessionId, "signals.json")
+        );
+      }
+    }
+  } catch {
+  }
+  return out;
+}
+function readGrokSignalsUsage(paths) {
+  for (const p of paths) {
+    try {
+      if (!import_node_fs2.default.existsSync(p)) continue;
+      const raw = import_node_fs2.default.readFileSync(p, "utf8");
+      const j = JSON.parse(raw);
+      const used = Number(j.contextTokensUsed);
+      const size = Number(j.contextWindowTokens);
+      if (!Number.isFinite(used) || !Number.isFinite(size) || size <= 0) {
+        continue;
+      }
+      const pctRaw = Number(j.contextWindowUsage);
+      return {
+        used: Math.max(0, Math.round(used)),
+        size: Math.max(1, Math.round(size)),
+        pct: Number.isFinite(pctRaw) ? pctRaw : void 0
+      };
+    } catch {
+    }
+  }
+  return null;
+}
+var GrokSignalsWatcher = class {
+  constructor(paths, onUsage, intervalMs = 1200) {
+    this.onUsage = onUsage;
+    this.intervalMs = intervalMs;
+    this.paths = paths;
+  }
+  timer = null;
+  watchers = [];
+  lastKey = "";
+  stopped = false;
+  paths;
+  start() {
+    this.stopped = false;
+    this.tick();
+    this.timer = setInterval(() => this.tick(), this.intervalMs);
+    for (const p of this.paths) {
+      try {
+        const dir = import_node_path2.default.dirname(p);
+        if (!import_node_fs2.default.existsSync(dir)) continue;
+        const w = import_node_fs2.default.watch(dir, { persistent: false }, (_evt, filename) => {
+          if (this.stopped) return;
+          if (!filename || filename === "signals.json" || String(filename).endsWith("signals.json")) {
+            this.tick();
+          }
+        });
+        this.watchers.push(w);
+      } catch {
+      }
+    }
+  }
+  /** Force a read (e.g. after prompt completes). */
+  refresh() {
+    this.tick();
+  }
+  stop() {
+    this.stopped = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    for (const w of this.watchers) {
+      try {
+        w.close();
+      } catch {
+      }
+    }
+    this.watchers = [];
+  }
+  tick() {
+    if (this.stopped) return;
+    const u = readGrokSignalsUsage(this.paths);
+    if (!u) return;
+    const key = `${u.used}:${u.size}`;
+    if (key === this.lastKey) return;
+    this.lastKey = key;
+    this.onUsage(u);
+  }
+};
+
+// ../bridge/src/attachment-persist.ts
+var import_node_fs3 = __toESM(require("node:fs"), 1);
+var import_node_os3 = __toESM(require("node:os"), 1);
+var import_node_path3 = __toESM(require("node:path"), 1);
+var UPLOADS = import_node_path3.default.join(import_node_os3.default.homedir(), ".agent-pane", "uploads");
+var MIME_BY_EXT = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".bmp": "image/bmp",
+  ".svg": "image/svg+xml",
+  ".heic": "image/heic",
+  ".avif": "image/avif",
+  ".pdf": "application/pdf",
+  ".txt": "text/plain; charset=utf-8",
+  ".md": "text/markdown; charset=utf-8",
+  ".json": "application/json",
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".ts": "text/plain; charset=utf-8",
+  ".tsx": "text/plain; charset=utf-8"
+};
+function guessMime(filePath) {
+  const ext = import_node_path3.default.extname(filePath).toLowerCase();
+  return MIME_BY_EXT[ext] || "application/octet-stream";
+}
+function isImagePath(filePath) {
+  const ext = import_node_path3.default.extname(filePath).toLowerCase();
+  return [
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".heic",
+    ".avif"
+  ].includes(ext);
+}
+function isEphemeralPath(filePath) {
+  const p = filePath.replace(/\\/g, "/");
+  return /\/TemporaryItems\//i.test(p) || /\/screencaptureui_/i.test(p) || /\/var\/folders\/[^/]+\/[^/]+\/T\//i.test(p) || /NSIRD_screencapture/i.test(p);
+}
+function persistLocalFile(absPath) {
+  const src = import_node_path3.default.resolve(absPath);
+  if (!import_node_fs3.default.existsSync(src) || !import_node_fs3.default.statSync(src).isFile()) return absPath;
+  if (src.startsWith(UPLOADS + import_node_path3.default.sep) || src === UPLOADS) return src;
+  import_node_fs3.default.mkdirSync(UPLOADS, { recursive: true });
+  const base = import_node_path3.default.basename(src).replace(/[^\w.\-()+ ]+/g, "_").slice(0, 120) || "file.bin";
+  const dest = import_node_path3.default.join(UPLOADS, `${Date.now().toString(36)}-${base}`);
+  import_node_fs3.default.copyFileSync(src, dest);
+  return dest;
+}
+function stabilizeAttachment(ref) {
+  if (ref.kind === "folder") return ref;
+  const p = ref.path;
+  if (!p) return ref;
+  if (isImagePath(p) || isEphemeralPath(p)) {
+    return { ...ref, path: persistLocalFile(p) };
+  }
+  return ref;
+}
+function stabilizeAttachments(refs) {
+  if (!refs?.length) return refs;
+  return refs.map(stabilizeAttachment);
+}
+
+// ../bridge/src/path-env.ts
+var import_node_fs4 = __toESM(require("node:fs"), 1);
+var import_node_os4 = __toESM(require("node:os"), 1);
+var import_node_path4 = __toESM(require("node:path"), 1);
+var import_node_child_process = require("node:child_process");
+var SYSTEM_DIRS = [
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
+  "/opt/homebrew/bin",
+  "/opt/homebrew/sbin",
+  "/usr/local/bin"
+];
+function nvmDefaultBin(home) {
+  const nvmDir = process.env.NVM_DIR || import_node_path4.default.join(home, ".nvm");
+  const alias = import_node_path4.default.join(nvmDir, "alias", "default");
+  try {
+    if (import_node_fs4.default.existsSync(alias)) {
+      const ver = import_node_fs4.default.readFileSync(alias, "utf8").trim();
+      if (ver) {
+        const bin = import_node_path4.default.join(nvmDir, "versions", "node", ver, "bin");
+        if (import_node_fs4.default.existsSync(bin)) return bin;
+      }
+    }
+  } catch {
+  }
+  try {
+    const versions = import_node_path4.default.join(nvmDir, "versions", "node");
+    if (!import_node_fs4.default.existsSync(versions)) return null;
+    const names = import_node_fs4.default.readdirSync(versions).filter((n) => n.startsWith("v")).sort();
+    for (let i = names.length - 1; i >= 0; i--) {
+      const bin = import_node_path4.default.join(versions, names[i], "bin");
+      if (import_node_fs4.default.existsSync(bin)) return bin;
+    }
+  } catch {
+  }
+  return null;
+}
+function userExtraDirs(home) {
+  const extras = [
+    import_node_path4.default.join(home, ".grok", "bin"),
+    import_node_path4.default.join(home, ".local", "bin"),
+    import_node_path4.default.join(home, ".cargo", "bin")
+  ];
+  const nvm = nvmDefaultBin(home);
+  if (nvm) extras.push(nvm);
+  return extras.filter((d) => {
+    try {
+      return import_node_fs4.default.existsSync(d);
+    } catch {
+      return false;
+    }
+  });
+}
+function cleanPathParts(raw) {
+  if (!raw) return [];
+  return raw.split(import_node_path4.default.delimiter).map((p) => p.trim()).filter((p) => p.length > 0 && p !== "$" && !/^\$+$/.test(p));
+}
+function buildAugmentedPath(existing) {
+  const home = import_node_os4.default.homedir();
+  const parts = [
+    ...SYSTEM_DIRS,
+    ...userExtraDirs(home),
+    ...cleanPathParts(existing)
+  ];
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const p of parts) {
+    if (seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out.join(import_node_path4.default.delimiter);
+}
+function applyHealthyPathToProcess() {
+  process.env.PATH = buildAugmentedPath(process.env.PATH);
+}
+function withHealthyEnv(base = process.env) {
+  const env = { ...base };
+  env.PATH = buildAugmentedPath(base.PATH ?? process.env.PATH);
+  env.BASH_ENV = "";
+  env.ENV = "";
+  return env;
+}
+function unwrapOuterQuotes(s) {
+  const t = s.trim();
+  if (t.length < 2) return t;
+  const a = t[0];
+  const b = t[t.length - 1];
+  if (a === "'" && b === "'") {
+    return t.slice(1, -1);
+  }
+  if (a === '"' && b === '"') {
+    return t.slice(1, -1).replace(/\\([\\"`$])/g, "$1");
+  }
+  return t;
+}
+function stripLeadingPathExports(script) {
+  let s = script.trimStart();
+  for (let i = 0; i < 3; i++) {
+    const m = s.match(
+      /^export\s+PATH=(?:"[^"]*"|'[^']*'|[^\s;]+)\s*;?\s*/
+    );
+    if (!m) break;
+    s = s.slice(m[0].length);
+  }
+  return s;
+}
+function stripBashCWrapper(script) {
+  const t = script.trim();
+  const m = t.match(/^(?:\/bin\/)?bash\s+-(l)?c\s+([\s\S]+)$/i);
+  if (!m) return script;
+  return unwrapOuterQuotes(m[2]);
+}
+function looksLikeGrokQuoteNest(s) {
+  return s.includes(`'"`) || s.includes(`"'`);
+}
+function repairGrokBrokenShellEscapes(script) {
+  let t = script.trim();
+  if (!looksLikeGrokQuoteNest(t)) return t;
+  if (t.startsWith("'")) {
+    if (t.endsWith("'") && t.length >= 2) {
+      const inner = t.slice(1, -1);
+      if (looksLikeGrokQuoteNest(inner) || /[|]/.test(inner)) {
+        t = inner;
+      }
+    } else {
+      t = t.slice(1);
+    }
+  }
+  t = t.replace(/'"'(.)'/g, "'$1'");
+  t = t.replace(/"'"\\+n\\?"/g, '"\\n"');
+  t = t.replace(/"'"\\+n"/g, '"\\n"');
+  t = t.replace(/'\\+n'/g, "'\\n'");
+  t = t.replace(/"\\+n"/g, '"\\n"');
+  t = t.replace(/'"'"'/g, "'");
+  t = t.replace(/'\"'\"'/g, "'");
+  return t;
+}
+function demangleGrokShellWord(script) {
+  const t = script.trim();
+  if (!looksLikeGrokQuoteNest(t)) return t;
+  const r = (0, import_node_child_process.spawnSync)("/bin/bash", ["--noprofile", "--norc"], {
+    input: `set -- ${t}
+printf '%s' "$1"
+`,
+    encoding: "utf8",
+    env: withHealthyEnv(process.env)
+  });
+  if (r.status === 0 && typeof r.stdout === "string" && r.stdout.length > 0) {
+    return r.stdout;
+  }
+  return repairGrokBrokenShellEscapes(t);
+}
+function bashHardenedArgs(script) {
+  let body = demangleGrokShellWord(script.trim());
+  body = stripLeadingPathExports(unwrapOuterQuotes(body));
+  body = stripBashCWrapper(body);
+  body = demangleGrokShellWord(body);
+  body = stripLeadingPathExports(unwrapOuterQuotes(body));
+  body = stripBashCWrapper(body);
+  body = body.replace(/'(\r?\n)'/g, "'\\n'").replace(/"(\r?\n)"/g, '"\\n"');
+  return {
+    // -s: read script from stdin — no -c argv quoting battlefield
+    args: ["--noprofile", "--norc", "-s"],
+    stdinScript: body.endsWith("\n") ? body : `${body}
+`,
+    labelBody: body
+  };
+}
+function bashSpec(script, healthyPath) {
+  void healthyPath;
+  const h = bashHardenedArgs(script);
+  return {
+    file: "/bin/bash",
+    args: h.args,
+    shell: false,
+    label: `bash -s ${h.labelBody.slice(0, 40)}`,
+    stdinScript: h.stdinScript
+  };
+}
+function resolveToolSpawn(command, args, healthyPath) {
+  const cmd = (command ?? "").trim();
+  const a = args.map(String);
+  if (/^(?:\/bin\/)?bash$/.test(cmd) && a.length >= 1 && /^-l?c$/.test(a[0])) {
+    const script = a[1] ?? "";
+    return bashSpec(script, healthyPath);
+  }
+  if (/^(?:\/bin\/)?bash$/.test(cmd) && a.length >= 1 && !/^-/.test(a[0])) {
+    const script = a.length === 1 ? a[0] : a.join(" ");
+    if (a.length > 1 || /[\s'"|&;<>$`]/.test(script)) {
+      return bashSpec(script, healthyPath);
+    }
+  }
+  const line = a.length === 0 ? cmd : "";
+  if (line) {
+    const m = line.match(/^(?:\/bin\/)?bash\s+-(l)?c\s+([\s\S]+)$/i);
+    if (m) {
+      return bashSpec(m[2], healthyPath);
+    }
+    if (/[\s'"|&;<>$`]/.test(line)) {
+      return bashSpec(line, healthyPath);
+    }
+  }
+  const file = cmd || "/bin/bash";
+  const argv = a.length ? a : [];
+  if (/[\s'"|&;<>$`]/.test(file)) {
+    const script = argv.length ? `${file} ${argv.join(" ")}` : file;
+    return bashSpec(script, healthyPath);
+  }
+  if (argv.some((x) => /[|&;<>]/.test(x) || x.includes("\n"))) {
+    const script = [file, ...argv].join(" ");
+    return bashSpec(script, healthyPath);
+  }
+  return {
+    file,
+    args: argv,
+    shell: false,
+    label: `${file} ${argv.join(" ")}`.trim().slice(0, 60)
+  };
+}
+
+// ../bridge/src/grok-acp-adapter.ts
 var GrokAcpAdapter = class {
   id = "grok-acp";
   proc = null;
@@ -3844,6 +5153,7 @@ var GrokAcpAdapter = class {
   providerSessionId = "";
   cwd = ".";
   model;
+  effort;
   grokBin;
   closed = false;
   autoApprove;
@@ -4074,6 +5384,25 @@ var GrokAcpAdapter = class {
         this.reply(id, {});
         return;
       }
+      if (method === "_x.ai/auth/get_url" || method === "x.ai/auth/get_url") {
+        const url = String(
+          p.url ?? p.authUrl ?? ""
+        );
+        if (url) {
+          this.emitActivity("Grok login \u2014 browser opened\u2026", "working");
+          try {
+            (0, import_node_child_process3.execFile)("open", [url], () => void 0);
+          } catch (e) {
+            console.warn("[adapter] open auth url failed", e);
+          }
+        }
+        this.reply(id, { ok: true });
+        return;
+      }
+      if (method === "_x.ai/auth/submit_code" || method === "x.ai/auth/submit_code") {
+        this.reply(id, { ok: true });
+        return;
+      }
       console.warn("[adapter] unhandled server request", method);
       this.replyError(id, `Unsupported method: ${method}`, -32601);
     } catch (e) {
@@ -4085,11 +5414,20 @@ var GrokAcpAdapter = class {
   }
   readTextFile(filePath, line, limit) {
     if (!filePath) throw new Error("path required");
-    const resolved = import_node_path2.default.resolve(filePath);
-    if (!import_node_fs2.default.existsSync(resolved)) {
+    const base = this.cwd && this.cwd !== "." ? this.cwd : process.cwd();
+    const resolved = import_node_path6.default.isAbsolute(filePath) ? import_node_path6.default.normalize(filePath) : import_node_path6.default.resolve(base, filePath);
+    if (!import_node_fs6.default.existsSync(resolved)) {
       throw new Error(`File not found: ${resolved}`);
     }
-    let text = import_node_fs2.default.readFileSync(resolved, "utf8");
+    if (isImagePath(resolved)) {
+      const st = import_node_fs6.default.statSync(resolved);
+      return `[Image file \u2014 not text]
+path: ${resolved}
+mime: ${guessMime(resolved)}
+size: ${st.size} bytes
+Do not use Read/read_file on images. If this image was attached by the user, it is already available as vision content in the conversation \u2014 describe it from that.`;
+    }
+    let text = import_node_fs6.default.readFileSync(resolved, "utf8");
     if (line != null || limit != null) {
       const lines = text.split("\n");
       const start = Math.max(0, (line ?? 1) - 1);
@@ -4103,9 +5441,10 @@ var GrokAcpAdapter = class {
   }
   writeTextFile(filePath, content) {
     if (!filePath) throw new Error("path required");
-    const resolved = import_node_path2.default.resolve(filePath);
-    import_node_fs2.default.mkdirSync(import_node_path2.default.dirname(resolved), { recursive: true });
-    import_node_fs2.default.writeFileSync(resolved, content, "utf8");
+    const base = this.cwd && this.cwd !== "." ? this.cwd : process.cwd();
+    const resolved = import_node_path6.default.isAbsolute(filePath) ? import_node_path6.default.normalize(filePath) : import_node_path6.default.resolve(base, filePath);
+    import_node_fs6.default.mkdirSync(import_node_path6.default.dirname(resolved), { recursive: true });
+    import_node_fs6.default.writeFileSync(resolved, content, "utf8");
   }
   emitActivity(text, phase) {
     if (!this.domainSessionId) return;
@@ -4117,6 +5456,97 @@ var GrokAcpAdapter = class {
       at: nowIso()
     });
   }
+  /** Last context window size from agent (for compact_completed which only sends after). */
+  lastContextSize = 0;
+  /** Monotonic guard — signals can briefly point at the wrong session after resume. */
+  lastContextUsed = 0;
+  lastContextProviderId = "";
+  turnAssistantText = "";
+  signalsWatcher = null;
+  stopSignalsWatcher() {
+    this.signalsWatcher?.stop();
+    this.signalsWatcher = null;
+  }
+  startSignalsWatcher() {
+    this.stopSignalsWatcher();
+    if (!this.providerSessionId || !this.cwd?.trim()) return;
+    const paths = resolveGrokSignalsPaths(this.cwd, this.providerSessionId);
+    if (paths.length === 0) return;
+    this.signalsWatcher = new GrokSignalsWatcher(paths, (u) => {
+      this.emitContextUsage(u.used, u.size, "signals", u.pct);
+    });
+    this.signalsWatcher.start();
+  }
+  /** Point watcher at a different Grok session id (e.g. from /session-info). */
+  retargetProviderSession(nextId) {
+    const id = nextId.trim();
+    if (!id || id === this.providerSessionId) return;
+    this.providerSessionId = id;
+    this.lastContextUsed = 0;
+    this.lastContextProviderId = id;
+    this.startSignalsWatcher();
+    this.publishSignalsUsageOnce();
+  }
+  /** One-shot read for SessionManager / HTTP (no watcher required). */
+  publishSignalsUsageOnce() {
+    if (!this.providerSessionId || !this.cwd?.trim()) return false;
+    const u = readGrokSignalsUsage(
+      resolveGrokSignalsPaths(this.cwd, this.providerSessionId)
+    );
+    if (!u) return false;
+    this.emitContextUsage(u.used, u.size, "signals", u.pct);
+    return true;
+  }
+  emitContextUsage(used, size, source, pct) {
+    if (!this.domainSessionId) return;
+    if (!Number.isFinite(used) || !Number.isFinite(size) || size <= 0) return;
+    const usedN = Math.max(0, Math.round(used));
+    const sizeN = Math.max(1, Math.round(size));
+    if (source === "signals" && this.lastContextProviderId === this.providerSessionId && this.lastContextUsed > 0 && usedN + 500 < this.lastContextUsed) {
+      return;
+    }
+    this.lastContextSize = sizeN;
+    this.lastContextUsed = usedN;
+    this.lastContextProviderId = this.providerSessionId;
+    this.emit({
+      type: "ContextUsage",
+      sessionId: this.domainSessionId,
+      used: usedN,
+      size: sizeN,
+      source,
+      pct: typeof pct === "number" && Number.isFinite(pct) ? Math.max(0, Math.min(100, Math.round(pct))) : Math.min(100, Math.round(usedN / sizeN * 100)),
+      providerSessionId: this.providerSessionId || void 0,
+      at: nowIso()
+    });
+  }
+  /** Pull usage (+ optional session id) out of /session-info style replies. */
+  ingestSessionInfoText(text) {
+    if (!text || !/session\s*id|context\s*:/i.test(text)) return;
+    const idMatch = text.match(
+      /Session\s*ID\s*[:：]\s*\**\s*[`"]?(019f[0-9a-fA-F-]{20,}|[0-9a-f]{8}-[0-9a-f-]{27,})[`"]?/i
+    );
+    if (idMatch?.[1]) {
+      this.retargetProviderSession(idMatch[1]);
+    }
+    const ctxMatch = text.match(
+      /Context[\s\S]{0,48}?([\d,]+)\s*\/\s*([\d,]+)\s*tokens(?:\s*\((\d+)\s*%\))?/i
+    );
+    if (ctxMatch) {
+      const used = Number(String(ctxMatch[1]).replace(/,/g, ""));
+      const size = Number(String(ctxMatch[2]).replace(/,/g, ""));
+      const pct = ctxMatch[3] != null ? Number(ctxMatch[3]) : void 0;
+      if (Number.isFinite(used) && Number.isFinite(size) && size > 0) {
+        this.emitContextUsage(used, size, "session_info", pct);
+      }
+    }
+  }
+  numField(v) {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) {
+      return Number(v);
+    }
+    return void 0;
+  }
   createTerminal(p) {
     const id = `term-${(0, import_node_crypto.randomUUID)()}`;
     const command = String(p.command ?? "");
@@ -4124,22 +5554,26 @@ var GrokAcpAdapter = class {
     const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : this.cwd || process.cwd();
     const byteLimit = typeof p.outputByteLimit === "number" && p.outputByteLimit > 0 ? p.outputByteLimit : 1048576;
     const envList = Array.isArray(p.env) ? p.env : [];
-    const env = { ...process.env };
+    const env = withHealthyEnv(process.env);
     for (const e of envList) {
       if (e?.name) env[e.name] = String(e.value ?? "");
     }
-    const useShell = args.length === 0 && /[\s'"|&;<>]/.test(command);
-    const proc = useShell ? (0, import_node_child_process.spawn)(command, {
+    env.PATH = buildAugmentedPath(env.PATH);
+    const spec = resolveToolSpawn(command, args, env.PATH);
+    const proc = (0, import_node_child_process2.spawn)(spec.file, spec.args, {
       cwd,
-      env,
-      shell: true,
-      stdio: ["ignore", "pipe", "pipe"]
-    }) : (0, import_node_child_process.spawn)(command || "/bin/bash", args.length ? args : ["-lc", "true"], {
-      cwd,
-      env,
+      env: spec.env ? { ...env, ...spec.env } : env,
       shell: false,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: [
+        spec.stdinScript != null ? "pipe" : "ignore",
+        "pipe",
+        "pipe"
+      ]
     });
+    if (spec.stdinScript != null && proc.stdin) {
+      proc.stdin.write(spec.stdinScript);
+      proc.stdin.end();
+    }
     const term = {
       id,
       proc,
@@ -4160,6 +5594,9 @@ var GrokAcpAdapter = class {
       }
       const last = s.trim().split("\n").filter(Boolean).pop();
       if (last) {
+        if (/command not found|bash_profile|zshrc|conda initialize/i.test(last)) {
+          return;
+        }
         this.emitActivity(
           last.length > 80 ? `${last.slice(0, 80)}\u2026` : last,
           "sleeping"
@@ -4183,7 +5620,7 @@ var GrokAcpAdapter = class {
       this.emitActivity(null);
     });
     this.terminals.set(id, term);
-    const label = useShell ? command.slice(0, 60) : `${command} ${args.join(" ")}`.trim().slice(0, 60);
+    const label = spec.label;
     this.emitActivity(`Running ${label}${label.length >= 60 ? "\u2026" : ""}`, "tool");
     return id;
   }
@@ -4254,11 +5691,23 @@ var GrokAcpAdapter = class {
         this.emitActivity(null);
       } else if (kind === "auto_compact_started" || kind === "compact_started" || kind === "compacting") {
         this.emitActivity("Compacting conversation\u2026", "compact");
+        const used = this.numField(update.tokens_used ?? update.tokensUsed);
+        const size = this.numField(
+          update.context_window ?? update.contextWindow
+        );
+        if (used != null && size != null) {
+          this.emitContextUsage(used, size, "compact");
+        }
       } else if (kind === "auto_compact_completed" || kind === "compact_completed") {
         const before = update.tokens_before ?? update.tokensBefore;
         const after = update.tokens_after ?? update.tokensAfter;
         const msg = before != null && after != null ? `Compacted \xB7 ${before} \u2192 ${after} tokens` : "Compact complete";
         this.emitActivity(msg, "compact");
+        const afterN = this.numField(after);
+        const size = this.numField(update.context_window ?? update.contextWindow) ?? (this.lastContextSize > 0 ? this.lastContextSize : void 0);
+        if (afterN != null && size != null) {
+          this.emitContextUsage(afterN, size, "compact_done");
+        }
         setTimeout(() => this.emitActivity(null), 8e3);
       } else if (kind === "turn_completed") {
       } else if (kind === "session_summary_generated") {
@@ -4280,6 +5729,10 @@ var GrokAcpAdapter = class {
         const content = update.content;
         const text = content?.text ?? update.text ?? "";
         if (text) {
+          this.turnAssistantText += text;
+          if (/Session\s*ID|Context\s*:/i.test(this.turnAssistantText) && this.turnAssistantText.length < 2e4) {
+            this.ingestSessionInfoText(this.turnAssistantText);
+          }
           this.emit({
             type: "MessageChunk",
             sessionId: sid,
@@ -4363,6 +5816,37 @@ var GrokAcpAdapter = class {
         this.emit({ type: "TasksReplaced", sessionId: sid, tasks, at });
         break;
       }
+      case "usage_update": {
+        const used = this.numField(update.used);
+        const size = this.numField(update.size);
+        if (used != null && size != null) {
+          this.emitContextUsage(used, size, "acp");
+        }
+        break;
+      }
+      case "auto_compact_started":
+      case "compact_started": {
+        const used = this.numField(update.tokens_used ?? update.tokensUsed);
+        const size = this.numField(
+          update.context_window ?? update.contextWindow
+        );
+        if (used != null && size != null) {
+          this.emitContextUsage(used, size, "compact");
+        }
+        this.emitActivity("Compacting conversation\u2026", "compact");
+        break;
+      }
+      case "auto_compact_completed":
+      case "compact_completed": {
+        const after = this.numField(
+          update.tokens_after ?? update.tokensAfter
+        );
+        const size = this.numField(update.context_window ?? update.contextWindow) ?? (this.lastContextSize > 0 ? this.lastContextSize : void 0);
+        if (after != null && size != null) {
+          this.emitContextUsage(after, size, "compact_done");
+        }
+        break;
+      }
       default:
         break;
     }
@@ -4370,7 +5854,12 @@ var GrokAcpAdapter = class {
   async start(opts) {
     this.cwd = opts.cwd;
     this.model = opts.model;
+    this.effort = opts.effort;
     this.closed = false;
+    this.lastContextSize = 0;
+    this.lastContextUsed = 0;
+    this.lastContextProviderId = "";
+    this.turnAssistantText = "";
     this.domainSessionId = opts.domainSessionId ?? (0, import_node_crypto.randomUUID)();
     if (opts.permissionMode === "default" || opts.permissionMode === "ask") {
       this.autoApprove = false;
@@ -4379,16 +5868,31 @@ var GrokAcpAdapter = class {
     }
     const agentArgs = ["agent"];
     if (opts.model) agentArgs.push("--model", opts.model);
+    if (opts.effort) agentArgs.push("--effort", opts.effort);
     if (this.autoApprove) agentArgs.push("--always-approve");
     agentArgs.push("stdio");
-    this.proc = (0, import_node_child_process.spawn)(this.grokBin, agentArgs, {
+    this.proc = (0, import_node_child_process2.spawn)(this.grokBin, agentArgs, {
       cwd: opts.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env }
+      // Inherit bridge PATH (already augmented at boot); re-apply in case env was stripped.
+      env: withHealthyEnv(process.env)
     });
     this.proc.stderr?.on("data", (buf) => {
+      const line = buf.toString();
+      try {
+        const logDir = import_node_path6.default.join(
+          process.env.HOME || "/tmp",
+          ".agent-pane"
+        );
+        import_node_fs6.default.mkdirSync(logDir, { recursive: true });
+        import_node_fs6.default.appendFileSync(
+          import_node_path6.default.join(logDir, "grok-stderr.log"),
+          `[${(/* @__PURE__ */ new Date()).toISOString()}] ${line.slice(0, 2e3)}`
+        );
+      } catch {
+      }
       if (process.env.AGENT_PANE_DEBUG) {
-        console.error("[grok stderr]", buf.toString().slice(0, 500));
+        console.error("[grok stderr]", line.slice(0, 500));
       }
     });
     this.rl = readline.createInterface({ input: this.proc.stdout });
@@ -4396,6 +5900,7 @@ var GrokAcpAdapter = class {
     this.proc.on("exit", (code) => {
       const unexpected = !this.closed;
       this.proc = null;
+      this.stopSignalsWatcher();
       if (unexpected) {
         this.emit({
           type: "SessionError",
@@ -4418,7 +5923,7 @@ var GrokAcpAdapter = class {
         }
       }
     });
-    await this.send("initialize", {
+    const init = await this.send("initialize", {
       protocolVersion: 1,
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
@@ -4427,19 +5932,71 @@ var GrokAcpAdapter = class {
       },
       clientInfo: { name: "agent-pane", version: "0.1.2" }
     });
+    const methods = Array.isArray(init?.authMethods) ? init.authMethods : [];
+    const methodId = typeof init?._meta?.defaultAuthMethodId === "string" && init._meta.defaultAuthMethodId || methods.find((m) => typeof m?.id === "string" && m.id)?.id || (methods.length > 0 ? "grok.com" : null);
     this.absorbUpdates = false;
-    const result = await this.send(
+    const { browserMcpServers: browserMcpServers2 } = await Promise.resolve().then(() => (init_browser_mcp_config(), browser_mcp_config_exports));
+    const wantMcp = process.env.AGENT_PANE_BROWSER_MCP !== "0" && !opts.resumed;
+    const mcpServers = wantMcp ? browserMcpServers2() : [];
+    const isAuthRequired = (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      return /Authentication required|auth_required|no auth method/i.test(msg);
+    };
+    const sessionNew = async (servers, timeoutMs) => await this.send(
       "session/new",
-      { cwd: opts.cwd, mcpServers: [] },
-      3e4
+      { cwd: opts.cwd, mcpServers: servers },
+      timeoutMs
     );
+    const t0 = Date.now();
+    let result;
+    try {
+      const firstTimeout = mcpServers.length > 0 ? 2e4 : 25e3;
+      this.emitActivity("Connecting\u2026", "working");
+      result = await sessionNew(mcpServers, firstTimeout);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (methodId && isAuthRequired(e)) {
+        console.warn(
+          `[adapter] session/new needs auth after ${Date.now() - t0}ms \u2014 authenticate once`
+        );
+        try {
+          this.emitActivity("Grok login required\u2026", "working");
+          await this.send("authenticate", { methodId }, 45e3);
+        } catch (authErr) {
+          this.emitActivity(null);
+          const am = authErr instanceof Error ? authErr.message : String(authErr);
+          throw new Error(
+            `\u9700\u8981\u767B\u5F55 Grok\uFF08${am}\uFF09\u3002\u7EC8\u7AEF\u8DD1\uFF1Agrok login  \u7136\u540E\u56DE\u5230\u8FD9\u91CC\u518D Send\u3002`
+          );
+        }
+        this.emitActivity("Connecting\u2026", "working");
+        result = await sessionNew([], 25e3);
+      } else if (mcpServers.length > 0 && /timed out/i.test(msg)) {
+        console.warn(
+          `[adapter] session/new with MCP timed out after ${Date.now() - t0}ms \u2014 retry without MCP`
+        );
+        this.emitActivity("Connecting\u2026", "working");
+        result = await sessionNew([], 25e3);
+      } else if (isAuthRequired(e)) {
+        this.emitActivity(null);
+        throw new Error(
+          `\u9700\u8981\u767B\u5F55 Grok\u3002\u7EC8\u7AEF\u8DD1\uFF1Agrok login  \u7136\u540E\u56DE\u5230\u8FD9\u91CC\u518D Send\u3002\uFF08${msg}\uFF09`
+        );
+      } else {
+        this.emitActivity(null);
+        throw e;
+      }
+    }
+    this.emitActivity(null);
     this.providerSessionId = result.sessionId ?? (0, import_node_crypto.randomUUID)();
+    this.startSignalsWatcher();
     return {
       providerSessionId: this.providerSessionId,
       domainSessionId: this.domainSessionId,
       resumed: Boolean(opts.resumed),
       cwd: opts.cwd,
       model: opts.model,
+      effort: opts.effort,
       /** Always need digest when resumed (we no longer session/load). */
       needsHistoryDigest: Boolean(opts.resumed)
     };
@@ -4477,25 +6034,50 @@ ${input.text}`;
     const blocks = [
       { type: "text", text: promptText }
     ];
-    if (input.attachments?.length) {
-      for (const a of input.attachments) {
+    const attachments = stabilizeAttachments(input.attachments);
+    const imageNames = [];
+    if (attachments?.length) {
+      for (const a of attachments) {
+        const abs = a.path;
+        const name = import_node_path6.default.basename(abs);
+        if (a.kind !== "folder" && isImagePath(abs) && import_node_fs6.default.existsSync(abs)) {
+          try {
+            const buf = import_node_fs6.default.readFileSync(abs);
+            if (buf.length <= 12 * 1024 * 1024) {
+              blocks.push({
+                type: "image",
+                mimeType: guessMime(abs),
+                data: buf.toString("base64")
+              });
+              imageNames.push(name);
+            }
+          } catch {
+          }
+        }
         blocks.push({
           type: "resource_link",
-          uri: `file://${a.path}`,
-          name: a.path
+          uri: `file://${abs}`,
+          name
         });
       }
+    }
+    if (imageNames.length) {
+      blocks.push({
+        type: "text",
+        text: `[Attached image${imageNames.length > 1 ? "s" : ""}: ${imageNames.join(", ")}. Vision content is already included above \u2014 look at the image(s) directly. Do NOT call Read/read_file on these image paths (binary files).]`
+      });
     }
     const shown = input.displayText ?? input.text;
     this.turnCancelled = false;
     this.promptInFlight = true;
+    this.turnAssistantText = "";
     if (!input.skipUserEvent) {
       this.userTurns.push(shown);
       this.emit({
         type: "UserMessageAppended",
         sessionId: this.domainSessionId,
         text: shown,
-        attachments: input.attachments,
+        attachments,
         at: nowIso()
       });
     }
@@ -4529,6 +6111,11 @@ ${input.text}`;
         role: "assistant",
         at: nowIso()
       });
+      this.ingestSessionInfoText(this.turnAssistantText);
+      this.turnAssistantText = "";
+      this.signalsWatcher?.refresh();
+      setTimeout(() => this.signalsWatcher?.refresh(), 400);
+      setTimeout(() => this.signalsWatcher?.refresh(), 1200);
     } catch (e) {
       this.promptInFlight = false;
       if (this.turnCancelled) {
@@ -4538,6 +6125,7 @@ ${input.text}`;
           role: "assistant",
           at: nowIso()
         });
+        this.signalsWatcher?.refresh();
         return;
       }
       this.emit({
@@ -4583,17 +6171,20 @@ ${input.text}`;
     }
   }
   /**
-   * 撤回上一条用户消息：
-   * 1) 取消进行中的 turn
-   * 2) 尽力调用 Grok `_x.ai/rewind/*`
-   * 3) 无论 provider 是否成功，都发出 SessionRewound 让 UI 回滚
+   * Discard user turn `userTurnIndex` and everything after (Claude Code Undo).
+   * 1) cancel in-flight turn
+   * 2) best-effort Grok `_x.ai/rewind/*` to that prompt index
+   * 3) always emit SessionRewound so UI + event store can truncate
    */
-  async undoLastTurn() {
+  async rewindToUserTurn(userTurnIndex) {
     if (this.userTurns.length === 0) {
       throw new Error("Nothing to undo");
     }
+    if (!Number.isFinite(userTurnIndex) || userTurnIndex < 0 || userTurnIndex >= this.userTurns.length) {
+      throw new Error("Invalid turn to undo");
+    }
     await this.cancel(this.domainSessionId);
-    const restoredText = this.userTurns[this.userTurns.length - 1];
+    const restoredText = this.userTurns[userTurnIndex];
     let providerOk = false;
     let note;
     try {
@@ -4604,41 +6195,78 @@ ${input.text}`;
       if (points.length === 0) {
         note = "UI undid the turn; Grok had no rewind point";
       } else {
-        const last = points[points.length - 1];
-        const target = last.prompt_index;
-        const result = await this.send("_x.ai/rewind/execute", {
-          sessionId: this.providerSessionId,
-          target_prompt_index: target,
-          mode: "conversation_only"
-        });
-        if (result?.success) {
-          providerOk = true;
-          note = void 0;
+        let target = points[userTurnIndex] ?? points.find((p) => {
+          const preview = (p.prompt_preview ?? "").trim();
+          return preview && restoredText.trim().startsWith(preview.slice(0, 40));
+        }) ?? null;
+        if (!target && points.length === this.userTurns.length) {
+          target = points[userTurnIndex] ?? null;
+        }
+        if (!target && userTurnIndex === this.userTurns.length - 1) {
+          target = points[points.length - 1] ?? null;
+        }
+        if (!target) {
+          const offset = points.length - this.userTurns.length;
+          if (offset >= 0 && points[offset + userTurnIndex]) {
+            target = points[offset + userTurnIndex];
+          }
+        }
+        if (!target) {
+          note = "UI undid the turn; could not map Grok rewind point \u2014 model may still recall later messages";
         } else {
-          note = "UI undid the turn; Grok rewind not confirmed \u2014 model may still recall the last message";
-          try {
-            await this.send("_x.ai/rewind/execute", {
-              sessionId: this.providerSessionId,
-              target_prompt_index: target,
-              mode: "all"
-            });
-          } catch {
+          const result = await this.send("_x.ai/rewind/execute", {
+            sessionId: this.providerSessionId,
+            target_prompt_index: target.prompt_index,
+            mode: "conversation_only"
+          });
+          if (result?.success) {
+            providerOk = true;
+            note = void 0;
+          } else {
+            note = "UI undid the turn; Grok rewind not confirmed \u2014 model may still recall later messages";
+            try {
+              await this.send("_x.ai/rewind/execute", {
+                sessionId: this.providerSessionId,
+                target_prompt_index: target.prompt_index,
+                mode: "all"
+              });
+            } catch {
+            }
           }
         }
       }
     } catch (e) {
       note = `UI undid the turn; Grok rewind failed: ${e instanceof Error ? e.message : String(e)}`;
     }
-    this.userTurns.pop();
+    this.userTurns = this.userTurns.slice(0, userTurnIndex);
     this.emit({
       type: "SessionRewound",
       sessionId: this.domainSessionId,
       restoredText,
+      userTurnIndex,
       providerOk,
       note,
       at: nowIso()
     });
-    return { restoredText, providerOk, note };
+    return { restoredText, userTurnIndex, providerOk, note };
+  }
+  /**
+   * 撤回上一条用户消息 — thin wrapper around rewindToUserTurn.
+   */
+  async undoLastTurn() {
+    if (this.userTurns.length === 0) {
+      throw new Error("Nothing to undo");
+    }
+    const r = await this.rewindToUserTurn(this.userTurns.length - 1);
+    return {
+      restoredText: r.restoredText,
+      providerOk: r.providerOk,
+      note: r.note
+    };
+  }
+  /** Rebuild turn list after resume / history hydrate. */
+  hydrateUserTurns(texts) {
+    this.userTurns = texts.filter((t) => typeof t === "string");
   }
   /**
    * Weekly credit usage / billing snapshot (Grok TUI `/usage`).
@@ -4716,6 +6344,7 @@ ${input.text}`;
   }
   async stop() {
     this.closed = true;
+    this.stopSignalsWatcher();
     for (const term of this.terminals.values()) {
       if (!term.exited) {
         try {
@@ -4741,11 +6370,40 @@ ${input.text}`;
 function summarize(v) {
   if (v == null) return "";
   if (typeof v === "string") return v.slice(0, 12e3);
+  const unwrapped = unwrapAcpText(v);
+  if (unwrapped) return unwrapped.slice(0, 12e3);
   try {
     return JSON.stringify(v).slice(0, 12e3);
   } catch {
     return String(v).slice(0, 12e3);
   }
+}
+function unwrapAcpText(v) {
+  if (typeof v === "string") return v;
+  if (!v || typeof v !== "object") return "";
+  if (Array.isArray(v)) {
+    const parts = [];
+    for (const item of v) {
+      const t = unwrapAcpText(item);
+      if (t) parts.push(t);
+    }
+    return parts.join("\n").trim();
+  }
+  const o = v;
+  if (typeof o.text === "string" && o.text.trim()) return o.text;
+  if (o.content != null) {
+    const inner = unwrapAcpText(o.content);
+    if (inner) return inner;
+  }
+  for (const key of ["message", "error", "output", "rawOutput"]) {
+    const x = o[key];
+    if (typeof x === "string" && x.trim()) return x;
+    if (x && typeof x === "object") {
+      const inner = unwrapAcpText(x);
+      if (inner) return inner;
+    }
+  }
+  return "";
 }
 function mapTaskStatus(s) {
   const x = (s ?? "pending").toLowerCase();
@@ -4756,17 +6414,17 @@ function mapTaskStatus(s) {
 }
 
 // ../bridge/src/workspace-snapshot.ts
-var import_node_child_process2 = require("node:child_process");
-var import_node_fs3 = __toESM(require("node:fs"), 1);
-var import_node_path3 = __toESM(require("node:path"), 1);
-var import_node_os2 = __toESM(require("node:os"), 1);
+var import_node_child_process4 = require("node:child_process");
+var import_node_fs7 = __toESM(require("node:fs"), 1);
+var import_node_path7 = __toESM(require("node:path"), 1);
+var import_node_os5 = __toESM(require("node:os"), 1);
 var import_node_crypto2 = require("node:crypto");
 function hashFile(abs) {
   try {
-    if (!import_node_fs3.default.existsSync(abs)) return "missing";
-    const st = import_node_fs3.default.statSync(abs);
+    if (!import_node_fs7.default.existsSync(abs)) return "missing";
+    const st = import_node_fs7.default.statSync(abs);
     if (st.isDirectory()) return `dir:${st.mtimeMs}`;
-    const buf = import_node_fs3.default.readFileSync(abs);
+    const buf = import_node_fs7.default.readFileSync(abs);
     return (0, import_node_crypto2.createHash)("sha256").update(buf).digest("hex");
   } catch {
     return "error";
@@ -4774,29 +6432,29 @@ function hashFile(abs) {
 }
 function loadSnapshotFingerprints(snapshot) {
   if (!snapshot) return null;
-  const root = snapshot.kind === "files" ? snapshot.ref : import_node_path3.default.join(
-    process.env.HOME || import_node_os2.default.homedir(),
+  const root = snapshot.kind === "files" ? snapshot.ref : import_node_path7.default.join(
+    process.env.HOME || import_node_os5.default.homedir(),
     ".agent-pane",
     "snapshots",
     snapshot.snapshotId
   );
-  const fpPath = import_node_path3.default.join(root, "fingerprints.json");
+  const fpPath = import_node_path7.default.join(root, "fingerprints.json");
   try {
-    if (import_node_fs3.default.existsSync(fpPath)) {
-      const obj = JSON.parse(import_node_fs3.default.readFileSync(fpPath, "utf8"));
+    if (import_node_fs7.default.existsSync(fpPath)) {
+      const obj = JSON.parse(import_node_fs7.default.readFileSync(fpPath, "utf8"));
       return new Map(Object.entries(obj));
     }
   } catch {
   }
-  const filesDir = import_node_path3.default.join(root, "files");
+  const filesDir = import_node_path7.default.join(root, "files");
   const map = /* @__PURE__ */ new Map();
-  if (!import_node_fs3.default.existsSync(filesDir)) return map;
+  if (!import_node_fs7.default.existsSync(filesDir)) return map;
   const walk = (dir, prefix) => {
-    for (const name of import_node_fs3.default.readdirSync(dir)) {
-      const abs = import_node_path3.default.join(dir, name);
+    for (const name of import_node_fs7.default.readdirSync(dir)) {
+      const abs = import_node_path7.default.join(dir, name);
       const rel = prefix ? `${prefix}/${name}` : name;
       try {
-        if (import_node_fs3.default.statSync(abs).isDirectory()) walk(abs, rel);
+        if (import_node_fs7.default.statSync(abs).isDirectory()) walk(abs, rel);
         else map.set(rel, hashFile(abs));
       } catch {
       }
@@ -4807,7 +6465,7 @@ function loadSnapshotFingerprints(snapshot) {
 }
 function isGitRepo(cwd) {
   try {
-    (0, import_node_child_process2.execFileSync)("git", ["rev-parse", "--is-inside-work-tree"], {
+    (0, import_node_child_process4.execFileSync)("git", ["rev-parse", "--is-inside-work-tree"], {
       cwd,
       stdio: ["ignore", "pipe", "ignore"]
     });
@@ -4817,7 +6475,7 @@ function isGitRepo(cwd) {
   }
 }
 function git(cwd, args) {
-  return (0, import_node_child_process2.execFileSync)("git", args, {
+  return (0, import_node_child_process4.execFileSync)("git", args, {
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -4828,13 +6486,13 @@ var WorkspaceSnapshotService = class {
   snapshots = /* @__PURE__ */ new Map();
   root;
   constructor(root) {
-    this.root = root ?? import_node_path3.default.join(import_node_os2.default.homedir(), ".agent-pane", "snapshots");
-    import_node_fs3.default.mkdirSync(this.root, { recursive: true });
+    this.root = root ?? import_node_path7.default.join(import_node_os5.default.homedir(), ".agent-pane", "snapshots");
+    import_node_fs7.default.mkdirSync(this.root, { recursive: true });
   }
   take(sessionId, cwd) {
     const snapshotId = (0, import_node_crypto2.randomUUID)();
-    const dir = import_node_path3.default.join(this.root, snapshotId);
-    import_node_fs3.default.mkdirSync(dir, { recursive: true });
+    const dir = import_node_path7.default.join(this.root, snapshotId);
+    import_node_fs7.default.mkdirSync(dir, { recursive: true });
     if (isGitRepo(cwd)) {
       let head = "UNBORN";
       try {
@@ -4843,24 +6501,24 @@ var WorkspaceSnapshotService = class {
         head = "UNBORN";
       }
       const status = git(cwd, ["status", "--porcelain", "-uall"]);
-      import_node_fs3.default.writeFileSync(import_node_path3.default.join(dir, "head"), head, "utf8");
-      import_node_fs3.default.writeFileSync(import_node_path3.default.join(dir, "status.txt"), status, "utf8");
+      import_node_fs7.default.writeFileSync(import_node_path7.default.join(dir, "head"), head, "utf8");
+      import_node_fs7.default.writeFileSync(import_node_path7.default.join(dir, "status.txt"), status, "utf8");
       const meta2 = {
         snapshotId,
         cwd,
         kind: "git",
         ref: head
       };
-      import_node_fs3.default.writeFileSync(import_node_path3.default.join(dir, "meta.json"), JSON.stringify(meta2, null, 2));
+      import_node_fs7.default.writeFileSync(import_node_path7.default.join(dir, "meta.json"), JSON.stringify(meta2, null, 2));
       const fingerprints = {};
       for (const line of status.split("\n").filter(Boolean)) {
         const p = line.slice(3).trim().split(" -> ").pop();
-        const abs = import_node_path3.default.join(cwd, p);
-        if (import_node_fs3.default.existsSync(abs) && import_node_fs3.default.statSync(abs).isFile()) {
-          const dest = import_node_path3.default.join(dir, "files", p);
-          import_node_fs3.default.mkdirSync(import_node_path3.default.dirname(dest), { recursive: true });
+        const abs = import_node_path7.default.join(cwd, p);
+        if (import_node_fs7.default.existsSync(abs) && import_node_fs7.default.statSync(abs).isFile()) {
+          const dest = import_node_path7.default.join(dir, "files", p);
+          import_node_fs7.default.mkdirSync(import_node_path7.default.dirname(dest), { recursive: true });
           try {
-            import_node_fs3.default.copyFileSync(abs, dest);
+            import_node_fs7.default.copyFileSync(abs, dest);
             fingerprints[p] = hashFile(abs);
           } catch {
           }
@@ -4868,8 +6526,8 @@ var WorkspaceSnapshotService = class {
           fingerprints[p] = "missing";
         }
       }
-      import_node_fs3.default.writeFileSync(
-        import_node_path3.default.join(dir, "fingerprints.json"),
+      import_node_fs7.default.writeFileSync(
+        import_node_path7.default.join(dir, "fingerprints.json"),
         JSON.stringify(fingerprints, null, 2),
         "utf8"
       );
@@ -4882,7 +6540,7 @@ var WorkspaceSnapshotService = class {
       kind: "files",
       ref: dir
     };
-    import_node_fs3.default.writeFileSync(import_node_path3.default.join(dir, "meta.json"), JSON.stringify(meta, null, 2));
+    import_node_fs7.default.writeFileSync(import_node_path7.default.join(dir, "meta.json"), JSON.stringify(meta, null, 2));
     this.snapshots.set(sessionId, meta);
     return meta;
   }
@@ -4893,7 +6551,7 @@ var WorkspaceSnapshotService = class {
   restore(sessionId, filePath) {
     const snap = this.snapshots.get(sessionId);
     if (!snap) throw new Error("No snapshot for session");
-    const dir = import_node_path3.default.join(this.root, snap.snapshotId);
+    const dir = import_node_path7.default.join(this.root, snap.snapshotId);
     const cwd = snap.cwd;
     if (snap.kind === "git") {
       if (filePath === "*") {
@@ -4906,32 +6564,32 @@ var WorkspaceSnapshotService = class {
         try {
           git(cwd, ["checkout", "HEAD", "--", filePath]);
         } catch {
-          const abs = import_node_path3.default.join(cwd, filePath);
-          if (import_node_fs3.default.existsSync(abs)) import_node_fs3.default.rmSync(abs, { force: true });
+          const abs = import_node_path7.default.join(cwd, filePath);
+          if (import_node_fs7.default.existsSync(abs)) import_node_fs7.default.rmSync(abs, { force: true });
         }
         try {
           const status = git(cwd, ["status", "--porcelain", "--", filePath]);
           if (status.startsWith("??")) {
-            import_node_fs3.default.rmSync(import_node_path3.default.join(cwd, filePath), { force: true });
+            import_node_fs7.default.rmSync(import_node_path7.default.join(cwd, filePath), { force: true });
           }
         } catch {
         }
       }
-      const filesRoot = import_node_path3.default.join(dir, "files");
-      if (import_node_fs3.default.existsSync(filesRoot)) {
+      const filesRoot = import_node_path7.default.join(dir, "files");
+      if (import_node_fs7.default.existsSync(filesRoot)) {
         const restoreOne = (rel) => {
-          const src = import_node_path3.default.join(filesRoot, rel);
-          const dest = import_node_path3.default.join(cwd, rel);
-          if (!import_node_fs3.default.existsSync(src)) return;
-          import_node_fs3.default.mkdirSync(import_node_path3.default.dirname(dest), { recursive: true });
-          import_node_fs3.default.copyFileSync(src, dest);
+          const src = import_node_path7.default.join(filesRoot, rel);
+          const dest = import_node_path7.default.join(cwd, rel);
+          if (!import_node_fs7.default.existsSync(src)) return;
+          import_node_fs7.default.mkdirSync(import_node_path7.default.dirname(dest), { recursive: true });
+          import_node_fs7.default.copyFileSync(src, dest);
         };
         if (filePath === "*") {
           const walk = (d, prefix = "") => {
-            for (const name of import_node_fs3.default.readdirSync(d)) {
-              const p = import_node_path3.default.join(d, name);
+            for (const name of import_node_fs7.default.readdirSync(d)) {
+              const p = import_node_path7.default.join(d, name);
               const rel = prefix ? `${prefix}/${name}` : name;
-              if (import_node_fs3.default.statSync(p).isDirectory()) walk(p, rel);
+              if (import_node_fs7.default.statSync(p).isDirectory()) walk(p, rel);
               else restoreOne(rel);
             }
           };
@@ -4953,13 +6611,13 @@ var WorkspaceSnapshotService = class {
 };
 
 // ../bridge/src/diff-engine.ts
-var import_node_child_process3 = require("node:child_process");
-var import_node_fs4 = __toESM(require("node:fs"), 1);
-var import_node_path4 = __toESM(require("node:path"), 1);
+var import_node_child_process5 = require("node:child_process");
+var import_node_fs8 = __toESM(require("node:fs"), 1);
+var import_node_path8 = __toESM(require("node:path"), 1);
 var import_node_crypto3 = require("node:crypto");
 function git2(cwd, args) {
   try {
-    return (0, import_node_child_process3.execFileSync)("git", args, {
+    return (0, import_node_child_process5.execFileSync)("git", args, {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
@@ -4980,12 +6638,12 @@ function countDiffStats(patch) {
   return { additions, deletions };
 }
 function fileFingerprint(cwd, relPath) {
-  const abs = import_node_path4.default.join(cwd, relPath);
+  const abs = import_node_path8.default.join(cwd, relPath);
   try {
-    if (!import_node_fs4.default.existsSync(abs)) return "missing";
-    const st = import_node_fs4.default.statSync(abs);
+    if (!import_node_fs8.default.existsSync(abs)) return "missing";
+    const st = import_node_fs8.default.statSync(abs);
     if (st.isDirectory()) return `dir:${st.mtimeMs}`;
-    const buf = import_node_fs4.default.readFileSync(abs);
+    const buf = import_node_fs8.default.readFileSync(abs);
     return (0, import_node_crypto3.createHash)("sha256").update(buf).digest("hex");
   } catch {
     return "error";
@@ -4994,7 +6652,7 @@ function fileFingerprint(cwd, relPath) {
 var DiffEngine = class {
   compute(cwd, snapshot) {
     try {
-      (0, import_node_child_process3.execFileSync)("git", ["rev-parse", "--is-inside-work-tree"], {
+      (0, import_node_child_process5.execFileSync)("git", ["rev-parse", "--is-inside-work-tree"], {
         cwd,
         stdio: ["ignore", "pipe", "ignore"]
       });
@@ -5044,391 +6702,17 @@ var DiffEngine = class {
   }
 };
 
-// ../bridge/src/history-index.ts
-var import_node_fs5 = __toESM(require("node:fs"), 1);
-var import_node_os3 = __toESM(require("node:os"), 1);
-var import_node_path5 = __toESM(require("node:path"), 1);
-var import_node_crypto4 = require("node:crypto");
-var ROOT = import_node_path5.default.join(import_node_os3.default.homedir(), ".agent-pane", "sessions");
-var PINS_PATH = import_node_path5.default.join(import_node_os3.default.homedir(), ".agent-pane", "pins.json");
-var listCache = null;
-var LIST_TTL_MS = 12e3;
-function readPinSet() {
-  try {
-    if (!import_node_fs5.default.existsSync(PINS_PATH)) return /* @__PURE__ */ new Set();
-    const raw = JSON.parse(import_node_fs5.default.readFileSync(PINS_PATH, "utf8"));
-    if (Array.isArray(raw)) return new Set(raw.map(String));
-    if (raw && typeof raw === "object") {
-      const o = raw;
-      if (Array.isArray(o.ids)) return new Set(o.ids.map(String));
-      return new Set(Object.keys(o).filter((k) => o[k]));
-    }
-  } catch {
-  }
-  return /* @__PURE__ */ new Set();
-}
-function writePinSet(ids) {
-  ensureRoot();
-  const dir = import_node_path5.default.dirname(PINS_PATH);
-  import_node_fs5.default.mkdirSync(dir, { recursive: true });
-  import_node_fs5.default.writeFileSync(
-    PINS_PATH,
-    JSON.stringify({ ids: [...ids] }, null, 2),
-    "utf8"
-  );
-  invalidateHistoryListCache();
-}
-function isPinned(sessionId) {
-  return readPinSet().has(sessionId);
-}
-function setPinned(sessionId, pinned) {
-  const set = readPinSet();
-  if (pinned) set.add(sessionId);
-  else set.delete(sessionId);
-  writePinSet(set);
-}
-var eventsCache = /* @__PURE__ */ new Map();
-var EVENTS_TTL_MS = 6e4;
-function invalidateHistoryListCache() {
-  listCache = null;
-}
-function invalidateSessionEventsCache(sessionId) {
-  if (sessionId) eventsCache.delete(sessionId);
-  else eventsCache.clear();
-}
-function ensureRoot() {
-  import_node_fs5.default.mkdirSync(ROOT, { recursive: true });
-}
-function metaPath(sessionId) {
-  return import_node_path5.default.join(ROOT, sessionId, "meta.json");
-}
-function eventsPath(sessionId) {
-  return import_node_path5.default.join(ROOT, sessionId, "events.jsonl");
-}
-function ensureTitle(sessionId, title) {
-  const t = (title || "").trim();
-  if (t && t !== "Untitled") return t.slice(0, 80);
-  const derived = deriveMetaFromEvents(sessionId);
-  const d = (derived?.title || "").trim();
-  if (d && d !== "New session" && d !== "Untitled") return d.slice(0, 80);
-  return t || "New session";
-}
-function readMeta(sessionId) {
-  try {
-    const p = metaPath(sessionId);
-    if (!import_node_fs5.default.existsSync(p)) return null;
-    const meta = JSON.parse(import_node_fs5.default.readFileSync(p, "utf8"));
-    meta.pinned = isPinned(sessionId) || !!meta.pinned;
-    meta.title = ensureTitle(sessionId, meta.title);
-    return meta;
-  } catch {
-    return null;
-  }
-}
-function writeMeta(meta) {
-  ensureRoot();
-  const dir = import_node_path5.default.join(ROOT, meta.sessionId);
-  import_node_fs5.default.mkdirSync(dir, { recursive: true });
-  const fixed = {
-    ...meta,
-    title: ensureTitle(meta.sessionId, meta.title),
-    pinned: isPinned(meta.sessionId) || !!meta.pinned
-  };
-  import_node_fs5.default.writeFileSync(metaPath(meta.sessionId), JSON.stringify(fixed, null, 2), "utf8");
-  invalidateHistoryListCache();
-}
-function upsertMeta(patch) {
-  const prev = readMeta(patch.sessionId);
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const prevTitle = (prev?.title || "").trim();
-  const patchTitle = (patch.title || "").trim().slice(0, 80);
-  const keepTitle = prevTitle && prevTitle !== "New session" && prevTitle !== "Untitled" && (prev?.messageCount ?? 0) > 0;
-  const title = keepTitle ? prevTitle : patchTitle || prevTitle || "New session";
-  const meta = {
-    sessionId: patch.sessionId,
-    cwd: patch.cwd ?? prev?.cwd ?? "",
-    title: ensureTitle(patch.sessionId, title),
-    createdAt: prev?.createdAt ?? now,
-    updatedAt: now,
-    messageCount: (prev?.messageCount ?? 0) + (patch.bumpMessage ? 1 : 0),
-    providerSessionId: patch.providerSessionId ?? prev?.providerSessionId,
-    // Pin from dedicated store (never lost on upsert)
-    pinned: isPinned(patch.sessionId) || !!prev?.pinned,
-    unread: prev?.unread,
-    archived: prev?.archived
-  };
-  writeMeta(meta);
-  return meta;
-}
-function deriveMetaFromEvents(sessionId) {
-  const p = eventsPath(sessionId);
-  if (!import_node_fs5.default.existsSync(p)) return null;
-  let cwd = "";
-  let title = "New session";
-  let createdAt = "";
-  let updatedAt = "";
-  let messageCount = 0;
-  let firstUser = "";
-  try {
-    const lines = import_node_fs5.default.readFileSync(p, "utf8").split("\n").filter(Boolean);
-    for (const line of lines) {
-      try {
-        const e = JSON.parse(line);
-        if (!createdAt && e.at) createdAt = e.at;
-        if (e.at) updatedAt = e.at;
-        if (e.type === "SessionStarted") {
-          cwd = e.cwd ?? cwd;
-        }
-        if (e.type === "UserMessageAppended") {
-          messageCount++;
-          const t = e.text ?? "";
-          if (!firstUser && t) firstUser = t;
-        }
-      } catch {
-      }
-    }
-  } catch {
-    return null;
-  }
-  if (!createdAt) return null;
-  return {
-    sessionId,
-    cwd,
-    title: (firstUser || title).slice(0, 80),
-    createdAt,
-    updatedAt: updatedAt || createdAt,
-    messageCount
-  };
-}
-function listHistory(force = false) {
-  if (!force && listCache && Date.now() - listCache.at < LIST_TTL_MS) {
-    return listCache.groups;
-  }
-  ensureRoot();
-  const sessions2 = [];
-  let dirs = [];
-  try {
-    dirs = import_node_fs5.default.readdirSync(ROOT);
-  } catch {
-    listCache = { at: Date.now(), groups: [] };
-    return [];
-  }
-  for (const id of dirs) {
-    const dir = import_node_path5.default.join(ROOT, id);
-    try {
-      if (!import_node_fs5.default.statSync(dir).isDirectory()) continue;
-    } catch {
-      continue;
-    }
-    if (!hasReplayableEvents(id)) {
-      try {
-        const metaOnly = readMeta(id);
-        const ev = eventsPath(id);
-        const emptyOrMissing = !import_node_fs5.default.existsSync(ev) || import_node_fs5.default.statSync(ev).size === 0;
-        if (metaOnly && emptyOrMissing) {
-          import_node_fs5.default.rmSync(dir, { recursive: true, force: true });
-        }
-      } catch {
-      }
-      continue;
-    }
-    let meta = readMeta(id);
-    if (!meta) {
-      meta = deriveMetaFromEvents(id);
-      if (meta && !isDraftSession(meta)) {
-        meta.pinned = isPinned(id);
-        writeMeta(meta);
-      }
-    } else {
-      if (meta.pinned && !isPinned(id)) setPinned(id, true);
-      const before = JSON.stringify({ t: meta.title, p: meta.pinned });
-      meta = {
-        ...meta,
-        title: ensureTitle(id, meta.title),
-        pinned: isPinned(id) || !!meta.pinned
-      };
-      const after = JSON.stringify({ t: meta.title, p: meta.pinned });
-      if (before !== after && !isDraftSession(meta)) writeMeta(meta);
-    }
-    if (meta && !isDraftSession(meta)) sessions2.push(meta);
-  }
-  sessions2.sort(
-    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-  );
-  const byCwd = /* @__PURE__ */ new Map();
-  const active = sessions2.filter((s) => !s.archived && !isDraftSession(s));
-  for (const s of active) {
-    const key = s.cwd || "(unknown)";
-    const list = byCwd.get(key) ?? [];
-    list.push(s);
-    byCwd.set(key, list);
-  }
-  for (const list of byCwd.values()) {
-    list.sort((a, b) => {
-      if (!!b.pinned !== !!a.pinned) return a.pinned ? -1 : 1;
-      return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
-    });
-  }
-  const groups = [];
-  for (const [cwd, list] of byCwd) {
-    groups.push({
-      cwd,
-      name: cwd === "(unknown)" ? "Unknown" : import_node_path5.default.basename(cwd) || cwd,
-      sessions: list
-    });
-  }
-  groups.sort((a, b) => {
-    const ta = a.sessions[0] ? new Date(a.sessions[0].updatedAt).getTime() : 0;
-    const tb = b.sessions[0] ? new Date(b.sessions[0].updatedAt).getTime() : 0;
-    return tb - ta;
-  });
-  listCache = { at: Date.now(), groups };
-  return groups;
-}
-function loadSessionEvents(sessionId, force = false) {
-  const p = eventsPath(sessionId);
-  if (!import_node_fs5.default.existsSync(p)) return [];
-  let mtimeMs = 0;
-  try {
-    mtimeMs = import_node_fs5.default.statSync(p).mtimeMs;
-  } catch {
-    return [];
-  }
-  const hit = eventsCache.get(sessionId);
-  if (!force && hit && hit.mtimeMs === mtimeMs && Date.now() - hit.at < EVENTS_TTL_MS) {
-    return hit.events;
-  }
-  const events = [];
-  const lines = import_node_fs5.default.readFileSync(p, "utf8").split("\n").filter(Boolean);
-  for (const line of lines) {
-    try {
-      events.push(JSON.parse(line));
-    } catch {
-    }
-  }
-  eventsCache.set(sessionId, { at: Date.now(), mtimeMs, events });
-  return events;
-}
-function patchMeta(sessionId, patch) {
-  let prev = readMeta(sessionId);
-  if (!prev) {
-    prev = deriveMetaFromEvents(sessionId) ?? null;
-  }
-  if (!prev) return null;
-  const next = {
-    ...prev,
-    updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-  };
-  if (patch.title != null && String(patch.title).trim()) {
-    next.title = String(patch.title).trim().slice(0, 80);
-  }
-  if (typeof patch.pinned === "boolean") {
-    setPinned(sessionId, patch.pinned);
-    next.pinned = patch.pinned;
-  } else {
-    next.pinned = isPinned(sessionId) || !!prev.pinned;
-  }
-  if (typeof patch.unread === "boolean") next.unread = patch.unread;
-  if (typeof patch.archived === "boolean") next.archived = patch.archived;
-  if (patch.cwd != null) next.cwd = patch.cwd;
-  next.title = ensureTitle(sessionId, next.title);
-  writeMeta(next);
-  return next;
-}
-function deleteSession(sessionId) {
-  const dir = import_node_path5.default.join(ROOT, sessionId);
-  try {
-    if (import_node_fs5.default.existsSync(dir)) {
-      import_node_fs5.default.rmSync(dir, { recursive: true, force: true });
-    }
-  } catch (e) {
-    console.error("[history] deleteSession failed", sessionId, e);
-    return false;
-  }
-  try {
-    if (import_node_fs5.default.existsSync(dir)) {
-      import_node_fs5.default.rmSync(dir, { recursive: true, force: true });
-    }
-  } catch {
-  }
-  invalidateHistoryListCache();
-  invalidateSessionEventsCache(sessionId);
-  return true;
-}
-function isDraftSession(meta) {
-  return (meta.messageCount ?? 0) <= 0;
-}
-function hasReplayableEvents(sessionId) {
-  const p = eventsPath(sessionId);
-  if (!import_node_fs5.default.existsSync(p)) return false;
-  try {
-    const lines = import_node_fs5.default.readFileSync(p, "utf8").split("\n").filter(Boolean);
-    for (const line of lines) {
-      try {
-        const e = JSON.parse(line);
-        if (e.type === "UserMessageAppended") return true;
-      } catch {
-      }
-    }
-  } catch {
-    return false;
-  }
-  return false;
-}
-function pruneDraftSessions(opts) {
-  ensureRoot();
-  let removed = 0;
-  let dirs = [];
-  try {
-    dirs = import_node_fs5.default.readdirSync(ROOT);
-  } catch {
-    return 0;
-  }
-  for (const id of dirs) {
-    if (opts?.keepSessionId && id === opts.keepSessionId) continue;
-    const dir = import_node_path5.default.join(ROOT, id);
-    try {
-      if (!import_node_fs5.default.statSync(dir).isDirectory()) continue;
-    } catch {
-      continue;
-    }
-    const meta = readMeta(id) ?? deriveMetaFromEvents(id);
-    if (!meta || !isDraftSession(meta)) continue;
-    if (opts?.cwd && meta.cwd && meta.cwd !== opts.cwd) continue;
-    if (deleteSession(id)) removed++;
-  }
-  return removed;
-}
-function forkSession(sessionId) {
-  const events = loadSessionEvents(sessionId, true);
-  if (!events.length) return null;
-  const prev = readMeta(sessionId) ?? deriveMetaFromEvents(sessionId);
-  if (!prev) return null;
-  const newId = (0, import_node_crypto4.randomUUID)();
-  const dir = import_node_path5.default.join(ROOT, newId);
-  import_node_fs5.default.mkdirSync(dir, { recursive: true });
-  const lines = events.map(
-    (e) => JSON.stringify({ ...e, sessionId: newId })
-  );
-  import_node_fs5.default.writeFileSync(import_node_path5.default.join(dir, "events.jsonl"), lines.join("\n") + "\n", "utf8");
-  const meta = {
-    ...prev,
-    sessionId: newId,
-    title: `${prev.title} (fork)`,
-    createdAt: (/* @__PURE__ */ new Date()).toISOString(),
-    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-    pinned: false,
-    unread: false,
-    archived: false
-  };
-  writeMeta(meta);
-  return meta;
-}
-
 // ../bridge/src/session-manager.ts
+init_history_index();
 function modeUsesAlwaysApprove(mode) {
   const m = mode.toLowerCase();
-  return m === "agent" || m === "always" || m === "always-approve" || m === "yolo";
+  return m === "agent" || m === "debug" || m === "multitask" || m === "always" || m === "always-approve" || m === "yolo";
+}
+function normalizePermissionMode(mode) {
+  const m = (mode ?? "agent").toLowerCase();
+  if (m === "plan") return "plan";
+  if (m === "auto" || m === "ask") return "auto";
+  return "agent";
 }
 function buildHistoryDigest(sessionId, maxTurns = 12) {
   const events = loadSessionEvents(sessionId, true);
@@ -5499,6 +6783,35 @@ var SessionManager = class {
       this.broadcast({ type: "event", event: ephemeral });
       return ephemeral;
     }
+    if (event.type === "SessionRewound") {
+      try {
+        this.store.truncateBeforeUserTurn(
+          event.sessionId,
+          event.userTurnIndex
+        );
+      } catch {
+      }
+      invalidateSessionEventsCache(event.sessionId);
+      try {
+        const kept = this.store.list(event.sessionId, 0);
+        const msgCount = kept.filter((e) => e.type === "UserMessageAppended").length;
+        const live = this.live.get(event.sessionId);
+        const prev = readMeta(event.sessionId);
+        if (prev) {
+          writeMeta({
+            ...prev,
+            cwd: live?.cwd || prev.cwd,
+            messageCount: msgCount,
+            updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+          });
+          invalidateHistoryListCache();
+        }
+      } catch {
+      }
+      const ephemeral = { ...event, seq: 0 };
+      this.broadcast({ type: "event", event: ephemeral });
+      return ephemeral;
+    }
     const stored = this.store.append(event);
     this.broadcast({ type: "event", event: stored });
     invalidateSessionEventsCache(event.sessionId);
@@ -5539,7 +6852,8 @@ var SessionManager = class {
         await this.createSession(
           cmd.cwd,
           cmd.model,
-          cmd.permissionMode ?? this.permissionMode
+          cmd.permissionMode ?? this.permissionMode,
+          cmd.effort
         );
         break;
       case "session.resume":
@@ -5547,11 +6861,17 @@ var SessionManager = class {
           sessionId: cmd.sessionId,
           cwd: cmd.cwd,
           model: cmd.model,
+          effort: cmd.effort,
           permissionMode: cmd.permissionMode ?? this.permissionMode
         });
         break;
       case "session.prompt":
-        await this.prompt(cmd.sessionId, cmd.text, cmd.attachments);
+        await this.prompt(
+          cmd.sessionId,
+          cmd.text,
+          cmd.attachments,
+          cmd.permissionMode
+        );
         break;
       case "session.cancel":
         await this.live.get(cmd.sessionId)?.adapter.cancel(cmd.sessionId);
@@ -5559,11 +6879,28 @@ var SessionManager = class {
       case "session.undoLast": {
         const live = this.live.get(cmd.sessionId);
         if (!live) {
-          this.broadcast({ type: "error", message: "Unknown session" });
+          this.rewindOffline(cmd.sessionId, -1);
           break;
         }
         try {
           await live.adapter.undoLastTurn();
+        } catch (e) {
+          this.broadcast({
+            type: "error",
+            message: e instanceof Error ? e.message : String(e)
+          });
+        }
+        break;
+      }
+      case "session.rewindTo": {
+        const live = this.live.get(cmd.sessionId);
+        if (!live) {
+          this.rewindOffline(cmd.sessionId, cmd.userTurnIndex);
+          break;
+        }
+        try {
+          this.hydrateAdapterTurns(live.adapter, cmd.sessionId);
+          await live.adapter.rewindToUserTurn(cmd.userTurnIndex);
         } catch (e) {
           this.broadcast({
             type: "error",
@@ -5600,6 +6937,36 @@ var SessionManager = class {
         break;
     }
   }
+  hydrateAdapterTurns(adapter, sessionId) {
+    const texts = this.store.list(sessionId, 0).filter((e) => e.type === "UserMessageAppended").map((e) => e.text ?? "");
+    adapter.hydrateUserTurns(texts);
+  }
+  /**
+   * History-only / dead agent rewind: truncate events + broadcast SessionRewound.
+   * `userTurnIndex` -1 means last user turn.
+   */
+  rewindOffline(sessionId, userTurnIndex) {
+    const events = this.store.list(sessionId, 0);
+    const userTexts = events.filter((e) => e.type === "UserMessageAppended").map((e) => e.text ?? "");
+    if (userTexts.length === 0) {
+      this.broadcast({ type: "error", message: "Nothing to undo" });
+      return;
+    }
+    const idx = userTurnIndex < 0 ? userTexts.length - 1 : Math.floor(userTurnIndex);
+    if (idx < 0 || idx >= userTexts.length) {
+      this.broadcast({ type: "error", message: "Invalid turn to undo" });
+      return;
+    }
+    this.publish({
+      type: "SessionRewound",
+      sessionId,
+      restoredText: userTexts[idx],
+      userTurnIndex: idx,
+      providerOk: false,
+      note: "UI undid the turn (agent not attached)",
+      at: nowIso()
+    });
+  }
   /** 关掉所有（或指定 cwd）旧 adapter，避免 grok agent 进程堆僵尸 */
   async stopLiveSessions(filterCwd) {
     const entries = [...this.live.entries()];
@@ -5615,6 +6982,20 @@ var SessionManager = class {
   wireAdapter(adapter) {
     adapter.onEvent((e) => {
       this.publish(e);
+      if (e.type === "ContextUsage" && e.providerSessionId) {
+        const live = this.live.get(e.sessionId);
+        if (live && live.providerSessionId !== e.providerSessionId) {
+          live.providerSessionId = e.providerSessionId;
+          try {
+            upsertMeta({
+              sessionId: e.sessionId,
+              cwd: live.cwd,
+              providerSessionId: e.providerSessionId
+            });
+          } catch {
+          }
+        }
+      }
       if (e.type === "ToolFinished" || e.type === "MessageDone") {
         const sid = e.sessionId;
         setTimeout(() => this.refreshDiff(sid), 300);
@@ -5627,9 +7008,11 @@ var SessionManager = class {
       }
     });
   }
-  async createSession(cwd, model, permissionMode) {
+  async createSession(cwd, model, permissionMode, effort) {
     await this.stopLiveSessions();
-    const mode = (permissionMode ?? this.permissionMode ?? "agent").toLowerCase();
+    const mode = normalizePermissionMode(
+      permissionMode ?? this.permissionMode ?? "agent"
+    );
     this.permissionMode = mode;
     this.broadcast({
       type: "status",
@@ -5644,6 +7027,7 @@ var SessionManager = class {
       started = await adapter.start({
         cwd,
         model,
+        effort,
         // adapter maps ask/default → no --always-approve; else always-approve
         permissionMode: modeUsesAlwaysApprove(mode) ? "auto" : "ask"
       });
@@ -5660,6 +7044,7 @@ var SessionManager = class {
       domainSessionId,
       cwd,
       model,
+      effort,
       permissionMode: mode,
       providerSessionId,
       adapter,
@@ -5674,6 +7059,10 @@ var SessionManager = class {
       providerSessionId,
       at: nowIso()
     });
+    try {
+      adapter.publishSignalsUsageOnce?.();
+    } catch {
+    }
     if (readMeta(domainSessionId)) {
       upsertMeta({ sessionId: domainSessionId, cwd, providerSessionId });
     }
@@ -5728,7 +7117,9 @@ var SessionManager = class {
       }
       this.live.delete(sessionId);
     }
-    const mode = (opts.permissionMode ?? this.permissionMode ?? "agent").toLowerCase();
+    const mode = normalizePermissionMode(
+      opts.permissionMode ?? this.permissionMode ?? "agent"
+    );
     this.permissionMode = mode;
     const meta = readMeta(sessionId);
     const providerSessionId = meta?.providerSessionId ?? existing?.providerSessionId;
@@ -5750,11 +7141,13 @@ var SessionManager = class {
     this.wireAdapter(adapter);
     const resumeCwd = cwd || meta?.cwd || existing?.cwd || "";
     const resumeModel = opts.model ?? existing?.model;
+    const resumeEffort = opts.effort ?? existing?.effort;
     let started;
     try {
       started = await adapter.start({
         cwd: resumeCwd,
         model: resumeModel,
+        effort: resumeEffort,
         permissionMode: modeUsesAlwaysApprove(mode) ? "auto" : "ask",
         domainSessionId: sessionId,
         // Keep id for bookkeeping; start() no longer session/load (prompt hang).
@@ -5762,9 +7155,11 @@ var SessionManager = class {
         resumed: true
       });
     } catch (e) {
+      const raw = e instanceof Error ? e.message : String(e);
+      const hint = /timed out/i.test(raw) && !/登录|login|Authentication|认证/i.test(raw) ? "\uFF08\u53EF\u518D\u70B9 Send \u91CD\u8BD5\uFF09" : "";
       this.broadcast({
         type: "error",
-        message: `\u6062\u590D\u4F1A\u8BDD\u5931\u8D25: ${e instanceof Error ? e.message : String(e)}`
+        message: `\u6062\u590D\u4F1A\u8BDD\u5931\u8D25: ${raw}${hint}`
       });
       return;
     }
@@ -5775,11 +7170,13 @@ var SessionManager = class {
       domainSessionId: sessionId,
       cwd: resumeCwd,
       model: resumeModel,
+      effort: resumeEffort,
       permissionMode: mode,
       providerSessionId: loadedProvider,
       adapter,
       acceptedFp: /* @__PURE__ */ new Map()
     });
+    this.hydrateAdapterTurns(adapter, sessionId);
     this.publish({
       type: "SessionStarted",
       sessionId,
@@ -5789,6 +7186,10 @@ var SessionManager = class {
       providerSessionId: loadedProvider,
       at: nowIso()
     });
+    try {
+      adapter.publishSignalsUsageOnce?.();
+    } catch {
+    }
     upsertMeta({
       sessionId,
       cwd: resumeCwd,
@@ -5806,7 +7207,7 @@ var SessionManager = class {
     }
     this.refreshDiff(sessionId);
   }
-  async prompt(sessionId, text, attachments) {
+  async prompt(sessionId, text, attachments, permissionMode) {
     let live = this.live.get(sessionId);
     if (!live || !live.adapter.isAlive()) {
       const meta = readMeta(sessionId);
@@ -5814,7 +7215,8 @@ var SessionManager = class {
         sessionId,
         cwd: live?.cwd || meta?.cwd || "",
         model: live?.model,
-        permissionMode: live?.permissionMode
+        effort: live?.effort,
+        permissionMode: permissionMode ?? live?.permissionMode
       });
       live = this.live.get(sessionId);
       if (!live || !live.adapter.isAlive()) {
@@ -5824,6 +7226,9 @@ var SessionManager = class {
         });
         return;
       }
+    }
+    if (permissionMode) {
+      live.permissionMode = normalizePermissionMode(permissionMode);
     }
     const slashName = text.trim().match(/^\/([a-zA-Z][\w-]*)/)?.[1]?.toLowerCase();
     if (slashName === "usage" || slashName === "billing") {
@@ -5867,7 +7272,12 @@ var SessionManager = class {
           lines.push(`Prepaid balance: ${u.prepaidBalance}`);
         }
         lines.push("", "_Source: Grok `_x.ai/billing` (same as TUI `/usage`)._");
-        live.adapter.emitLocalReply(text.trim(), lines.join("\n"));
+        this.broadcast({
+          type: "notice",
+          kind: "usage",
+          title: `Usage \xB7 ${u.subscriptionTier || "Grok"}`,
+          body: lines.join("\n")
+        });
         this.broadcast({ type: "status", message: " " });
       } catch (e) {
         this.broadcast({
@@ -5898,6 +7308,7 @@ var SessionManager = class {
           sessionId,
           cwd: live.cwd || meta?.cwd || "",
           model: live.model,
+          effort: live.effort,
           permissionMode: live.permissionMode
         });
         const again = this.live.get(sessionId);
@@ -6021,13 +7432,290 @@ var SessionManager = class {
 };
 
 // ../bridge/src/http-api.ts
-var import_node_child_process4 = require("node:child_process");
-var import_node_fs6 = __toESM(require("node:fs"), 1);
-var import_node_os4 = __toESM(require("node:os"), 1);
-var import_node_path6 = __toESM(require("node:path"), 1);
+var import_node_child_process6 = require("node:child_process");
+var import_node_fs12 = __toESM(require("node:fs"), 1);
+var import_node_os9 = __toESM(require("node:os"), 1);
+var import_node_path12 = __toESM(require("node:path"), 1);
 var import_node_util = require("node:util");
-var execFileAsync = (0, import_node_util.promisify)(import_node_child_process4.execFile);
-var recentPath = import_node_path6.default.join(import_node_os4.default.homedir(), ".agent-pane", "recent.json");
+init_history_index();
+
+// ../bridge/src/customize-config.ts
+var import_node_fs10 = __toESM(require("node:fs"), 1);
+var import_node_os7 = __toESM(require("node:os"), 1);
+var import_node_path10 = __toESM(require("node:path"), 1);
+var GROK_DIR = import_node_path10.default.join(import_node_os7.default.homedir(), ".grok");
+var RULES_DIR = import_node_path10.default.join(GROK_DIR, "rules");
+var MEMORY_INDEX = import_node_path10.default.join(GROK_DIR, "memory", "MEMORY.md");
+var GROK_CONFIG = import_node_path10.default.join(GROK_DIR, "config.toml");
+var CURSOR_MCP = import_node_path10.default.join(import_node_os7.default.homedir(), ".cursor", "mcp.json");
+var SAFE_RULE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,120}\.md$/;
+var SECRET_ENV_RE = /(KEY|TOKEN|SECRET|PASSWORD|AUTH)/i;
+var MASK = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022";
+function ensureParent(file) {
+  import_node_fs10.default.mkdirSync(import_node_path10.default.dirname(file), { recursive: true });
+}
+function maskEnvValue(key, value) {
+  if (!SECRET_ENV_RE.test(key)) return value;
+  if (!value) return "";
+  if (value.length <= 4) return MASK;
+  return `${value.slice(0, 3)}${MASK}`;
+}
+function isMasked(value) {
+  return value.includes("\u2022") || value === MASK;
+}
+function listCustomizeFiles() {
+  const out = [];
+  if (import_node_fs10.default.existsSync(MEMORY_INDEX)) {
+    try {
+      out.push({
+        id: "memory:MEMORY.md",
+        name: "MEMORY.md",
+        path: MEMORY_INDEX,
+        kind: "memory",
+        content: import_node_fs10.default.readFileSync(MEMORY_INDEX, "utf8")
+      });
+    } catch {
+    }
+  }
+  try {
+    if (import_node_fs10.default.existsSync(RULES_DIR)) {
+      const names = import_node_fs10.default.readdirSync(RULES_DIR).filter((n) => SAFE_RULE_NAME.test(n)).sort();
+      for (const name of names) {
+        const p = import_node_path10.default.join(RULES_DIR, name);
+        try {
+          const st = import_node_fs10.default.statSync(p);
+          if (!st.isFile()) continue;
+          out.push({
+            id: `rule:${name}`,
+            name,
+            path: p,
+            kind: "rule",
+            content: import_node_fs10.default.readFileSync(p, "utf8")
+          });
+        } catch {
+        }
+      }
+    }
+  } catch {
+  }
+  return out;
+}
+function writeCustomizeFile(id, content) {
+  if (typeof content !== "string") {
+    throw new Error("content must be a string");
+  }
+  if (content.length > 512e3) {
+    throw new Error("file too large (max 512KB)");
+  }
+  if (id === "memory:MEMORY.md") {
+    ensureParent(MEMORY_INDEX);
+    import_node_fs10.default.writeFileSync(MEMORY_INDEX, content, "utf8");
+    return {
+      id,
+      name: "MEMORY.md",
+      path: MEMORY_INDEX,
+      kind: "memory",
+      content
+    };
+  }
+  const m = id.match(/^rule:(.+)$/);
+  if (!m) throw new Error("unknown file id");
+  const name = m[1];
+  if (!SAFE_RULE_NAME.test(name)) throw new Error("invalid rule name");
+  ensureParent(import_node_path10.default.join(RULES_DIR, name));
+  const p = import_node_path10.default.join(RULES_DIR, name);
+  if (import_node_path10.default.resolve(p) !== import_node_path10.default.resolve(RULES_DIR, name)) {
+    throw new Error("invalid path");
+  }
+  import_node_fs10.default.writeFileSync(p, content, "utf8");
+  return { id, name, path: p, kind: "rule", content };
+}
+function parseTomlStringArray(raw) {
+  const m = raw.match(/^\s*args\s*=\s*\[([\s\S]*?)\]/m);
+  if (!m) return void 0;
+  const inner = m[1];
+  const out = [];
+  const re = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'/g;
+  let hit;
+  while (hit = re.exec(inner)) {
+    out.push((hit[1] ?? hit[2] ?? "").replace(/\\"/g, '"'));
+  }
+  return out;
+}
+function parseGrokMcp(raw) {
+  const servers = /* @__PURE__ */ new Map();
+  const sectionRe = /^\[mcp_servers\.([^\]]+)\]\s*$/gm;
+  const indices = [];
+  let sm;
+  while (sm = sectionRe.exec(raw)) {
+    indices.push({
+      name: sm[1],
+      start: sm.index,
+      headerEnd: sm.index + sm[0].length
+    });
+  }
+  for (let i = 0; i < indices.length; i++) {
+    const cur = indices[i];
+    const end = i + 1 < indices.length ? indices[i + 1].start : raw.length;
+    const body = raw.slice(cur.headerEnd, end);
+    const isEnv = cur.name.endsWith(".env");
+    const baseName = isEnv ? cur.name.slice(0, -".env".length) : cur.name;
+    let server2 = servers.get(baseName);
+    if (!server2) {
+      server2 = { name: baseName, enabled: true, env: {} };
+      servers.set(baseName, server2);
+    }
+    if (isEnv) {
+      const envRe = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:\\.|[^"\\])*)"/gm;
+      let em;
+      while (em = envRe.exec(body)) {
+        const key = em[1];
+        const val = em[2].replace(/\\"/g, '"');
+        server2.env[key] = maskEnvValue(key, val);
+      }
+    } else {
+      const enabled = body.match(/^\s*enabled\s*=\s*(true|false)\s*$/m);
+      if (enabled) server2.enabled = enabled[1] === "true";
+      const command = body.match(/^\s*command\s*=\s*"((?:\\.|[^"\\])*)"/m);
+      if (command) server2.command = command[1].replace(/\\"/g, '"');
+      const args = parseTomlStringArray(body);
+      if (args) server2.args = args;
+    }
+  }
+  return [...servers.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+function loadCustomizeMcp() {
+  let grok = [];
+  if (import_node_fs10.default.existsSync(GROK_CONFIG)) {
+    try {
+      grok = parseGrokMcp(import_node_fs10.default.readFileSync(GROK_CONFIG, "utf8"));
+    } catch {
+      grok = [];
+    }
+  }
+  let cursorJson = '{\n  "mcpServers": {}\n}\n';
+  if (import_node_fs10.default.existsSync(CURSOR_MCP)) {
+    try {
+      const raw = import_node_fs10.default.readFileSync(CURSOR_MCP, "utf8");
+      const parsed = JSON.parse(raw);
+      cursorJson = `${JSON.stringify(parsed, null, 2)}
+`;
+    } catch {
+      cursorJson = import_node_fs10.default.readFileSync(CURSOR_MCP, "utf8");
+    }
+  }
+  return {
+    grokConfigPath: GROK_CONFIG,
+    cursorMcpPath: CURSOR_MCP,
+    grok,
+    cursorJson
+  };
+}
+function findTomlSection(raw, sectionHeader) {
+  const header = `[${sectionHeader}]`;
+  const re = new RegExp(
+    `^\\[${sectionHeader.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]\\s*$`,
+    "m"
+  );
+  const m = re.exec(raw);
+  if (!m || m.index === void 0) return null;
+  const start = m.index;
+  const headerEnd = start + m[0].length;
+  const rest = raw.slice(headerEnd);
+  const next = rest.search(/\n\s*\[[^\]]+\]/);
+  const end = next >= 0 ? headerEnd + next : raw.length;
+  return { start, headerEnd, end };
+}
+function setTomlKeyInSection(raw, sectionHeader, key, line) {
+  const found = findTomlSection(raw, sectionHeader);
+  if (!found) {
+    const block = `
+[${sectionHeader}]
+${line}
+`;
+    return raw.endsWith("\n") ? raw + block : `${raw}
+${block}`;
+  }
+  const { headerEnd, end } = found;
+  const before = raw.slice(0, headerEnd);
+  let body = raw.slice(headerEnd, end);
+  const after = raw.slice(end);
+  const keyRe = new RegExp(`^\\s*${key}\\s*=\\s*.*$`, "m");
+  if (keyRe.test(body)) {
+    body = body.replace(keyRe, line);
+  } else {
+    if (!body.startsWith("\n")) body = `
+${body}`;
+    body = body.replace(/^\n/, `
+${line}
+`);
+  }
+  if (!body.startsWith("\n")) body = `
+${body}`;
+  return before + body + after;
+}
+function setTomlEnvString(raw, serverName, key, value) {
+  const section = `mcp_servers.${serverName}.env`;
+  const escaped = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const line = `${key} = "${escaped}"`;
+  return setTomlKeyInSection(raw, section, key, line);
+}
+function patchGrokMcp(patches) {
+  if (!Array.isArray(patches) || patches.length === 0) {
+    return loadCustomizeMcp();
+  }
+  let raw = import_node_fs10.default.existsSync(GROK_CONFIG) ? import_node_fs10.default.readFileSync(GROK_CONFIG, "utf8") : "";
+  for (const patch of patches) {
+    const name = String(patch.name || "").trim();
+    if (!name || /[\[\]]/.test(name)) throw new Error("invalid server name");
+    if (typeof patch.enabled === "boolean") {
+      raw = setTomlKeyInSection(
+        raw,
+        `mcp_servers.${name}`,
+        "enabled",
+        `enabled = ${patch.enabled}`
+      );
+    }
+    if (patch.env && typeof patch.env === "object") {
+      for (const [k, v] of Object.entries(patch.env)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
+        if (typeof v !== "string") continue;
+        if (SECRET_ENV_RE.test(k) && isMasked(v)) continue;
+        if (SECRET_ENV_RE.test(k) && !v.trim()) continue;
+        raw = setTomlEnvString(raw, name, k, v);
+      }
+    }
+  }
+  ensureParent(GROK_CONFIG);
+  import_node_fs10.default.writeFileSync(GROK_CONFIG, raw, "utf8");
+  return loadCustomizeMcp();
+}
+function writeCursorMcp(jsonText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (e) {
+    throw new Error(
+      `invalid JSON: ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("mcp.json root must be an object");
+  }
+  const obj = parsed;
+  if (!("mcpServers" in obj) || typeof obj.mcpServers !== "object") {
+    throw new Error('mcp.json must contain an "mcpServers" object');
+  }
+  const pretty = `${JSON.stringify(parsed, null, 2)}
+`;
+  ensureParent(CURSOR_MCP);
+  import_node_fs10.default.writeFileSync(CURSOR_MCP, pretty, "utf8");
+  return loadCustomizeMcp();
+}
+
+// ../bridge/src/http-api.ts
+var execFileAsync = (0, import_node_util.promisify)(import_node_child_process6.execFile);
+var recentPath = import_node_path12.default.join(import_node_os9.default.homedir(), ".agent-pane", "recent.json");
 function parseSkillFrontmatter(raw) {
   const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!m) return {};
@@ -6051,23 +7739,23 @@ function parseSkillFrontmatter(raw) {
 }
 function listSkills(cwd) {
   const roots = [
-    { dir: import_node_path6.default.join(import_node_os4.default.homedir(), ".grok", "skills"), source: "user-grok" },
-    { dir: import_node_path6.default.join(import_node_os4.default.homedir(), ".claude", "skills"), source: "user-claude" },
-    { dir: import_node_path6.default.join(import_node_os4.default.homedir(), ".cursor", "skills"), source: "user-cursor" }
+    { dir: import_node_path12.default.join(import_node_os9.default.homedir(), ".grok", "skills"), source: "user-grok" },
+    { dir: import_node_path12.default.join(import_node_os9.default.homedir(), ".claude", "skills"), source: "user-claude" },
+    { dir: import_node_path12.default.join(import_node_os9.default.homedir(), ".cursor", "skills"), source: "user-cursor" }
   ];
   if (cwd) {
     roots.unshift(
-      { dir: import_node_path6.default.join(cwd, ".grok", "skills"), source: "project-grok" },
-      { dir: import_node_path6.default.join(cwd, ".claude", "skills"), source: "project-claude" },
-      { dir: import_node_path6.default.join(cwd, ".cursor", "skills"), source: "project-cursor" }
+      { dir: import_node_path12.default.join(cwd, ".grok", "skills"), source: "project-grok" },
+      { dir: import_node_path12.default.join(cwd, ".claude", "skills"), source: "project-claude" },
+      { dir: import_node_path12.default.join(cwd, ".cursor", "skills"), source: "project-cursor" }
     );
   }
   const byName = /* @__PURE__ */ new Map();
   for (const { dir, source } of roots) {
     let entries = [];
     try {
-      if (!import_node_fs6.default.existsSync(dir)) continue;
-      entries = import_node_fs6.default.readdirSync(dir, { withFileTypes: true });
+      if (!import_node_fs12.default.existsSync(dir)) continue;
+      entries = import_node_fs12.default.readdirSync(dir, { withFileTypes: true });
     } catch {
       continue;
     }
@@ -6076,11 +7764,11 @@ function listSkills(cwd) {
       if (["shell", "canvas", "statusline", "node_modules"].includes(ent.name)) {
         continue;
       }
-      const skillDir = import_node_path6.default.join(dir, ent.name);
-      const md = import_node_path6.default.join(skillDir, "SKILL.md");
-      if (!import_node_fs6.default.existsSync(md)) continue;
+      const skillDir = import_node_path12.default.join(dir, ent.name);
+      const md = import_node_path12.default.join(skillDir, "SKILL.md");
+      if (!import_node_fs12.default.existsSync(md)) continue;
       try {
-        const raw = import_node_fs6.default.readFileSync(md, "utf8").slice(0, 8e3);
+        const raw = import_node_fs12.default.readFileSync(md, "utf8").slice(0, 8e3);
         const fm = parseSkillFrontmatter(raw);
         const name = (fm.name || ent.name).trim();
         if (!name || byName.has(name)) continue;
@@ -6101,7 +7789,10 @@ function listSkills(cwd) {
 }
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+  );
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 function json(res, status, body) {
@@ -6119,21 +7810,21 @@ function readBody(req) {
 }
 function loadRecent() {
   try {
-    if (!import_node_fs6.default.existsSync(recentPath)) return [];
-    const data = JSON.parse(import_node_fs6.default.readFileSync(recentPath, "utf8"));
+    if (!import_node_fs12.default.existsSync(recentPath)) return [];
+    const data = JSON.parse(import_node_fs12.default.readFileSync(recentPath, "utf8"));
     return Array.isArray(data) ? data : [];
   } catch {
     return [];
   }
 }
 function pushRecent(cwd) {
-  const name = import_node_path6.default.basename(cwd) || cwd;
+  const name = import_node_path12.default.basename(cwd) || cwd;
   const next = [
     { path: cwd, name, at: (/* @__PURE__ */ new Date()).toISOString() },
     ...loadRecent().filter((e) => e.path !== cwd)
   ].slice(0, 24);
-  import_node_fs6.default.mkdirSync(import_node_path6.default.dirname(recentPath), { recursive: true });
-  import_node_fs6.default.writeFileSync(recentPath, JSON.stringify(next, null, 2), "utf8");
+  import_node_fs12.default.mkdirSync(import_node_path12.default.dirname(recentPath), { recursive: true });
+  import_node_fs12.default.writeFileSync(recentPath, JSON.stringify(next, null, 2), "utf8");
   return next;
 }
 async function pickFolderMac() {
@@ -6156,18 +7847,110 @@ end try
     return null;
   }
 }
+function assertUnderRoot(root, target) {
+  const rootAbs = import_node_path12.default.resolve(root);
+  const targetAbs = import_node_path12.default.resolve(target);
+  const prefix = rootAbs.endsWith(import_node_path12.default.sep) ? rootAbs : rootAbs + import_node_path12.default.sep;
+  if (targetAbs !== rootAbs && !targetAbs.startsWith(prefix)) {
+    throw new Error("path escapes workspace root");
+  }
+  return targetAbs;
+}
+function listWorkspaceDir(root, relPath) {
+  if (!root || !import_node_fs12.default.existsSync(root) || !import_node_fs12.default.statSync(root).isDirectory()) {
+    throw new Error("workspace root missing");
+  }
+  const joined = import_node_path12.default.resolve(root, relPath || ".");
+  const dir = assertUnderRoot(root, joined);
+  if (!import_node_fs12.default.statSync(dir).isDirectory()) {
+    throw new Error("not a directory");
+  }
+  const names = import_node_fs12.default.readdirSync(dir);
+  const entries = [];
+  for (const name of names) {
+    if (name === ".DS_Store") continue;
+    const full = import_node_path12.default.join(dir, name);
+    let st;
+    try {
+      st = import_node_fs12.default.lstatSync(full);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) continue;
+    if (st.isDirectory()) {
+      entries.push({ name, path: full, kind: "dir" });
+    } else if (st.isFile()) {
+      entries.push({ name, path: full, kind: "file", size: st.size });
+    }
+  }
+  entries.sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  return entries;
+}
+async function revealInFinder(target) {
+  if (process.platform !== "darwin") {
+    throw new Error("Reveal in Finder is macOS-only");
+  }
+  await execFileAsync("open", ["-R", target], { timeout: 15e3 });
+}
+async function openWithDefaultApp(target) {
+  if (process.platform === "darwin") {
+    await execFileAsync("open", [target], { timeout: 15e3 });
+    return;
+  }
+  if (process.platform === "win32") {
+    await execFileAsync("cmd", ["/c", "start", "", target], { timeout: 15e3 });
+    return;
+  }
+  await execFileAsync("xdg-open", [target], { timeout: 15e3 });
+}
+async function openItermAt(cwd) {
+  if (process.platform !== "darwin") {
+    throw new Error("iTerm open is macOS-only");
+  }
+  const abs = import_node_path12.default.resolve(cwd);
+  const script = `
+on run argv
+  set targetPath to item 1 of argv
+  try
+    tell application "iTerm"
+      activate
+      if (count of windows) = 0 then
+        create window with default profile
+      else
+        tell current window
+          create tab with default profile
+        end tell
+      end if
+      tell current session of current window
+        write text "cd " & quoted form of targetPath & "; clear"
+      end tell
+    end tell
+  on error
+    do shell script "open -a iTerm " & quoted form of targetPath
+  end try
+end run
+`;
+  try {
+    await execFileAsync("osascript", ["-e", script, abs], { timeout: 2e4 });
+  } catch {
+    await execFileAsync("open", ["-a", "iTerm", abs], { timeout: 15e3 });
+  }
+}
 function scanProjects() {
   const roots = [
-    import_node_path6.default.join(import_node_os4.default.homedir(), "projects"),
-    import_node_path6.default.join(import_node_os4.default.homedir(), "Desktop"),
-    import_node_path6.default.join(import_node_os4.default.homedir(), "dev")
+    import_node_path12.default.join(import_node_os9.default.homedir(), "projects"),
+    import_node_path12.default.join(import_node_os9.default.homedir(), "Desktop"),
+    import_node_path12.default.join(import_node_os9.default.homedir(), "dev")
   ];
   const out = [];
   for (const root of roots) {
-    if (!import_node_fs6.default.existsSync(root)) continue;
+    if (!import_node_fs12.default.existsSync(root)) continue;
     let entries;
     try {
-      entries = import_node_fs6.default.readdirSync(root, { withFileTypes: true });
+      entries = import_node_fs12.default.readdirSync(root, { withFileTypes: true });
     } catch {
       continue;
     }
@@ -6175,7 +7958,7 @@ function scanProjects() {
       if (!ent.isDirectory()) continue;
       if (ent.name.startsWith(".") || ent.name === "node_modules" || ent.name === "__pycache__")
         continue;
-      const full = import_node_path6.default.join(root, ent.name);
+      const full = import_node_path12.default.join(root, ent.name);
       out.push({
         path: full,
         name: ent.name,
@@ -6210,6 +7993,84 @@ async function handleHttp(req, res, hooks = {}) {
     json(res, 200, { skills: listSkills(cwd) });
     return true;
   }
+  if (url.pathname === "/api/context-usage" && req.method === "GET") {
+    let cwd = url.searchParams.get("cwd") || "";
+    let providerSessionId = url.searchParams.get("providerSessionId") || "";
+    const sessionId = url.searchParams.get("sessionId") || "";
+    if ((!cwd || !providerSessionId) && sessionId) {
+      const meta = readMeta(sessionId);
+      if (meta) {
+        cwd = cwd || meta.cwd || "";
+        providerSessionId = providerSessionId || meta.providerSessionId || "";
+      }
+    }
+    if (!providerSessionId) {
+      json(res, 200, { ok: false, usage: null });
+      return true;
+    }
+    const paths = resolveGrokSignalsPaths(cwd || import_node_os9.default.homedir(), providerSessionId);
+    const usage = readGrokSignalsUsage(
+      paths.length ? paths : resolveGrokSignalsPaths(import_node_os9.default.homedir(), providerSessionId)
+    );
+    if (!usage) {
+      json(res, 200, { ok: false, usage: null, providerSessionId, cwd });
+      return true;
+    }
+    json(res, 200, {
+      ok: true,
+      usage: {
+        used: usage.used,
+        size: usage.size,
+        pct: typeof usage.pct === "number" ? usage.pct : Math.min(100, Math.round(usage.used / usage.size * 100)),
+        source: "signals"
+      },
+      providerSessionId,
+      cwd
+    });
+    return true;
+  }
+  if (url.pathname === "/api/customize/files" && req.method === "GET") {
+    json(res, 200, { files: listCustomizeFiles() });
+    return true;
+  }
+  if (url.pathname === "/api/customize/files" && req.method === "PUT") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      if (!body.id || typeof body.content !== "string") {
+        json(res, 400, { error: "id and content required" });
+        return true;
+      }
+      const file = writeCustomizeFile(body.id, body.content);
+      json(res, 200, { file });
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/customize/mcp" && req.method === "GET") {
+    json(res, 200, loadCustomizeMcp());
+    return true;
+  }
+  if (url.pathname === "/api/customize/mcp" && req.method === "PUT") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      let state = loadCustomizeMcp();
+      if (Array.isArray(body.grok) && body.grok.length > 0) {
+        state = patchGrokMcp(body.grok);
+      }
+      if (typeof body.cursorJson === "string") {
+        state = writeCursorMcp(body.cursorJson);
+      }
+      json(res, 200, state);
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
   if (url.pathname === "/api/history" && req.method === "GET") {
     const force = url.searchParams.get("force") === "1";
     const groups = listHistory(force);
@@ -6222,6 +8083,24 @@ async function handleHttp(req, res, hooks = {}) {
   if (url.pathname === "/api/history/invalidate" && req.method === "POST") {
     invalidateHistoryListCache();
     json(res, 200, { ok: true });
+    return true;
+  }
+  if (url.pathname === "/api/history/import-grok" && req.method === "POST") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const sessionId = (body.sessionId || "").trim();
+      if (!sessionId) {
+        json(res, 400, { error: "sessionId required" });
+        return true;
+      }
+      const { importGrokSession: importGrokSession2 } = await Promise.resolve().then(() => (init_grok_session_import(), grok_session_import_exports));
+      const result = importGrokSession2(sessionId, { force: !!body.force });
+      json(res, 200, result);
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
     return true;
   }
   const histMatch = url.pathname.match(
@@ -6239,9 +8118,19 @@ async function handleHttp(req, res, hooks = {}) {
     );
     return true;
   }
-  const patchMatch = url.pathname.match(/^\/api\/history\/([^/]+)$/);
-  if (patchMatch && req.method === "PATCH") {
-    const sessionId = decodeURIComponent(patchMatch[1]);
+  const metaMatch = url.pathname.match(/^\/api\/history\/([^/]+)$/);
+  if (metaMatch && req.method === "GET") {
+    const sessionId = decodeURIComponent(metaMatch[1]);
+    const meta = readMeta(sessionId);
+    if (!meta) {
+      json(res, 404, { error: "session not found" });
+      return true;
+    }
+    json(res, 200, { meta });
+    return true;
+  }
+  if (metaMatch && req.method === "PATCH") {
+    const sessionId = decodeURIComponent(metaMatch[1]);
     try {
       const body = JSON.parse(await readBody(req));
       const meta = patchMeta(sessionId, {
@@ -6265,7 +8154,21 @@ async function handleHttp(req, res, hooks = {}) {
   const forkMatch = url.pathname.match(/^\/api\/history\/([^/]+)\/fork$/);
   if (forkMatch && req.method === "POST") {
     const sessionId = decodeURIComponent(forkMatch[1]);
-    const meta = forkSession(sessionId);
+    let throughUserTurn;
+    try {
+      const raw = await readBody(req);
+      if (raw.trim()) {
+        const body = JSON.parse(raw);
+        if (typeof body.throughUserTurn === "number" && Number.isFinite(body.throughUserTurn) && body.throughUserTurn >= 0) {
+          throughUserTurn = Math.floor(body.throughUserTurn);
+        }
+      }
+    } catch {
+    }
+    const meta = forkSession(
+      sessionId,
+      throughUserTurn != null ? { throughUserTurn } : void 0
+    );
     if (!meta) {
       json(res, 404, { error: "cannot fork" });
       return true;
@@ -6273,10 +8176,14 @@ async function handleHttp(req, res, hooks = {}) {
     json(res, 200, { meta });
     return true;
   }
-  if (patchMatch && req.method === "DELETE") {
-    const sessionId = decodeURIComponent(patchMatch[1]);
+  if (metaMatch && req.method === "DELETE") {
+    const sessionId = decodeURIComponent(metaMatch[1]);
     try {
       await hooks.stopSession?.(sessionId);
+    } catch {
+    }
+    try {
+      setPinned(sessionId, false);
     } catch {
     }
     const ok = deleteSession(sessionId);
@@ -6304,25 +8211,47 @@ async function handleHttp(req, res, hooks = {}) {
         json(res, 400, { error: "base64 required" });
         return true;
       }
-      const dir = import_node_path6.default.join(import_node_os4.default.homedir(), ".agent-pane", "uploads");
-      import_node_fs6.default.mkdirSync(dir, { recursive: true });
+      const dir = import_node_path12.default.join(import_node_os9.default.homedir(), ".agent-pane", "uploads");
+      import_node_fs12.default.mkdirSync(dir, { recursive: true });
       const stamp = Date.now().toString(36);
       const safe = name.slice(0, 120) || "upload.bin";
-      const dest = import_node_path6.default.join(dir, `${stamp}-${safe}`);
+      const dest = import_node_path12.default.join(dir, `${stamp}-${safe}`);
       const buf = Buffer.from(b64, "base64");
       if (buf.length > 40 * 1024 * 1024) {
         json(res, 413, { error: "file too large (max 40MB)" });
         return true;
       }
-      import_node_fs6.default.writeFileSync(dest, buf);
+      import_node_fs12.default.writeFileSync(dest, buf);
       json(res, 200, {
         path: dest,
         name: safe,
         size: buf.length,
-        mime: body.mime || null
+        mime: body.mime || guessMime(dest)
       });
     } catch (e) {
       json(res, 400, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/fs/persist" && req.method === "POST") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const src = String(body.path || "");
+      if (!src || !import_node_path12.default.isAbsolute(src) || !import_node_fs12.default.existsSync(src)) {
+        json(res, 400, { error: "path missing or not found" });
+        return true;
+      }
+      const dest = persistLocalFile(src);
+      json(res, 200, {
+        path: dest,
+        name: import_node_path12.default.basename(dest),
+        mime: guessMime(dest),
+        image: isImagePath(dest)
+      });
+    } catch (e) {
+      json(res, 500, {
         error: e instanceof Error ? e.message : String(e)
       });
     }
@@ -6353,17 +8282,530 @@ async function handleHttp(req, res, hooks = {}) {
       json(res, 400, { error: "invalid json" });
       return true;
     }
-    if (!cwd || !import_node_fs6.default.existsSync(cwd)) {
+    if (!cwd || !import_node_fs12.default.existsSync(cwd)) {
       json(res, 400, { error: "path missing or not found" });
       return true;
     }
     json(res, 200, { recent: pushRecent(cwd) });
     return true;
   }
+  if (url.pathname === "/api/fs/list" && req.method === "GET") {
+    const root = url.searchParams.get("root") || "";
+    const rel = url.searchParams.get("path") || ".";
+    try {
+      const entries = listWorkspaceDir(root, rel);
+      json(res, 200, { root, path: rel, entries });
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/fs/reveal" && req.method === "POST") {
+    const raw = await readBody(req);
+    let target = "";
+    try {
+      target = String(JSON.parse(raw).path ?? "");
+    } catch {
+      json(res, 400, { error: "invalid json" });
+      return true;
+    }
+    if (!target || !import_node_fs12.default.existsSync(target)) {
+      json(res, 400, { error: "path missing or not found" });
+      return true;
+    }
+    try {
+      await revealInFinder(target);
+      json(res, 200, { ok: true });
+    } catch (e) {
+      json(res, 500, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/fs/open" && req.method === "POST") {
+    const raw = await readBody(req);
+    let target = "";
+    try {
+      target = String(JSON.parse(raw).path ?? "");
+    } catch {
+      json(res, 400, { error: "invalid json" });
+      return true;
+    }
+    if (!target || !import_node_fs12.default.existsSync(target)) {
+      json(res, 400, { error: "path missing or not found" });
+      return true;
+    }
+    try {
+      await openWithDefaultApp(target);
+      json(res, 200, { ok: true });
+    } catch (e) {
+      json(res, 500, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/fs/file" && req.method === "GET") {
+    const target = url.searchParams.get("path") || "";
+    if (!target || !import_node_path12.default.isAbsolute(target) || !import_node_fs12.default.existsSync(target)) {
+      json(res, 404, { error: "file not found" });
+      return true;
+    }
+    let st;
+    try {
+      st = import_node_fs12.default.statSync(target);
+    } catch {
+      json(res, 404, { error: "file not found" });
+      return true;
+    }
+    if (!st.isFile()) {
+      json(res, 400, { error: "not a file" });
+      return true;
+    }
+    if (st.size > 40 * 1024 * 1024) {
+      json(res, 413, { error: "file too large" });
+      return true;
+    }
+    try {
+      const buf = import_node_fs12.default.readFileSync(target);
+      cors(res);
+      res.statusCode = 200;
+      res.setHeader("Content-Type", guessMime(target));
+      res.setHeader("Content-Length", String(buf.length));
+      res.setHeader("Cache-Control", "private, max-age=60");
+      res.end(buf);
+    } catch (e) {
+      json(res, 500, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/terminal/iterm" && req.method === "POST") {
+    const raw = await readBody(req);
+    let cwd = "";
+    try {
+      cwd = String(JSON.parse(raw).cwd ?? "");
+    } catch {
+      json(res, 400, { error: "invalid json" });
+      return true;
+    }
+    if (!cwd || !import_node_fs12.default.existsSync(cwd) || !import_node_fs12.default.statSync(cwd).isDirectory()) {
+      json(res, 400, { error: "cwd missing or not a directory" });
+      return true;
+    }
+    try {
+      await openItermAt(cwd);
+      json(res, 200, { ok: true });
+    } catch (e) {
+      json(res, 500, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/browser/state" && req.method === "GET") {
+    const { getBrowserSession: getBrowserSession2 } = await Promise.resolve().then(() => (init_browser_session(), browser_session_exports));
+    json(res, 200, getBrowserSession2().getState());
+    return true;
+  }
+  if (url.pathname === "/api/browser/navigate" && req.method === "POST") {
+    const { getBrowserSession: getBrowserSession2 } = await Promise.resolve().then(() => (init_browser_session(), browser_session_exports));
+    const raw = await readBody(req);
+    let target = "";
+    try {
+      target = String(JSON.parse(raw).url ?? "");
+    } catch {
+      json(res, 400, { error: "invalid json" });
+      return true;
+    }
+    try {
+      await getBrowserSession2().navigate(target);
+      json(res, 200, getBrowserSession2().getState());
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e),
+        ...getBrowserSession2().getState()
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/browser/back" && req.method === "POST") {
+    const { getBrowserSession: getBrowserSession2 } = await Promise.resolve().then(() => (init_browser_session(), browser_session_exports));
+    try {
+      await getBrowserSession2().back();
+      json(res, 200, getBrowserSession2().getState());
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e),
+        ...getBrowserSession2().getState()
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/browser/screenshot" && req.method === "POST") {
+    const { getBrowserSession: getBrowserSession2 } = await Promise.resolve().then(() => (init_browser_session(), browser_session_exports));
+    try {
+      const screenshotBase64 = await getBrowserSession2().screenshot();
+      json(res, 200, { ...getBrowserSession2().getState(), screenshotBase64 });
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e),
+        ...getBrowserSession2().getState()
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/browser/snapshot" && req.method === "POST") {
+    const { getBrowserSession: getBrowserSession2 } = await Promise.resolve().then(() => (init_browser_session(), browser_session_exports));
+    try {
+      const snapshot = await getBrowserSession2().snapshot();
+      json(res, 200, { snapshot, ...getBrowserSession2().getState() });
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/browser/click" && req.method === "POST") {
+    const { getBrowserSession: getBrowserSession2 } = await Promise.resolve().then(() => (init_browser_session(), browser_session_exports));
+    const raw = await readBody(req);
+    let selector = "";
+    try {
+      selector = String(JSON.parse(raw).selector ?? "");
+    } catch {
+      json(res, 400, { error: "invalid json" });
+      return true;
+    }
+    try {
+      await getBrowserSession2().click(selector);
+      json(res, 200, getBrowserSession2().getState());
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e),
+        ...getBrowserSession2().getState()
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/browser/type" && req.method === "POST") {
+    const { getBrowserSession: getBrowserSession2 } = await Promise.resolve().then(() => (init_browser_session(), browser_session_exports));
+    const raw = await readBody(req);
+    let selector = "";
+    let text = "";
+    try {
+      const body = JSON.parse(raw);
+      selector = String(body.selector ?? "");
+      text = String(body.text ?? "");
+    } catch {
+      json(res, 400, { error: "invalid json" });
+      return true;
+    }
+    try {
+      await getBrowserSession2().type(selector, text);
+      json(res, 200, getBrowserSession2().getState());
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e),
+        ...getBrowserSession2().getState()
+      });
+    }
+    return true;
+  }
   return false;
 }
 
+// ../bridge/src/terminal-pty.ts
+var import_node_fs13 = __toESM(require("node:fs"), 1);
+var import_node_path13 = __toESM(require("node:path"), 1);
+var import_node_module2 = require("node:module");
+var SHELL = process.env.SHELL || "/bin/zsh";
+function dynamicImport(specifier) {
+  return new Function("s", "return import(s)")(specifier);
+}
+function ensureSpawnHelperExecutable() {
+  try {
+    let root = null;
+    try {
+      const req = (0, import_node_module2.createRequire)(
+        // CJS bundle: import.meta.url is empty — resolve from cwd / NODE_PATH
+        import_node_path13.default.resolve(process.cwd(), "package.json")
+      );
+      root = import_node_path13.default.dirname(req.resolve("node-pty/package.json"));
+    } catch {
+      const nm = process.env.NODE_PATH?.split(import_node_path13.default.delimiter)[0];
+      if (nm) {
+        const cand = import_node_path13.default.join(nm, "node-pty");
+        if (import_node_fs13.default.existsSync(cand)) root = cand;
+      }
+    }
+    if (!root) return;
+    const prebuilds = import_node_path13.default.join(root, "prebuilds");
+    if (!import_node_fs13.default.existsSync(prebuilds)) return;
+    for (const plat of import_node_fs13.default.readdirSync(prebuilds)) {
+      const helper = import_node_path13.default.join(prebuilds, plat, "spawn-helper");
+      if (!import_node_fs13.default.existsSync(helper)) continue;
+      try {
+        import_node_fs13.default.accessSync(helper, import_node_fs13.default.constants.X_OK);
+      } catch {
+        import_node_fs13.default.chmodSync(helper, 493);
+      }
+    }
+  } catch {
+  }
+}
+function buildPtyEnv() {
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v == null) continue;
+    if (/^(npm_|npm_config_|CURSOR_|VSCODE_|ELECTRON)/i.test(k)) continue;
+    env[k] = v;
+  }
+  env.PATH = buildAugmentedPath(env.PATH ?? process.env.PATH);
+  env.TERM = "xterm-256color";
+  env.COLORTERM = env.COLORTERM || "truecolor";
+  env.SHELL = SHELL;
+  return env;
+}
+async function createPty(cwd, cols, rows) {
+  ensureSpawnHelperExecutable();
+  let mod;
+  try {
+    mod = await dynamicImport("node-pty");
+  } catch (e) {
+    throw new Error(
+      `node-pty unavailable (${e instanceof Error ? e.message : e}). Run: npm rebuild node-pty`
+    );
+  }
+  let pty;
+  try {
+    pty = mod.spawn(SHELL, [], {
+      name: "xterm-256color",
+      cols: Math.max(cols, 20),
+      rows: Math.max(rows, 8),
+      cwd,
+      env: buildPtyEnv()
+    });
+  } catch (e) {
+    throw new Error(
+      `PTY spawn failed (${e instanceof Error ? e.message : e}). Try: chmod +x node_modules/node-pty/prebuilds/*/spawn-helper`
+    );
+  }
+  return {
+    write: (data) => pty.write(data),
+    resize: (c, r) => pty.resize(Math.max(c, 20), Math.max(r, 8)),
+    kill: () => {
+      try {
+        pty.kill();
+      } catch {
+      }
+    },
+    onData: (cb) => {
+      pty.onData(cb);
+      return () => pty.removeListener("data", cb);
+    },
+    onExit: (cb) => {
+      const handler = (e) => cb(e.exitCode ?? 0);
+      pty.onExit(handler);
+      return () => pty.removeListener("exit", handler);
+    }
+  };
+}
+var TerminalHub = class {
+  cwd;
+  pty = null;
+  starting = null;
+  clients = /* @__PURE__ */ new Map();
+  cols = 80;
+  rows = 24;
+  dataUnsub = null;
+  exitUnsub = null;
+  /** Input typed before PTY is ready (e.g. `grok login` + Enter). */
+  pendingInput = "";
+  constructor(_key, cwd) {
+    this.cwd = cwd;
+  }
+  broadcast(msg) {
+    for (const { send } of this.clients.values()) {
+      send(msg);
+    }
+  }
+  flushPendingInput() {
+    if (!this.pty || !this.pendingInput) return;
+    const buf = this.pendingInput;
+    this.pendingInput = "";
+    this.pty.write(buf);
+  }
+  async ensurePty() {
+    if (this.pty) return;
+    if (this.starting) return this.starting;
+    this.starting = (async () => {
+      try {
+        const pty = await createPty(this.cwd, this.cols, this.rows);
+        this.pty = pty;
+        this.dataUnsub = pty.onData((data) => {
+          this.broadcast({ type: "data", data });
+        });
+        this.exitUnsub = pty.onExit((code) => {
+          this.broadcast({ type: "exit", code });
+          this.destroyPty();
+        });
+        this.flushPendingInput();
+      } catch (e) {
+        this.broadcast({
+          type: "error",
+          message: e instanceof Error ? e.message : String(e)
+        });
+        throw e;
+      } finally {
+        this.starting = null;
+      }
+    })();
+    return this.starting;
+  }
+  destroyPty() {
+    this.dataUnsub?.();
+    this.exitUnsub?.();
+    this.dataUnsub = null;
+    this.exitUnsub = null;
+    this.pty?.kill();
+    this.pty = null;
+    this.pendingInput = "";
+  }
+  attach(send, cols = 80, rows = 24) {
+    this.cols = cols;
+    this.rows = rows;
+    const id = Symbol("terminal-client");
+    this.clients.set(id, { send });
+    void this.ensurePty().then(() => {
+      this.pty?.resize(this.cols, this.rows);
+      this.flushPendingInput();
+      send({ type: "ready" });
+    }).catch((e) => {
+      send({
+        type: "error",
+        message: e instanceof Error ? e.message : String(e)
+      });
+    });
+    return id;
+  }
+  write(data) {
+    if (this.pty) {
+      this.pty.write(data);
+      return;
+    }
+    this.pendingInput += data;
+    void this.ensurePty();
+  }
+  resize(cols, rows) {
+    this.cols = cols;
+    this.rows = rows;
+    this.pty?.resize(cols, rows);
+  }
+  /** Detach one client; keep PTY alive so reopening the panel reconnects. */
+  dispose(sessionId) {
+    this.clients.delete(sessionId);
+  }
+  /** Explicit teardown (e.g. workspace cwd changed). */
+  kill() {
+    this.clients.clear();
+    this.destroyPty();
+  }
+  clientCount() {
+    return this.clients.size;
+  }
+};
+var hubs = /* @__PURE__ */ new Map();
+var terminalSessions = /* @__PURE__ */ new Map();
+function hubKey(cwd, termId) {
+  return termId ? `${cwd}::${termId}` : cwd;
+}
+function getHub(cwd, termId) {
+  const key = hubKey(cwd, termId);
+  let hub = hubs.get(key);
+  if (!hub) {
+    hub = new TerminalHub(key, cwd);
+    hubs.set(key, hub);
+  }
+  return hub;
+}
+function sendJson(ws, msg) {
+  ws.send(JSON.stringify(msg));
+}
+function handleTerminalWs(ws, rawMessage) {
+  let msg;
+  try {
+    msg = JSON.parse(String(rawMessage));
+  } catch {
+    sendJson(ws, { type: "error", message: "Invalid JSON" });
+    return;
+  }
+  switch (msg.type) {
+    case "attach": {
+      const cwd = msg.cwd;
+      if (!cwd) {
+        sendJson(ws, { type: "error", message: "attach requires cwd" });
+        return;
+      }
+      const existing = terminalSessions.get(ws);
+      if (existing) {
+        existing.hub.dispose(existing.clientId);
+        terminalSessions.delete(ws);
+      }
+      const key = hubKey(cwd, msg.termId);
+      const hub = getHub(cwd, msg.termId);
+      const clientId = hub.attach(
+        (m) => sendJson(ws, m),
+        msg.cols ?? 80,
+        msg.rows ?? 24
+      );
+      terminalSessions.set(ws, { hub, clientId, cwd, hubKey: key });
+      break;
+    }
+    case "input": {
+      const session = terminalSessions.get(ws);
+      if (!session) {
+        sendJson(ws, { type: "error", message: "Not attached" });
+        return;
+      }
+      session.hub.write(msg.data);
+      break;
+    }
+    case "resize": {
+      const session = terminalSessions.get(ws);
+      if (!session) {
+        sendJson(ws, { type: "error", message: "Not attached" });
+        return;
+      }
+      session.hub.resize(msg.cols, msg.rows);
+      break;
+    }
+    case "detach": {
+      const session = terminalSessions.get(ws);
+      if (session) {
+        session.hub.dispose(session.clientId);
+        terminalSessions.delete(ws);
+        if (msg.kill) {
+          session.hub.kill();
+          hubs.delete(session.hubKey);
+        }
+      }
+      break;
+    }
+    default:
+      sendJson(ws, { type: "error", message: "Unknown message type" });
+  }
+}
+function createTerminalConnection(ws) {
+  ws.send(JSON.stringify({ type: "hello", channel: "terminal" }));
+}
+
 // ../bridge/src/index.ts
+applyHealthyPathToProcess();
 var PORT = Number(process.env.AGENT_PANE_PORT ?? 8787);
 var HOST = process.env.AGENT_PANE_HOST ?? "127.0.0.1";
 var clients = /* @__PURE__ */ new Set();
@@ -6395,7 +8837,19 @@ var server = import_node_http.default.createServer(async (req, res) => {
   }
 });
 var wss = new import_websocket_server.default({ server });
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  const pathname = (req.url ?? "/").split("?")[0] || "/";
+  if (pathname === "/terminal") {
+    createTerminalConnection(ws);
+    ws.on("message", (raw) => {
+      handleTerminalWs(ws, raw);
+    });
+    ws.on("close", () => {
+      handleTerminalWs(ws, JSON.stringify({ type: "detach" }));
+      terminalSessions.delete(ws);
+    });
+    return;
+  }
   clients.add(ws);
   ws.send(JSON.stringify({ type: "hello", version: "0.1.0" }));
   ws.on("message", async (raw) => {
@@ -6421,6 +8875,7 @@ wss.on("connection", (ws) => {
 });
 server.listen(PORT, HOST, () => {
   console.log(`[agent-pane] bridge ws://${HOST}:${PORT}`);
+  console.log(`[agent-pane] terminal ws://${HOST}:${PORT}/terminal`);
   console.log(`[agent-pane] health http://${HOST}:${PORT}/health`);
   console.log(`[agent-pane] folder-pick POST http://${HOST}:${PORT}/api/folder-pick`);
 });

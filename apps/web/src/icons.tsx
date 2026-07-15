@@ -42,29 +42,48 @@ export function IconSpark({ size, className }: P) {
 }
 
 /**
- * Cursor Agents “New Agent” — paper plane (codicon-style send).
- * Matches the filled-wing plane in Cursor sidebar better than a spark.
+ * Cursor Agents “New Agent” — Lucide `send` (paper plane) 1:1.
+ * viewBox 24 keeps stroke proportions; rendered at 15–16px.
  */
-export function IconPaperPlane({ size, className }: P) {
+export function IconPaperPlane({ size = 16, className }: P) {
   return (
-    <Svg size={size} className={className}>
-      <path
-        d="M2 3.2l12.5 4.8L2 12.8V8.6l7.2-.6L2 7.4V3.2z"
-        fill="currentColor"
-        stroke="none"
-      />
-    </Svg>
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z" />
+      <path d="m21.854 2.147-10.94 10.939" />
+    </svg>
   );
 }
 
 /**
- * Closed folder — flat tab + body outline (collapsed repo row).
+ * Closed folder — Lucide `folder` 1:1 (Open project / collapsed repo).
  */
-export function IconFolder({ size, className }: P) {
+export function IconFolder({ size = 16, className }: P) {
   return (
-    <Svg size={size} className={className}>
-      <path d="M1.5 3.75c0-.69.56-1.25 1.25-1.25h3.38c.3 0 .59.11.81.31L8.1 4h5.15c.69 0 1.25.56 1.25 1.25v6.5c0 .69-.56 1.25-1.25 1.25h-10c-.69 0-1.25-.56-1.25-1.25v-8z" />
-    </Svg>
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+    </svg>
   );
 }
 
@@ -185,6 +204,63 @@ export function IconChevron({ size, className }: P) {
   );
 }
 
+/** Left sidebar panel (collapse / expand) — slightly wide glyph */
+export function IconSidebar({ size, className }: P) {
+  return (
+    <svg
+      width={size ?? 16}
+      height={size ?? 16}
+      viewBox="0 0 18 14"
+      className={className}
+      aria-hidden
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="1.25" y="1.25" width="15.5" height="11.5" rx="1.75" />
+      <path d="M6.5 1.25v11.5" />
+    </svg>
+  );
+}
+
+export function IconCheck({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
+    </Svg>
+  );
+}
+
+export function IconGlobe({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <circle cx="8" cy="8" r="5.5" />
+      <path d="M2.5 8h11M8 2.5c1.8 1.8 2.7 3.6 2.7 5.5S9.8 11.7 8 13.5C6.2 11.7 5.3 9.9 5.3 8S6.2 4.3 8 2.5z" />
+    </Svg>
+  );
+}
+
+export function IconDiff({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M4 2.5h5.5L13 6v7.5H4z" />
+      <path d="M9.5 2.5V6H13" />
+      <path d="M6.5 9h3M8 7.5v3" />
+    </Svg>
+  );
+}
+
+export function IconFile({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M4 2.5h5.5L13 6v7.5H4z" />
+      <path d="M9.5 2.5V6H13" />
+    </Svg>
+  );
+}
+
 export function IconBook({ size, className }: P) {
   return (
     <Svg size={size} className={className}>
@@ -199,6 +275,7 @@ export function IconBug({ size, className }: P) {
     <Svg size={size} className={className}>
       <path d="M8 5.5a3 3 0 0 1 3 3v3.5a3 3 0 0 1-6 0V8.5a3 3 0 0 1 3-3z" />
       <path d="M5 8.5H2.5M13.5 8.5H11M5 12H3M13 12h-2M5.5 5.5L3.5 3.5M10.5 5.5l2-2" />
+      <path d="M3.5 3.5l9 9" />
     </Svg>
   );
 }
@@ -210,6 +287,27 @@ export function IconList({ size, className }: P) {
       <circle cx="2.5" cy="4" r="0.8" fill="currentColor" stroke="none" />
       <circle cx="2.5" cy="8" r="0.8" fill="currentColor" stroke="none" />
       <circle cx="2.5" cy="12" r="0.8" fill="currentColor" stroke="none" />
+    </Svg>
+  );
+}
+
+/** Multitask — overlapping circles (Cursor layers) */
+export function IconLayers({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <circle cx="6.2" cy="8" r="3.4" />
+      <circle cx="9.8" cy="8" r="3.4" />
+    </Svg>
+  );
+}
+
+/** Ask — speech bubble with ? */
+export function IconAsk({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M3.5 3.5h9a1.5 1.5 0 0 1 1.5 1.5v5a1.5 1.5 0 0 1-1.5 1.5H7.2L4.5 14V11.5H3.5A1.5 1.5 0 0 1 2 10V5a1.5 1.5 0 0 1 1.5-1.5z" />
+      <path d="M6.6 6.2a1.5 1.5 0 1 1 2.1 1.35c-.45.25-.8.7-.8 1.25" />
+      <circle cx="8" cy="10.6" r="0.55" fill="currentColor" stroke="none" />
     </Svg>
   );
 }
@@ -283,6 +381,40 @@ export function IconTrash({ size, className }: P) {
       <path d="M6 4.5V3h4v1.5" />
       <path d="M4.5 4.5l.7 9h5.6l.7-9" />
       <path d="M6.5 7v4.5M9.5 7v4.5" />
+    </Svg>
+  );
+}
+
+/** Stacked folders — workspace setup */
+export function IconFolders({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <path d="M2.5 6.5h5l1.2-1.2H13.5v7.2H2.5V6.5z" />
+      <path d="M4 4.5h4.2l1 1H12" />
+    </Svg>
+  );
+}
+
+/** Customize — 2×2 module tiles (Cursor-style) */
+export function IconCustomize({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <rect x="2" y="2" width="5" height="5" rx="1" />
+      <rect x="9" y="2" width="5" height="5" rx="1" />
+      <rect x="2" y="9" width="5" height="5" rx="1" />
+      <rect x="9.5" y="9.5" width="4.5" height="4.5" rx="1" />
+    </Svg>
+  );
+}
+
+/** Small monitor — SSH / remote */
+export function IconMonitor({ size, className }: P) {
+  return (
+    <Svg size={size} className={className}>
+      <rect x="2" y="3" width="12" height="8.5" rx="1.2" />
+      <path d="M6.5 13.5h3M8 11.5v2" />
+      <circle cx="6" cy="7.2" r="0.7" fill="currentColor" stroke="none" />
+      <circle cx="10" cy="7.2" r="0.7" fill="currentColor" stroke="none" />
     </Svg>
   );
 }

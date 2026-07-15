@@ -3,6 +3,15 @@ import { WebSocketServer, type WebSocket } from "ws";
 import type { ClientCommand } from "@agent-pane/shared";
 import { SessionManager } from "./session-manager.js";
 import { handleHttp, pushRecent } from "./http-api.js";
+import {
+  createTerminalConnection,
+  handleTerminalWs,
+  terminalSessions,
+} from "./terminal-pty.js";
+import { applyHealthyPathToProcess } from "./path-env.js";
+
+// GUI-launched Tauri often inherits a lean PATH; fix before any tool/PTY spawn.
+applyHealthyPathToProcess();
 
 const PORT = Number(process.env.AGENT_PANE_PORT ?? 8787);
 const HOST = process.env.AGENT_PANE_HOST ?? "127.0.0.1";
@@ -41,7 +50,21 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  const pathname = (req.url ?? "/").split("?")[0] || "/";
+
+  if (pathname === "/terminal") {
+    createTerminalConnection(ws);
+    ws.on("message", (raw) => {
+      handleTerminalWs(ws, raw);
+    });
+    ws.on("close", () => {
+      handleTerminalWs(ws, JSON.stringify({ type: "detach" }));
+      terminalSessions.delete(ws);
+    });
+    return;
+  }
+
   clients.add(ws);
   ws.send(JSON.stringify({ type: "hello", version: "0.1.0" }));
 
@@ -71,6 +94,7 @@ wss.on("connection", (ws) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[agent-pane] bridge ws://${HOST}:${PORT}`);
+  console.log(`[agent-pane] terminal ws://${HOST}:${PORT}/terminal`);
   console.log(`[agent-pane] health http://${HOST}:${PORT}/health`);
   console.log(`[agent-pane] folder-pick POST http://${HOST}:${PORT}/api/folder-pick`);
 });

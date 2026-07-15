@@ -10,8 +10,10 @@
     "frontendDist": "../../web/dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
+        "label": "main",
         "title": "Agent Pane",
         "width": 1280,
         "height": 840,
@@ -21,8 +23,10 @@
         "fullscreen": false,
         "center": true,
         "decorations": true,
+        "transparent": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
+        "acceptFirstMouse": true,
         "trafficLightPosition": {
           "x": 14,
           "y": 16
@@ -45,7 +49,8 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "resources/bridge.cjs"
+      "resources/bridge.cjs",
+      "resources/browser-mcp.cjs"
     ],
     "macOS": {
       "minimumSystemVersion": "12.0"

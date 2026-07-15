@@ -419,6 +419,12 @@ export function deleteSession(sessionId: string): boolean {
   } catch {
     /* ignore */
   }
+  // Clear pin entry so deleted ids don't linger
+  try {
+    if (isPinned(sessionId)) setPinned(sessionId, false);
+  } catch {
+    /* ignore */
+  }
   invalidateHistoryListCache();
   invalidateSessionEventsCache(sessionId);
   return true;
@@ -481,29 +487,73 @@ export function pruneDraftSessions(opts?: {
   return removed;
 }
 
-/** Fork = copy events.jsonl + meta under new id */
-export function forkSession(sessionId: string): SessionMeta | null {
+/**
+ * Slice domain events by user-turn boundaries.
+ * - `beforeTurn`: keep events before UserMessageAppended at that index (Undo).
+ * - `throughTurn`: keep through end of that turn (until next user) — Fork.
+ */
+export function sliceEventsByUserTurn(
+  events: DomainEvent[],
+  opts: { beforeTurn?: number; throughTurn?: number }
+): DomainEvent[] {
+  let turn = -1;
+  const out: DomainEvent[] = [];
+  for (const e of events) {
+    if (e.type === "SessionRewound") continue;
+    if (e.type === "UserMessageAppended") {
+      turn++;
+      if (opts.beforeTurn != null && turn === opts.beforeTurn) break;
+      if (opts.throughTurn != null && turn > opts.throughTurn) break;
+    }
+    out.push(e);
+  }
+  return out;
+}
+
+/**
+ * Fork = copy events (+ optional cut at a user turn) under a new session id.
+ * `throughUserTurn` = 0-based last user turn to keep (inclusive, full turn).
+ * Omit to copy the entire transcript (sidebar "Fork Chat").
+ */
+export function forkSession(
+  sessionId: string,
+  opts?: { throughUserTurn?: number }
+): SessionMeta | null {
   const events = loadSessionEvents(sessionId, true);
   if (!events.length) return null;
   const prev = readMeta(sessionId) ?? deriveMetaFromEvents(sessionId);
   if (!prev) return null;
+  const sliced =
+    typeof opts?.throughUserTurn === "number"
+      ? sliceEventsByUserTurn(events, { throughTurn: opts.throughUserTurn })
+      : events.filter((e) => e.type !== "SessionRewound");
+  if (!sliced.length) return null;
   const newId = randomUUID();
   const dir = path.join(ROOT, newId);
   fs.mkdirSync(dir, { recursive: true });
-  const lines = events.map((e) =>
-    JSON.stringify({ ...e, sessionId: newId })
+  const lines = sliced.map((e, i) =>
+    JSON.stringify({ ...e, sessionId: newId, seq: i + 1 })
   );
   fs.writeFileSync(path.join(dir, "events.jsonl"), lines.join("\n") + "\n", "utf8");
+  const messageCount = sliced.filter((e) => e.type === "UserMessageAppended").length;
+  const firstUser = sliced.find((e) => e.type === "UserMessageAppended") as
+    | { text?: string }
+    | undefined;
   const meta: SessionMeta = {
     ...prev,
     sessionId: newId,
-    title: `${prev.title} (fork)`,
+    title: `${(firstUser?.text || prev.title).slice(0, 60)} (fork)`,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    messageCount,
     pinned: false,
     unread: false,
     archived: false,
+    // New branch — don't inherit stale provider id (resume starts fresh)
+    providerSessionId: undefined,
   };
   writeMeta(meta);
+  invalidateSessionEventsCache(newId);
+  invalidateHistoryListCache();
   return meta;
 }

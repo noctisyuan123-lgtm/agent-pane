@@ -1,8 +1,9 @@
-import type { DomainEvent } from "@agent-pane/shared";
+import type { ContextRef, DomainEvent } from "@agent-pane/shared";
 import {
   formatToolFailed,
   formatToolFinished,
   formatToolStarted,
+  tidyToolError,
   type ToolRow,
 } from "./toolFormat";
 
@@ -13,14 +14,64 @@ export type TurnLogLine = {
 };
 
 export type ChatItem =
-  | { kind: "user"; text: string; id: string }
+  | {
+      kind: "user";
+      text: string;
+      id: string;
+      attachments?: ContextRef[];
+    }
   | { kind: "assistant"; text: string; id: string }
   /** Short pre-tool narration — muted, not a full reply bubble */
   | { kind: "status"; text: string; id: string }
   | { kind: "thought"; text: string; id: string }
   | { kind: "tools"; id: string; tools: ToolRow[] }
   /** Grok CLI-style end-of-turn step log (◆ Thought / Task / Run) */
-  | { kind: "turn_log"; id: string; lines: TurnLogLine[] };
+  | { kind: "turn_log"; id: string; lines: TurnLogLine[] }
+  /** Cursor-style turn duration for "Worked for Xs" fold */
+  | { kind: "worked"; id: string; ms: number };
+
+/** 0-based user-turn index that owns chat item at `messageIndex` (Claude Code). */
+export function userTurnIndexAt(
+  messages: ChatItem[],
+  messageIndex: number
+): number {
+  let turn = -1;
+  const end = Math.min(messageIndex, messages.length - 1);
+  for (let i = 0; i <= end; i++) {
+    if (messages[i]?.kind === "user") turn++;
+  }
+  return turn;
+}
+
+/** Drop the user bubble at `userTurnIndex` and everything after. */
+export function sliceMessagesBeforeUserTurn(
+  messages: ChatItem[],
+  userTurnIndex: number
+): ChatItem[] {
+  let turn = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]?.kind === "user") {
+      turn++;
+      if (turn === userTurnIndex) return messages.slice(0, i);
+    }
+  }
+  return messages;
+}
+
+/** Text of the user message for a given turn index. */
+export function userTextAtTurn(
+  messages: ChatItem[],
+  userTurnIndex: number
+): string | null {
+  let turn = -1;
+  for (const m of messages) {
+    if (m.kind === "user") {
+      turn++;
+      if (turn === userTurnIndex) return m.text;
+    }
+  }
+  return null;
+}
 
 function eventMs(e: { at?: string }): number {
   if (!e.at) return 0;
@@ -60,6 +111,12 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
   let thoughtStartMs = 0;
   let thoughtActive = false;
   const toolStartMs = new Map<string, number>();
+  /** Wall-clock start of current user turn (for Worked for Xs) */
+  let turnStartMs = 0;
+  /** Whether current turn already got a `worked` item (MessageDone or seal) */
+  let workedSealed = false;
+  /** Last event timestamp seen (EOF incomplete-turn seal) */
+  let lastEventMs = 0;
 
   const sealThoughtLog = (endMs: number) => {
     if (!thoughtActive) return;
@@ -75,7 +132,11 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
   const flushThought = () => {
     const t = thoughtBuf.trim();
     if (t && thoughtId) {
-      messages.push({ kind: "thought", text: t, id: thoughtId });
+      const last = messages[messages.length - 1];
+      // Avoid stacking identical thought shells from polluted / repeated streams
+      if (!(last?.kind === "thought" && last.text.trim() === t)) {
+        messages.push({ kind: "thought", text: t, id: thoughtId });
+      }
     }
     thoughtBuf = "";
   };
@@ -109,25 +170,44 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
     turnLog = [];
   };
 
+  /** Cursor-style fold duration — also for incomplete turns (no MessageDone). */
+  const sealWorked = (endMs: number) => {
+    if (workedSealed || turn < 1 || turnStartMs <= 0) return;
+    const ms = Math.max(0, endMs - turnStartMs);
+    messages.push({
+      kind: "worked",
+      id: `worked-${sid || "s"}-t${turn}`,
+      ms,
+    });
+    workedSealed = true;
+  };
+
   for (let i = 0; i < events.length; i++) {
     const event = events[i]!;
     const tag = `r${i}`;
     const at = eventMs(event);
+    if (at) lastEventMs = at;
     if (event.sessionId) sid = event.sessionId;
 
     switch (event.type) {
       case "UserMessageAppended": {
+        // Close previous turn (may lack MessageDone — still need Worked-for fold)
+        const prevEnd = at || lastEventMs || Date.now();
+        sealThoughtLog(prevEnd);
         flushThought();
         flushTools();
         flushAssistant();
         flushTurnLog();
+        if (turn >= 1) sealWorked(prevEnd);
         postToolsId = null;
         turnDone = false;
+        workedSealed = false;
         turn += 1;
         turnLog = [];
         thoughtActive = false;
         thoughtStartMs = 0;
         toolStartMs.clear();
+        turnStartMs = at || Date.now();
         assistantId = `a-${event.sessionId}-t${turn}`;
         thoughtId = `t-${event.sessionId}-t${turn}`;
         toolsId = `tools-${event.sessionId}-t${turn}`;
@@ -135,6 +215,9 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
           kind: "user",
           text: event.text,
           id: `u-${event.sessionId}-t${turn}`,
+          attachments: event.attachments?.length
+            ? event.attachments
+            : undefined,
         });
         break;
       }
@@ -162,11 +245,13 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
         break;
       }
       case "MessageDone": {
-        sealThoughtLog(at || Date.now());
+        const endMs = at || Date.now();
+        sealThoughtLog(endMs);
         flushThought();
         flushTools();
         flushAssistant();
         flushTurnLog();
+        sealWorked(endMs);
         turnDone = true;
         postToolsId = null;
         break;
@@ -175,6 +260,8 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
         if (turnDone) break;
         sealThoughtLog(at || Date.now());
         flushThought();
+        // New thought id after tools — reuse would stack duplicate React keys
+        thoughtId = `t-${event.sessionId}-t${turn}-${tag}`;
         if (assistantBuf.trim()) {
           const text = assistantBuf.trim();
           const liveId = assistantId;
@@ -256,7 +343,7 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
         );
         turnLog.push({
           tone: "fail",
-          text: `Failed: ${event.error?.slice(0, 80) || "tool"}`,
+          text: `Failed: ${tidyToolError(event.error || "tool").slice(0, 120)}`,
         });
         break;
       }
@@ -264,10 +351,14 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
         break;
     }
   }
-  sealThoughtLog(Date.now());
+  // Incomplete last turn (Stop / disconnect / import cut): still emit worked
+  // so history folds process under Worked-for — never leave a naked trail.
+  const eofMs = lastEventMs || Date.now();
+  sealThoughtLog(eofMs);
   flushThought();
   flushTools();
   flushAssistant();
   flushTurnLog();
+  sealWorked(eofMs);
   return messages;
 }

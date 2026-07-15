@@ -116,6 +116,47 @@ export class EventStore {
     this.seqBySession.delete(sessionId);
   }
 
+  /**
+   * Rewrite events.jsonl. Used after rewind (drop discarded turns) and tests.
+   * Reassigns seq 1..N to keep the file tidy.
+   */
+  replaceAll(sessionId: string, events: DomainEvent[]): StoredEvent[] {
+    this.ensureSessionLoaded(sessionId);
+    const stored: StoredEvent[] = events.map((e, i) => ({
+      ...e,
+      sessionId,
+      seq: i + 1,
+    }));
+    this.memory.set(sessionId, stored);
+    this.seqBySession.set(sessionId, stored.length);
+    const p = this.eventsPath(sessionId, true);
+    const body =
+      stored.length === 0
+        ? ""
+        : stored.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    fs.writeFileSync(p, body, "utf8");
+    return stored;
+  }
+
+  /**
+   * Keep events before the Nth UserMessageAppended (0-based).
+   * Drops that user turn and everything after (Claude Code Undo).
+   */
+  truncateBeforeUserTurn(sessionId: string, userTurnIndex: number): StoredEvent[] {
+    const list = this.list(sessionId, 0);
+    let turn = -1;
+    const kept: DomainEvent[] = [];
+    for (const e of list) {
+      if (e.type === "SessionRewound") continue;
+      if (e.type === "UserMessageAppended") {
+        turn++;
+        if (turn === userTurnIndex) break;
+      }
+      kept.push(e);
+    }
+    return this.replaceAll(sessionId, kept);
+  }
+
   listSessions(): string[] {
     if (!fs.existsSync(this.root)) return [];
     return fs
