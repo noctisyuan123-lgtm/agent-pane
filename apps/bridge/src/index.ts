@@ -105,8 +105,31 @@ wss.on("connection", (ws, req) => {
 });
 
 server.listen(PORT, HOST, () => {
+  const provider = (process.env.AGENT_PANE_PROVIDER ?? "stdio").toLowerCase();
   console.log(`[agent-pane] bridge ws://${HOST}:${PORT}`);
   console.log(`[agent-pane] terminal ws://${HOST}:${PORT}/terminal`);
   console.log(`[agent-pane] health http://${HOST}:${PORT}/health`);
   console.log(`[agent-pane] folder-pick POST http://${HOST}:${PORT}/api/folder-pick`);
+  console.log(`[agent-pane] provider=${provider}`);
 });
+
+async function shutdownDaemon(): Promise<void> {
+  try {
+    const { AcpWsHub } = await import("./acp-ws-hub.js");
+    await AcpWsHub.shared().shutdown();
+  } catch {
+    /* ignore */
+  }
+  try {
+    const { DaemonSupervisor } = await import("./daemon-supervisor.js");
+    await DaemonSupervisor.shared().shutdown();
+  } catch {
+    /* ignore */
+  }
+}
+
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => {
+    void shutdownDaemon().finally(() => process.exit(0));
+  });
+}

@@ -1,29 +1,20 @@
 /**
- * ACP JSON-RPC over child process stdio.
+ * ACP JSON-RPC over child process stdio (NDJSON lines).
  * Owns framing only — no Grok extensions, no DomainEvent mapping.
  */
 import type { ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
+import type {
+  AcpHandlers,
+  AcpTransport,
+  JsonRpcMsg,
+} from "./acp-transport.js";
 
-export type JsonRpcMsg = {
-  jsonrpc?: string;
-  id?: number | string;
-  method?: string;
-  params?: unknown;
-  result?: unknown;
-  error?: unknown;
-};
+/** @deprecated Prefer AcpHandlers from acp-transport.js */
+export type AcpStdioHandlers = AcpHandlers;
+export type { JsonRpcMsg };
 
-export type AcpStdioHandlers = {
-  onRequest: (
-    id: number | string,
-    method: string,
-    params: unknown
-  ) => void | Promise<void>;
-  onNotification: (method: string, params: unknown) => void;
-};
-
-export class AcpStdioTransport {
+export class AcpStdioTransport implements AcpTransport {
   private proc: ChildProcess | null = null;
   private rl: readline.Interface | null = null;
   private nextId = 1;
@@ -32,9 +23,9 @@ export class AcpStdioTransport {
     { resolve: (v: unknown) => void; reject: (e: Error) => void }
   >();
   private closed = false;
-  private handlers: AcpStdioHandlers | null = null;
+  private handlers: AcpHandlers | null = null;
 
-  attach(proc: ChildProcess, handlers: AcpStdioHandlers): void {
+  attach(proc: ChildProcess, handlers: AcpHandlers): void {
     this.detach();
     this.closed = false;
     this.proc = proc;
@@ -44,7 +35,7 @@ export class AcpStdioTransport {
   }
 
   /** Replace handlers without rebinding the process (e.g. after reassignment). */
-  setHandlers(handlers: AcpStdioHandlers): void {
+  setHandlers(handlers: AcpHandlers): void {
     this.handlers = handlers;
   }
 
@@ -98,6 +89,10 @@ export class AcpStdioTransport {
     });
   }
 
+  notify(method: string, params?: unknown): void {
+    this.write({ jsonrpc: "2.0", method, params });
+  }
+
   reply(id: number | string, result: unknown): void {
     this.write({ jsonrpc: "2.0", id, result });
   }
@@ -140,6 +135,11 @@ export class AcpStdioTransport {
   }
 
   /** Fail all pending RPCs and stop reading lines (does not kill the process). */
+  close(): void {
+    this.detach();
+  }
+
+  /** @deprecated use close() */
   detach(): void {
     this.closed = true;
     try {
@@ -154,6 +154,11 @@ export class AcpStdioTransport {
     this.pending.clear();
     this.proc = null;
     this.handlers = null;
+  }
+
+  /** Kill child + close. */
+  dispose(): void {
+    this.kill();
   }
 
   /** Kill child + detach. */

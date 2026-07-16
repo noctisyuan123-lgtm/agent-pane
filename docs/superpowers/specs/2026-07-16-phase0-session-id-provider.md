@@ -147,7 +147,7 @@ Do **not** mix glass UI polish into these PRs.
 | `GrokAcpAdapter` composes transport | **done** |
 | `createAgentProvider()` env switch (`stdio` default; `serve` reserved) | **done** |
 | README Grok CLI pin 0.2.101 | **done** |
-| Full `DaemonAcpProvider` WebSocket client for `grok agent serve` | **not wired** (factory throws clear error; next wave when multi-session cold-start hurts) |
+| Full `DaemonAcpProvider` WebSocket client for `grok agent serve` | **wired** (2026-07-16) — `GrokAcpAdapter` `transportMode: "serve"` + `DaemonSupervisor` + `AcpWsTransport`; plan: [`2026-07-16-wave4-grok-agent-serve.md`](./2026-07-16-wave4-grok-agent-serve.md) |
 
 ---
 

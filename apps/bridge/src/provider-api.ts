@@ -8,6 +8,7 @@ import type { ContextRef, DomainEvent } from "@agent-pane/shared";
  * - Undo/rewind product semantics are Host-owned; provider assist is best-effort.
  *
  * @see docs/superpowers/specs/2026-07-16-phase0-session-id-provider.md
+ * @see docs/superpowers/specs/2026-07-16-wave4-grok-agent-serve.md
  */
 export type AgentStartOpts = {
   cwd: string;
@@ -111,12 +112,28 @@ export async function createGrokAcpProvider(opts?: {
   return new GrokAcpAdapter(opts);
 }
 
+/** WebSocket ACP provider against `grok agent serve` (DaemonSupervisor). */
+export async function createGrokServeProvider(opts?: {
+  grokBin?: string;
+  autoApprove?: boolean;
+}): Promise<AgentProvider> {
+  // Fail fast if daemon cannot be brought up (enables FALLBACK_STDIO).
+  const { DaemonSupervisor } = await import("./daemon-supervisor.js");
+  await DaemonSupervisor.shared().ensure();
+  const { GrokAcpAdapter } = await import("./grok-acp-adapter.js");
+  return new GrokAcpAdapter({
+    ...opts,
+    transportMode: "serve",
+  });
+}
+
 /**
  * Host entry: pick provider by env.
- * - `stdio` (default): spawn `grok agent … stdio` (current)
- * - `serve`: reserved for `grok agent serve` WebSocket ACP (not wired yet)
+ * - `stdio` (default): spawn `grok agent … stdio`
+ * - `serve` / `daemon`: `grok agent serve` WebSocket ACP
  *
  * Prefer out-of-process always; never embed Core by default.
+ * On serve failure, optional `AGENT_PANE_SERVE_FALLBACK_STDIO=1` falls back.
  */
 export async function createAgentProvider(opts?: {
   grokBin?: string;
@@ -124,11 +141,22 @@ export async function createAgentProvider(opts?: {
 }): Promise<AgentProvider> {
   const mode = (process.env.AGENT_PANE_PROVIDER ?? "stdio").toLowerCase();
   if (mode === "serve" || mode === "daemon") {
-    throw new Error(
-      "AGENT_PANE_PROVIDER=serve is reserved for grok agent serve " +
-        "(localhost WebSocket ACP). Not wired yet — use stdio (default). " +
-        "See docs/superpowers/specs/2026-07-16-phase0-session-id-provider.md §2.4"
-    );
+    try {
+      return await createGrokServeProvider(opts);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (process.env.AGENT_PANE_SERVE_FALLBACK_STDIO === "1") {
+        console.warn(
+          `[provider] serve failed (${msg}) — falling back to stdio`
+        );
+        return createGrokAcpProvider(opts);
+      }
+      throw new Error(
+        `AGENT_PANE_PROVIDER=serve failed: ${msg}. ` +
+          `Fix serve setup or set AGENT_PANE_SERVE_FALLBACK_STDIO=1. ` +
+          `See docs/superpowers/specs/2026-07-16-wave4-grok-agent-serve.md`
+      );
+    }
   }
   return createGrokAcpProvider(opts);
 }

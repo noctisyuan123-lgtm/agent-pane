@@ -133,6 +133,11 @@ fn start_bridge(app: &tauri::AppHandle) -> Result<(), String> {
     cmd.arg(&script)
         .env("AGENT_PANE_PORT", "8787")
         .env("AGENT_PANE_HOST", "127.0.0.1")
+        // Wave 4: shared `grok agent serve` (override with AGENT_PANE_PROVIDER=stdio)
+        .env(
+            "AGENT_PANE_PROVIDER",
+            std::env::var("AGENT_PANE_PROVIDER").unwrap_or_else(|_| "serve".into()),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 

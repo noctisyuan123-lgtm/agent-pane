@@ -311,3 +311,4 @@ Thinning the adapter **increases** dependence on upstream behavior. Without a pi
 | 1 | Initial working notes |
 | 2 | Fable5 review: Provider already exists; session ID first; embed last; upstream pin; undo/rewind special-case watch |
 | 3 | Wave 1–3 code: session-id truth, AgentProvider Host contract, Host-owned turns, `acp-stdio-transport` + `acp-text` extract, `createAgentProvider` factory, README grok pin 0.2.101 |
+| 4 | Wave 4 **code**: `AcpTransport` + `AcpWsTransport` + `DaemonSupervisor` + `GrokAcpAdapter(transportMode:serve)` + factory; plan [`wave4-grok-agent-serve.md`](./superpowers/specs/2026-07-16-wave4-grok-agent-serve.md) |

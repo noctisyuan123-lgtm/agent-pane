@@ -6,7 +6,12 @@ import { execFile } from "node:child_process";
 import type { ContextRef, DomainEvent } from "@agent-pane/shared";
 import { nowIso } from "@agent-pane/shared";
 import type { AgentProvider } from "./provider-api.js";
+import type { AcpTransport } from "./acp-transport.js";
 import { AcpStdioTransport } from "./acp-stdio-transport.js";
+import {
+  AcpWsHub,
+  type SessionTransportView,
+} from "./acp-ws-hub.js";
 import {
   mapTaskStatus,
   numField,
@@ -41,15 +46,18 @@ type AcpTerminal = {
   byteLimit: number;
 };
 
+export type GrokAcpTransportMode = "stdio" | "serve";
+
 /**
- * Grok ACP adapter — Grok packaging + DomainEvent mapping over stdio transport.
+ * Grok ACP adapter — Grok packaging + DomainEvent mapping over ACP transport
+ * (`stdio` child or WebSocket to `grok agent serve`).
  * CRITICAL: when we advertise fs/terminal capabilities, we MUST answer
  * agent→client requests (fs/read_text_file, session/request_permission, …)
  * or the tool loop hangs forever.
  */
 export class GrokAcpAdapter implements AgentProvider {
-  readonly id = "grok-acp";
-  private readonly transport = new AcpStdioTransport();
+  readonly id: string;
+  private transport: AcpTransport | null = null;
   private handlers: Array<(e: DomainEvent) => void> = [];
   private domainSessionId = "";
   private providerSessionId = "";
@@ -59,6 +67,9 @@ export class GrokAcpAdapter implements AgentProvider {
   private grokBin: string;
   private closed = false;
   private autoApprove: boolean;
+  private readonly transportMode: GrokAcpTransportMode;
+  /** Serve mode: shared hub view (one WS for all live sessions). */
+  private serveView: SessionTransportView | null = null;
   private pendingPermissions = new Map<
     string,
     { rpcId: number | string; options: Array<{ optionId: string; kind?: string }> }
@@ -80,7 +91,12 @@ export class GrokAcpAdapter implements AgentProvider {
   /** ACP terminal/create sessions */
   private terminals = new Map<string, AcpTerminal>();
 
-  constructor(opts?: { grokBin?: string; autoApprove?: boolean }) {
+  constructor(opts?: {
+    grokBin?: string;
+    autoApprove?: boolean;
+    /** `stdio` (default) or `serve` (`grok agent serve` WS). */
+    transportMode?: GrokAcpTransportMode;
+  }) {
     this.grokBin =
       opts?.grokBin ??
       process.env.GROK_BIN ??
@@ -88,6 +104,9 @@ export class GrokAcpAdapter implements AgentProvider {
     this.autoApprove =
       opts?.autoApprove ??
       process.env.AGENT_PANE_PERMISSION !== "ask";
+    this.transportMode = opts?.transportMode ?? "stdio";
+    this.id =
+      this.transportMode === "serve" ? "grok-acp-serve" : "grok-acp";
   }
 
   onEvent(handler: (e: DomainEvent) => void): void {
@@ -98,9 +117,9 @@ export class GrokAcpAdapter implements AgentProvider {
     this.deadHandlers.push(handler);
   }
 
-  /** Child still running and stdin open. */
+  /** Transport still open (stdio child or WS). */
   isAlive(): boolean {
-    return !this.closed && this.transport.isAlive();
+    return !this.closed && Boolean(this.transport?.isAlive());
   }
 
   private emit(event: DomainEvent): void {
@@ -113,33 +132,77 @@ export class GrokAcpAdapter implements AgentProvider {
     }
   }
 
-  private write(obj: unknown): void {
-    this.transport.write(obj);
-  }
-
   private send(
     method: string,
     params?: unknown,
     timeoutMs = 120_000
   ): Promise<unknown> {
+    if (!this.transport) {
+      return Promise.reject(new Error("Agent not started"));
+    }
     return this.transport.send(method, params, timeoutMs);
   }
 
   private reply(id: number | string, result: unknown): void {
-    this.transport.reply(id, result);
+    this.transport?.reply(id, result);
   }
 
   private replyError(id: number | string, message: string, code = -32000): void {
-    this.transport.replyError(id, message, code);
+    this.transport?.replyError(id, message, code);
   }
 
-  private attachTransport(proc: ChildProcess): void {
-    this.transport.attach(proc, {
+  private bindHandlers(): {
+    onRequest: (
+      id: number | string,
+      method: string,
+      params: unknown
+    ) => void | Promise<void>;
+    onNotification: (method: string, params: unknown) => void;
+    onClose: (reason?: string) => void;
+  } {
+    return {
       onRequest: (id, method, params) =>
         this.handleServerRequest(id, method, params),
       onNotification: (method, params) =>
         this.handleNotification(method, params),
+      onClose: (reason) => this.onTransportClosed(reason),
+    };
+  }
+
+  private onTransportClosed(reason?: string): void {
+    if (this.closed) return;
+    this.transport = null;
+    this.stopSignalsWatcher();
+    const msg =
+      reason?.trim() ||
+      (this.transportMode === "serve"
+        ? "grok agent serve connection lost — send again to resume"
+        : "grok agent exited — send again to resume");
+    this.emit({
+      type: "SessionError",
+      sessionId: this.domainSessionId,
+      message: msg,
+      at: nowIso(),
     });
+    this.emit({
+      type: "SessionEnded",
+      sessionId: this.domainSessionId,
+      stopReason: "transport_closed",
+      at: nowIso(),
+    });
+    for (const h of this.deadHandlers) {
+      try {
+        h(this.domainSessionId);
+      } catch (e) {
+        console.error("[adapter] onDead error", e);
+      }
+    }
+  }
+
+  private attachStdio(proc: ChildProcess): void {
+    const stdio = new AcpStdioTransport();
+    stdio.attach(proc, this.bindHandlers());
+    this.transport = stdio;
   }
 
   private async handleServerRequest(
@@ -150,6 +213,18 @@ export class GrokAcpAdapter implements AgentProvider {
     const p = (params ?? {}) as Record<string, unknown>;
 
     try {
+      // Permission / session-scoped agent→client RPCs must not be answered by
+      // the wrong live session when serve fans out to every WS.
+      if (
+        method === "session/request_permission" ||
+        method.endsWith("/request_permission")
+      ) {
+        if (this.isForeignProviderSession(p)) {
+          // Another client owns this session — do not reply (owner will).
+          return;
+        }
+      }
+
       if (method === "fs/read_text_file") {
         const filePath = String(p.path ?? "");
         const content = this.readTextFile(
@@ -614,10 +689,30 @@ export class GrokAcpAdapter implements AgentProvider {
     return id;
   }
 
+  /**
+   * Serve mode: daemon may fan out ACP traffic to every WS client.
+   * Drop notifications/RPCs that name a *different* provider session.
+   * Missing sessionId → accept (stdio / legacy shapes; permission must not hang).
+   * Before we own a providerSessionId, any *named* foreign id is dropped.
+   */
+  private isForeignProviderSession(params: Record<string, unknown>): boolean {
+    const nested = params.update as Record<string, unknown> | undefined;
+    const wire = String(
+      params.sessionId ?? nested?.sessionId ?? ""
+    ).trim();
+    if (!wire) return false;
+    if (!this.providerSessionId) return true;
+    return wire !== this.providerSessionId;
+  }
+
   private handleNotification(method: string, params: unknown): void {
     const p = (params ?? {}) as Record<string, unknown>;
 
     if (method === "session/update") {
+      // CRITICAL multi-session demux (esp. `grok agent serve`):
+      // params.sessionId is the Core handle; without this filter, B's WS
+      // paints A's tool stream (observed: sleep 30 leaked into "hello").
+      if (this.isForeignProviderSession(p)) return;
       const update = (p.update ?? p) as Record<string, unknown>;
       this.mapSessionUpdate(update);
       return;
@@ -640,9 +735,7 @@ export class GrokAcpAdapter implements AgentProvider {
 
     // Prompt queue (shows while compact / queued)
     if (method === "_x.ai/queue/changed" || method === "x.ai/queue/changed") {
-      if (String(p.sessionId ?? "") && String(p.sessionId) !== this.providerSessionId) {
-        return;
-      }
+      if (this.isForeignProviderSession(p)) return;
       const entries = (p.entries as Array<{ kind?: string; text?: string }>) ?? [];
       const running = p.runningPromptId ? String(p.runningPromptId) : "";
       const head = entries[0];
@@ -661,6 +754,7 @@ export class GrokAcpAdapter implements AgentProvider {
 
     // xAI extension notifications
     if (method === "_x.ai/session_notification" || method === "x.ai/session_notification") {
+      if (this.isForeignProviderSession(p)) return;
       const update = (p.update ?? p) as Record<string, unknown>;
       const kind = String(update.sessionUpdate ?? "");
       if (kind === "tool_call_delta_chunk") {
@@ -727,6 +821,16 @@ export class GrokAcpAdapter implements AgentProvider {
       } else if (kind === "session_summary_generated") {
         // ignore for activity strip
       }
+      return;
+    }
+
+    // Other notifications that name a session — ignore foreign in serve mode
+    if (
+      this.transportMode === "serve" &&
+      p.sessionId != null &&
+      this.isForeignProviderSession(p)
+    ) {
+      return;
     }
   }
 
@@ -936,67 +1040,11 @@ export class GrokAcpAdapter implements AgentProvider {
       this.autoApprove = true;
     }
 
-    const agentArgs = ["agent"];
-    if (opts.model) agentArgs.push("--model", opts.model);
-    if (opts.effort) agentArgs.push("--effort", opts.effort);
-    if (this.autoApprove) agentArgs.push("--always-approve");
-    agentArgs.push("stdio");
-
-    const proc = spawn(this.grokBin, agentArgs, {
-      cwd: opts.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      // Inherit bridge PATH (already augmented at boot); re-apply in case env was stripped.
-      env: withHealthyEnv(process.env),
-    });
-
-    proc.stderr?.on("data", (buf: Buffer) => {
-      const line = buf.toString();
-      try {
-        const logDir = path.join(
-          process.env.HOME || "/tmp",
-          ".agent-pane"
-        );
-        fs.mkdirSync(logDir, { recursive: true });
-        fs.appendFileSync(
-          path.join(logDir, "grok-stderr.log"),
-          `[${new Date().toISOString()}] ${line.slice(0, 2000)}`
-        );
-      } catch {
-        /* ignore */
-      }
-      if (process.env.AGENT_PANE_DEBUG) {
-        console.error("[grok stderr]", line.slice(0, 500));
-      }
-    });
-
-    this.attachTransport(proc);
-
-    proc.on("exit", (code) => {
-      const unexpected = !this.closed;
-      this.transport.detach();
-      this.stopSignalsWatcher();
-      if (unexpected) {
-        this.emit({
-          type: "SessionError",
-          sessionId: this.domainSessionId,
-          message: `grok agent exited (${code}) — send again to resume`,
-          at: nowIso(),
-        });
-        this.emit({
-          type: "SessionEnded",
-          sessionId: this.domainSessionId,
-          stopReason: `exited:${code ?? "?"}`,
-          at: nowIso(),
-        });
-        for (const h of this.deadHandlers) {
-          try {
-            h(this.domainSessionId);
-          } catch (e) {
-            console.error("[adapter] onDead error", e);
-          }
-        }
-      }
-    });
+    if (this.transportMode === "serve") {
+      await this.openServeTransport();
+    } else {
+      this.openStdioTransport(opts);
+    }
 
     const init = (await this.send("initialize", {
       protocolVersion: 1,
@@ -1099,6 +1147,10 @@ export class GrokAcpAdapter implements AgentProvider {
     }
     this.emitActivity(null);
     this.providerSessionId = result.sessionId ?? randomUUID();
+    // Serve: bind provider id so hub demux routes this session's stream here
+    if (this.serveView) {
+      this.serveView.attachProviderSession(this.providerSessionId);
+    }
     this.startSignalsWatcher();
 
     // NOTE: do NOT emit SessionStarted here. SessionManager must register
@@ -1300,10 +1352,8 @@ export class GrokAcpAdapter implements AgentProvider {
 
     // 关键：notification，不要 id，不要 await 响应
     if (this.providerSessionId) {
-      this.write({
-        jsonrpc: "2.0",
-        method: "session/cancel",
-        params: { sessionId: this.providerSessionId },
+      this.transport?.notify("session/cancel", {
+        sessionId: this.providerSessionId,
       });
     }
 
@@ -1583,7 +1633,13 @@ export class GrokAcpAdapter implements AgentProvider {
       }
     }
     this.terminals.clear();
-    this.transport.kill();
+    try {
+      this.transport?.dispose();
+    } catch {
+      /* ignore */
+    }
+    this.transport = null;
+    this.serveView = null;
     if (this.domainSessionId) {
       this.emit({
         type: "SessionEnded",
@@ -1592,5 +1648,91 @@ export class GrokAcpAdapter implements AgentProvider {
         at: nowIso(),
       });
     }
+  }
+
+  /** Spawn `grok agent … stdio` and attach NDJSON transport. */
+  private openStdioTransport(opts: {
+    cwd: string;
+    model?: string;
+    effort?: string;
+  }): void {
+    const agentArgs = ["agent"];
+    if (opts.model) agentArgs.push("--model", opts.model);
+    if (opts.effort) agentArgs.push("--effort", opts.effort);
+    if (this.autoApprove) agentArgs.push("--always-approve");
+    agentArgs.push("stdio");
+
+    const proc = spawn(this.grokBin, agentArgs, {
+      cwd: opts.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: withHealthyEnv(process.env),
+    });
+
+    proc.stderr?.on("data", (buf: Buffer) => {
+      const line = buf.toString();
+      try {
+        const logDir = path.join(process.env.HOME || "/tmp", ".agent-pane");
+        fs.mkdirSync(logDir, { recursive: true });
+        fs.appendFileSync(
+          path.join(logDir, "grok-stderr.log"),
+          `[${new Date().toISOString()}] ${line.slice(0, 2000)}`
+        );
+      } catch {
+        /* ignore */
+      }
+      if (process.env.AGENT_PANE_DEBUG) {
+        console.error("[grok stderr]", line.slice(0, 500));
+      }
+    });
+
+    this.attachStdio(proc);
+
+    proc.on("exit", (code) => {
+      const unexpected = !this.closed;
+      try {
+        this.transport?.close();
+      } catch {
+        /* ignore */
+      }
+      this.transport = null;
+      this.stopSignalsWatcher();
+      if (unexpected) {
+        this.emit({
+          type: "SessionError",
+          sessionId: this.domainSessionId,
+          message: `grok agent exited (${code}) — send again to resume`,
+          at: nowIso(),
+        });
+        this.emit({
+          type: "SessionEnded",
+          sessionId: this.domainSessionId,
+          stopReason: `exited:${code ?? "?"}`,
+          at: nowIso(),
+        });
+        for (const h of this.deadHandlers) {
+          try {
+            h(this.domainSessionId);
+          } catch (e) {
+            console.error("[adapter] onDead error", e);
+          }
+        }
+      }
+    });
+  }
+
+  /**
+   * Ensure `grok agent serve` is up and attach a **shared** WS hub view.
+   *
+   * Multi-WS (one socket per Pane session) was verified to break concurrency on
+   * 0.2.101: updates only reach one client and the other session/prompt hangs.
+   * One connection + sessionId demux is required.
+   */
+  private async openServeTransport(): Promise<void> {
+    const hub = AcpWsHub.shared();
+    await hub.ensureReady();
+    const view = hub.openView({ domainSessionId: this.domainSessionId });
+    view.setHandlers(this.bindHandlers());
+    this.serveView = view;
+    this.transport = view;
   }
 }
