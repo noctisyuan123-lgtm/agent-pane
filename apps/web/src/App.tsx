@@ -2176,36 +2176,33 @@ export function App() {
         aria-hidden
         onMouseDown={startWindowDrag}
       />
-      {/* Web 预览：假红绿灯，用来对折叠键高度（桌面有真灯会隐藏） */}
-      <div className="traffic-lights-mock" aria-hidden>
+      {/* Web 假灯（桌面用系统灯，此节点 CSS 隐藏）— 与键坐标解耦 */}
+      <div className="traffic-lights-slot" aria-hidden>
         <i />
         <i />
         <i />
       </div>
-      <button
-        type="button"
-        className="sidebar-toggle"
-        title={sidebarCollapsed ? "Show sidebar" : "Collapse sidebar"}
-        aria-label={sidebarCollapsed ? "Show sidebar" : "Collapse sidebar"}
-        aria-pressed={!sidebarCollapsed}
-        onClick={() => setSidebarCollapsed((v) => !v)}
-        style={{
-          // 比灯略大、中线对齐；再往右一点（与 CSS 变量一致）
-          top: 17, // 20 + 12/2 - 18/2
-          left: 86,
-          height: 18,
-          width: 18,
-        }}
-      >
-        <IconSidebar size={16} />
-      </button>
+      {/* 折叠键：独立 --sidebar-toggle-top，不跟 lights-y 绑死 */}
+      <div className="title-chrome">
+        <button
+          type="button"
+          className="sidebar-toggle"
+          title={sidebarCollapsed ? "Show sidebar" : "Collapse sidebar"}
+          aria-label={sidebarCollapsed ? "Show sidebar" : "Collapse sidebar"}
+          aria-pressed={!sidebarCollapsed}
+          onClick={() => setSidebarCollapsed((v) => !v)}
+        >
+          <IconSidebar size={16} />
+        </button>
+      </div>
       <div
         className={`sidebar-rail${sidebarCollapsed ? " collapsed" : ""}`}
         aria-hidden={sidebarCollapsed}
       >
       <aside
         className="sidebar"
-        style={sidebarCollapsed ? undefined : { width: sidebarW }}
+        /* 收起也保持宽度，由 rail overflow 水平裁切 → 滑出感 */
+        style={{ width: sidebarW }}
       >
         <button
           type="button"

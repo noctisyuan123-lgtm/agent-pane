@@ -29,7 +29,7 @@
         "acceptFirstMouse": true,
         "trafficLightPosition": {
           "x": 24,
-          "y": 20
+          "y": 28
         },
         "shadow": true
       }

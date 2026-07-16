@@ -27,15 +27,22 @@
   --sidebar-bubble-gap-right: 8px;
   --sidebar-bubble-radius: 16px;
   /*
-   * 红绿灯 / 折叠键共用坐标（与 tauri trafficLightPosition 对齐）。
-   * 折叠键 top 必须跟灯顶一致；之前中线算法在 WebView 里对不齐。
+   * 灯与折叠键 **坐标解耦**（以前绑在 lights-y 上，灯一挪键跟着走，像锁死）。
+   * 灯：仅 tauri trafficLightPosition + 假灯 slot
+   * 键：独立 --sidebar-toggle-top / left
    */
   --sidebar-lights-x: 24px;
-  --sidebar-lights-y: 20px;
+  --sidebar-lights-y: 28px;
   --sidebar-lights-size: 12px;
-  /* 折叠键比灯略大，垂直仍以灯带中线对齐；再往右一点 */
-  --sidebar-toggle-left: 86px;
+  --sidebar-lights-cluster-w: 54px;
   --sidebar-toggle-size: 18px;
+  --sidebar-toggle-gap: 12px;
+  /* 键独立 top：与灯中心对齐（灯顶 28 + 半高 6 − 键半高 9 = 25；桌面再单独拧） */
+  --sidebar-toggle-top: 25px;
+  --sidebar-toggle-left: calc(
+    var(--sidebar-lights-x) + var(--sidebar-lights-cluster-w) +
+      var(--sidebar-toggle-gap)
+  );
   /* 不要径向 vignette：WebView/8-bit 会 banding 出「深浅相接光环」 */
   --bg-glow: none;
   /* elevated / composer / bubble ≈ regularMaterial 半透明 */
@@ -170,22 +177,77 @@ a {
   app-region: drag;
 }
 
+/* Web 假灯：单独绝对定位在 lights-y（桌面隐藏，用系统灯） */
+.traffic-lights-slot {
+  display: none;
+  position: absolute;
+  top: var(--sidebar-lights-y);
+  left: var(--sidebar-lights-x);
+  z-index: 80;
+  width: var(--sidebar-lights-cluster-w);
+  height: var(--sidebar-lights-size);
+  align-items: center;
+  justify-content: space-between;
+  pointer-events: none;
+}
+html.no-vibrancy .traffic-lights-slot,
+body.web-preview .traffic-lights-slot {
+  display: flex;
+}
+.traffic-lights-slot i {
+  display: block;
+  width: var(--sidebar-lights-size);
+  height: var(--sidebar-lights-size);
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.traffic-lights-slot i:nth-child(1) {
+  background: #ff5f57;
+}
+.traffic-lights-slot i:nth-child(2) {
+  background: #febc2e;
+}
+.traffic-lights-slot i:nth-child(3) {
+  background: #28c840;
+}
+
 /*
- * 折叠键：与红绿灯同顶、同高、同一水平带。
- * 用 !important 压掉任何层叠；数值只来自 :root 变量。
+ * 折叠键：独立 top/left，绝不绑 lights-y。
+ * 改 --sidebar-toggle-top 就一定动（之前锁在灯上所以像没变）。
  */
+.title-chrome {
+  position: absolute;
+  top: var(--sidebar-toggle-top);
+  left: var(--sidebar-toggle-left);
+  z-index: 80;
+  height: var(--sidebar-toggle-size);
+  display: flex;
+  align-items: center;
+  pointer-events: none;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+html.is-tauri {
+  --sidebar-lights-cluster-w: 60px;
+  /* 再往右一点，离开绿灯 */
+  --sidebar-toggle-gap: 14px;
+  /*
+   * 截图：键上边 ≈ 灯心 → 偏下约半个图标。
+   * 20 太低、14 曾偏高 → 取中 17，键心尽量贴灯心。
+   */
+  --sidebar-toggle-top: 17px;
+}
+
 .sidebar-toggle {
-  position: absolute !important;
-  /* 垂直：灯带中线对齐（键比灯大时顶会略上移） */
-  top: calc(
-    var(--sidebar-lights-y) + var(--sidebar-lights-size) / 2 -
-      var(--sidebar-toggle-size) / 2
-  ) !important;
-  left: var(--sidebar-toggle-left) !important;
+  position: relative !important;
+  top: auto !important;
+  left: auto !important;
   z-index: 80;
   width: var(--sidebar-toggle-size) !important;
   height: var(--sidebar-toggle-size) !important;
   min-height: 0 !important;
+  flex-shrink: 0;
   border: none;
   border-radius: 5px;
   background: transparent;
@@ -198,6 +260,7 @@ a {
   margin: 0 !important;
   line-height: 0 !important;
   box-sizing: border-box;
+  pointer-events: auto;
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
@@ -214,38 +277,6 @@ a {
   flex-shrink: 0;
 }
 
-/* Web 预览用假红绿灯，方便对高度（Tauri 里隐藏） */
-.traffic-lights-mock {
-  display: none;
-  position: absolute;
-  top: var(--sidebar-lights-y);
-  left: var(--sidebar-lights-x);
-  z-index: 80;
-  height: var(--sidebar-lights-size);
-  align-items: center;
-  gap: 8px;
-  pointer-events: none;
-}
-html.no-vibrancy .traffic-lights-mock,
-body.web-preview .traffic-lights-mock {
-  display: flex;
-}
-.traffic-lights-mock i {
-  display: block;
-  width: var(--sidebar-lights-size);
-  height: var(--sidebar-lights-size);
-  border-radius: 50%;
-}
-.traffic-lights-mock i:nth-child(1) {
-  background: #ff5f57;
-}
-.traffic-lights-mock i:nth-child(2) {
-  background: #febc2e;
-}
-.traffic-lights-mock i:nth-child(3) {
-  background: #28c840;
-}
-
 /* Sidebar controls above the drag strip */
 .sidebar > button,
 .sidebar .side-btn,
@@ -259,11 +290,12 @@ body.web-preview .traffic-lights-mock {
 }
 
 /*
- * 左侧轨道：透明洞 + overflow 裁切。
- * 气泡用 100vmax 同色 box-shadow 把「圆角外侧」填成正文底（跟 stage 连续），
- * 圆角洞是真的，不是方框 border、也不是四条渐变贴纸。
+ * 左侧轨道：纯水平收放。
+ * overflow 裁切固定宽度的气泡 → 看起来是气泡水平滑入/滑出，不淡出、不缩放、不摊成旧侧栏。
  */
 .sidebar-rail {
+  --sidebar-slide-ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --sidebar-slide-dur: 0.28s;
   position: relative;
   display: flex;
   flex-direction: column;
@@ -274,17 +306,24 @@ body.web-preview .traffic-lights-mock {
     var(--sidebar-bubble-inset) var(--sidebar-bubble-inset);
   box-sizing: border-box;
   background: transparent;
-  overflow: hidden; /* 裁住气泡外扩的 正文底 shadow，别盖到 stage */
-  transition: width 0.16s ease, min-width 0.16s ease, padding 0.16s ease,
-    opacity 0.12s ease;
+  overflow: hidden; /* 水平裁切气泡 */
+  transition:
+    width var(--sidebar-slide-dur) var(--sidebar-slide-ease),
+    min-width var(--sidebar-slide-dur) var(--sidebar-slide-ease),
+    max-width var(--sidebar-slide-dur) var(--sidebar-slide-ease),
+    padding-left var(--sidebar-slide-dur) var(--sidebar-slide-ease),
+    padding-right var(--sidebar-slide-dur) var(--sidebar-slide-ease);
 }
 
 .sidebar-rail.collapsed {
   width: 0 !important;
   min-width: 0 !important;
   max-width: 0 !important;
-  padding: 0 !important;
-  opacity: 0;
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+  /* 上下 inset 保持：裁切时仍是圆角气泡条，不是全高实心条 */
+  padding-top: var(--sidebar-bubble-inset) !important;
+  padding-bottom: var(--sidebar-bubble-inset) !important;
   pointer-events: none;
   overflow: hidden;
 }
@@ -293,9 +332,17 @@ body.web-preview .traffic-lights-mock {
   display: none;
 }
 
+/* 收起时只去掉 100vmax 外扩填色（避免阴影拖成整栏），气泡本体样式保留被裁切 */
+.sidebar-rail.collapsed .sidebar {
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.45),
+    0 8px 28px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.18);
+}
+
 /*
- * 气泡：坐在真洞里 → 薄 glass 漏壁纸。
- * 第一层 shadow 用正文底铺满圆角外（被 rail overflow 裁成左轨一圈）。
+ * 气泡：固定自身宽度不随 rail 被压扁 → 水平滑出感。
  */
 .sidebar {
   position: relative;
@@ -303,15 +350,15 @@ body.web-preview .traffic-lights-mock {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  /* 顶：给气泡内 traffic lights + toggle 留空（灯 y=20） */
-  padding: 42px 8px 12px;
+  padding: 48px 8px 12px;
   margin: 0;
   height: 100%;
   min-height: 0;
   width: var(--sidebar-w);
+  /* 不压扁：宽度由 inline/sidebarW 定，rail overflow 水平裁切 */
   min-width: 180px;
   max-width: 420px;
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   overflow: hidden;
   background-color: transparent;
   background: var(--bg-sidebar);
@@ -319,7 +366,6 @@ body.web-preview .traffic-lights-mock {
   -webkit-backdrop-filter: blur(22px) saturate(150%);
   border-radius: var(--sidebar-bubble-radius);
   border: 1px solid rgba(255, 255, 255, 0.16);
-  /* 先画的在上层：勾线在上，正文底 fill 垫在最下（仅圆角外） */
   box-shadow:
     0 0 0 1px rgba(0, 0, 0, 0.45),
     0 8px 28px rgba(0, 0, 0, 0.28),
@@ -327,8 +373,7 @@ body.web-preview .traffic-lights-mock {
     inset 0 -1px 0 rgba(0, 0, 0, 0.18),
     0 0 0 100vmax var(--bg-editor);
   font-size: var(--side-font);
-  transition: width 0.16s ease, min-width 0.16s ease, padding 0.16s ease,
-    opacity 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+  transition: box-shadow 0.12s ease;
 }
 
 /* Always leave Overlay title chrome clear of scroll content */
