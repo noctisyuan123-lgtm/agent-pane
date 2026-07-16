@@ -2890,8 +2890,31 @@ export function App() {
               })}
 
               {b.tasks.length > 0 && (
-                <div className="todos">
-                  <h3>To-dos</h3>
+                <div
+                  className={
+                    b.tasks.every(
+                      (t) =>
+                        t.status === "completed" || t.status === "cancelled"
+                    )
+                      ? "todos todos-all-done"
+                      : "todos"
+                  }
+                >
+                  <h3>
+                    To-dos
+                    {(() => {
+                      const left = b.tasks.filter(
+                        (t) =>
+                          t.status !== "completed" &&
+                          t.status !== "cancelled"
+                      ).length;
+                      if (left === 0) return " · done";
+                      if (left < b.tasks.length) {
+                        return ` · ${left} left`;
+                      }
+                      return null;
+                    })()}
+                  </h3>
                   {b.tasks.map((t) => (
                     <div key={t.id} className={`todo ${t.status}`}>
                       <div className="check" />

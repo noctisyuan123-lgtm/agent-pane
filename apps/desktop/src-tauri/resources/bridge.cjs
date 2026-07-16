@@ -5266,7 +5266,7 @@ var grok_acp_adapter_exports = {};
 __export(grok_acp_adapter_exports, {
   GrokAcpAdapter: () => GrokAcpAdapter
 });
-var import_node_child_process3, import_node_fs7, import_node_path7, import_node_crypto2, import_node_child_process4, GrokAcpAdapter;
+var import_node_child_process3, import_node_fs7, import_node_path7, import_node_crypto2, GrokAcpAdapter;
 var init_grok_acp_adapter = __esm({
   "../bridge/src/grok-acp-adapter.ts"() {
     "use strict";
@@ -5274,7 +5274,6 @@ var init_grok_acp_adapter = __esm({
     import_node_fs7 = __toESM(require("node:fs"), 1);
     import_node_path7 = __toESM(require("node:path"), 1);
     import_node_crypto2 = require("node:crypto");
-    import_node_child_process4 = require("node:child_process");
     init_dist();
     init_acp_stdio_transport();
     init_acp_ws_hub();
@@ -5312,8 +5311,10 @@ var init_grok_acp_adapter = __esm({
       absorbUpdates = false;
       /** Resume digest preamble for first prompt after session/new. */
       contextPrefix = null;
-      /** ACP terminal/create sessions */
+      /** ACP terminal/create sessions — scoped to THIS Pane session only */
       terminals = /* @__PURE__ */ new Map();
+      /** In-flight tool_call ids (for cancel → ToolFailed UI) */
+      activeTools = /* @__PURE__ */ new Map();
       constructor(opts) {
         this.grokBin = opts?.grokBin ?? process.env.GROK_BIN ?? `${process.env.HOME}/.grok/bin/grok`;
         this.autoApprove = opts?.autoApprove ?? process.env.AGENT_PANE_PERMISSION !== "ask";
@@ -5523,7 +5524,7 @@ var init_grok_acp_adapter = __esm({
             if (url) {
               this.emitActivity("Grok login \u2014 browser opened\u2026", "working");
               try {
-                (0, import_node_child_process4.execFile)("open", [url], () => void 0);
+                (0, import_node_child_process3.execFile)("open", [url], () => void 0);
               } catch (e) {
                 console.warn("[adapter] open auth url failed", e);
               }
@@ -5900,6 +5901,7 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
             const toolId = String(update.toolCallId ?? update.id ?? (0, import_node_crypto2.randomUUID)());
             const title = String(update.title ?? update.kind ?? "tool");
             const toolKind = String(update.kind ?? "other");
+            this.activeTools.set(toolId, title);
             this.emit({
               type: "ToolStarted",
               sessionId: sid,
@@ -5921,6 +5923,7 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
             const title = update.title != null ? String(update.title) : void 0;
             const detail = summarize(update.content ?? update.rawOutput ?? update.output) || title || summarize(update);
             if (status === "failed" || status === "error") {
+              this.activeTools.delete(toolId);
               this.emit({
                 type: "ToolFailed",
                 sessionId: sid,
@@ -5929,6 +5932,7 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
                 at
               });
             } else if (status === "completed" || status === "success") {
+              this.activeTools.delete(toolId);
               this.emit({
                 type: "ToolFinished",
                 sessionId: sid,
@@ -6232,12 +6236,104 @@ ${input.text}`;
         }
       }
       /**
-       * 取消当前 turn。
-       * ACP 规定 session/cancel 是 **notification（无 id）**，
-       * 若带 id 当 request 发，Grok 会回 Method not found，生成不会停。
+       * Kill every ACP terminal process tree owned by THIS adapter (this Pane
+       * session). Other live sessions have their own adapter.terminals maps.
+       */
+      killSessionProcessTree(signal = "SIGTERM") {
+        let killed = 0;
+        for (const term of this.terminals.values()) {
+          if (term.exited) continue;
+          const pid = term.proc.pid;
+          if (pid && pid > 0) {
+            this.killPidTree(pid, signal);
+            killed++;
+          } else {
+            try {
+              term.proc.kill(signal);
+              killed++;
+            } catch {
+            }
+          }
+          term.exited = true;
+          term.signal = signal;
+          term.exitCode = term.exitCode ?? 1;
+          for (const w of term.waiters.splice(0)) w();
+        }
+        return killed;
+      }
+      /** Recurse children via pgrep -P, then signal the root pid. Session-local only. */
+      killPidTree(pid, signal) {
+        if (!Number.isFinite(pid) || pid <= 0) return;
+        if (process.platform !== "win32") {
+          try {
+            const out = (0, import_node_child_process3.execFileSync)("pgrep", ["-P", String(pid)], {
+              encoding: "utf8"
+            });
+            for (const line of out.split("\n")) {
+              const child = Number(line.trim());
+              if (Number.isFinite(child) && child > 0) {
+                this.killPidTree(child, signal);
+              }
+            }
+          } catch {
+          }
+        }
+        try {
+          process.kill(pid, signal);
+        } catch {
+        }
+      }
+      /**
+       * 取消当前 turn：停模型 + 杀本 session 的脚本/终端树 + 标工具失败。
+       * 不碰其他 live session（各自独立 adapter / terminals）。
+       * ACP 规定 session/cancel 是 **notification（无 id）**。
+       *
+       * Order matters: Core cancel FIRST (stop tool loop / subagents), then hard-kill
+       * host ACP terminals. Waking wait_for_exit before Core cancel can look like
+       * "tool finished" and let the model keep talking.
        */
       async cancel(_sessionId) {
         this.turnCancelled = true;
+        const at = nowIso();
+        if (this.providerSessionId) {
+          try {
+            this.transport?.notify("session/cancel", {
+              sessionId: this.providerSessionId
+            });
+          } catch (e) {
+            console.warn(
+              `[adapter] session/cancel notify failed:`,
+              e instanceof Error ? e.message : e
+            );
+          }
+        }
+        const nTerm = this.killSessionProcessTree("SIGTERM");
+        if (nTerm > 0) {
+          const pids = [];
+          for (const term of this.terminals.values()) {
+            const pid = term.proc.pid;
+            if (pid && pid > 0) pids.push(pid);
+          }
+          setTimeout(() => {
+            for (const pid of pids) {
+              try {
+                process.kill(pid, 0);
+                this.killPidTree(pid, "SIGKILL");
+              } catch {
+              }
+            }
+          }, 600);
+        }
+        for (const [toolId, title] of this.activeTools) {
+          this.emit({
+            type: "ToolFailed",
+            sessionId: this.domainSessionId,
+            toolId,
+            error: `Interrupted by user${title ? ` (${title})` : ""}`,
+            at
+          });
+        }
+        this.activeTools.clear();
         for (const [requestId, pending] of this.pendingPermissions) {
           this.reply(pending.rpcId, { outcome: { outcome: "cancelled" } });
           this.emit({
@@ -6245,16 +6341,14 @@ ${input.text}`;
             sessionId: this.domainSessionId,
             requestId,
             allow: false,
-            at: nowIso()
+            at
           });
         }
         this.pendingPermissions.clear();
-        if (this.providerSessionId) {
-          this.transport?.notify("session/cancel", {
-            sessionId: this.providerSessionId
-          });
-        }
-        if (this.promptInFlight) {
+        const wasInFlight = this.promptInFlight;
+        this.promptInFlight = false;
+        this.emitActivity(null);
+        if (wasInFlight) {
           this.emit({
             type: "MessageDone",
             sessionId: this.domainSessionId,
@@ -6262,12 +6356,17 @@ ${input.text}`;
             at: nowIso()
           });
         }
+        console.log(
+          `[adapter] cancel session=${this.domainSessionId.slice(0, 8)} provider=${(this.providerSessionId || "").slice(0, 8)} terminalsKilled=${nTerm} wasInFlight=${wasInFlight}`
+        );
       }
       /**
        * Discard user turn `userTurnIndex` and everything after (Claude Code Undo).
-       * 1) cancel in-flight turn
-       * 2) best-effort Grok `_x.ai/rewind/*` to that prompt index
-       * 3) always emit SessionRewound so UI + event store can truncate
+       * 1) cancel only if a prompt is in flight (idle cancel injects
+       *    `[Request interrupted by user]` into Core context — never do that for Retry)
+       * 2) best-effort Grok `_x.ai/rewind/*` (verify points shrunk)
+       * 3) emit SessionRewound so Host truncates Pane log
+       * Host rebinds with digest when providerOk is false.
        */
       async rewindToUserTurn(userTurnIndex) {
         if (this.userTurns.length === 0) {
@@ -6276,72 +6375,125 @@ ${input.text}`;
         if (!Number.isFinite(userTurnIndex) || userTurnIndex < 0 || userTurnIndex >= this.userTurns.length) {
           throw new Error("Invalid turn to undo");
         }
-        await this.cancel(this.domainSessionId);
+        if (this.promptInFlight) {
+          await this.cancel(this.domainSessionId);
+        }
         const restoredText = this.userTurns[userTurnIndex];
         let providerOk = false;
         let note;
         try {
-          const pts = await this.send("_x.ai/rewind/points", {
-            sessionId: this.providerSessionId
-          });
-          const points = pts?.rewind_points ?? [];
-          if (points.length === 0) {
-            note = "UI undid the turn; Grok had no rewind point";
+          const listPoints = async () => {
+            const pts = await this.send("_x.ai/rewind/points", {
+              sessionId: this.providerSessionId
+            });
+            return pts?.rewind_points ?? [];
+          };
+          const pointsBefore = await listPoints();
+          if (pointsBefore.length === 0) {
+            note = "Grok had no rewind point \u2014 will rebind provider context";
           } else {
-            let target = points[userTurnIndex] ?? points.find((p) => {
+            let target = pointsBefore[userTurnIndex] ?? pointsBefore.find((p) => {
               const preview = (p.prompt_preview ?? "").trim();
               return preview && restoredText.trim().startsWith(preview.slice(0, 40));
             }) ?? null;
-            if (!target && points.length === this.userTurns.length) {
-              target = points[userTurnIndex] ?? null;
+            if (!target && pointsBefore.length === this.userTurns.length) {
+              target = pointsBefore[userTurnIndex] ?? null;
             }
             if (!target && userTurnIndex === this.userTurns.length - 1) {
-              target = points[points.length - 1] ?? null;
+              target = pointsBefore[pointsBefore.length - 1] ?? null;
             }
             if (!target) {
-              const offset = points.length - this.userTurns.length;
-              if (offset >= 0 && points[offset + userTurnIndex]) {
-                target = points[offset + userTurnIndex];
+              const offset = pointsBefore.length - this.userTurns.length;
+              if (offset >= 0 && pointsBefore[offset + userTurnIndex]) {
+                target = pointsBefore[offset + userTurnIndex];
               }
             }
             if (!target) {
-              note = "UI undid the turn; could not map Grok rewind point \u2014 model may still recall later messages";
+              note = "Could not map Grok rewind point \u2014 will rebind provider context";
             } else {
-              const result = await this.send("_x.ai/rewind/execute", {
-                sessionId: this.providerSessionId,
-                target_prompt_index: target.prompt_index,
-                mode: "conversation_only"
-              });
-              if (result?.success) {
-                providerOk = true;
-                note = void 0;
-              } else {
-                note = "UI undid the turn; Grok rewind not confirmed \u2014 model may still recall later messages";
+              const modes = ["all", "conversation_only"];
+              for (const mode of modes) {
                 try {
-                  await this.send("_x.ai/rewind/execute", {
+                  const result = await this.send("_x.ai/rewind/execute", {
                     sessionId: this.providerSessionId,
                     target_prompt_index: target.prompt_index,
-                    mode: "all"
+                    mode
                   });
-                } catch {
+                  const after = await listPoints();
+                  const shrunk = after.length < pointsBefore.length;
+                  const droppedTarget = !after.some(
+                    (p) => p.prompt_index === target.prompt_index
+                  );
+                  if (result?.success || shrunk || droppedTarget) {
+                    providerOk = true;
+                    note = void 0;
+                    break;
+                  }
+                  note = result?.error || `Grok rewind mode=${mode} not confirmed`;
+                } catch (e) {
+                  note = `Grok rewind mode=${mode} failed: ${e instanceof Error ? e.message : String(e)}`;
                 }
+              }
+              if (!providerOk) {
+                note = `${note ?? "Grok rewind failed"} \u2014 will rebind provider context`;
               }
             }
           }
         } catch (e) {
-          note = `UI undid the turn; Grok rewind failed: ${e instanceof Error ? e.message : String(e)}`;
+          note = `Grok rewind failed: ${e instanceof Error ? e.message : String(e)} \u2014 will rebind provider context`;
         }
         this.userTurns = this.userTurns.slice(0, userTurnIndex);
-        this.emit({
-          type: "SessionRewound",
-          sessionId: this.domainSessionId,
-          restoredText,
-          userTurnIndex,
-          providerOk,
-          note,
-          at: nowIso()
-        });
         return { restoredText, userTurnIndex, providerOk, note };
+      }
+      /**
+       * After a failed Core rewind: open a fresh provider session on the same
+       * transport and attach digest via setContextPrefix (Host). Does NOT emit
+       * SessionEnded — live Pane session stays continuous.
+       */
+      async rebindProviderSession(opts) {
+        if (this.serveView && this.providerSessionId) {
+          try {
+            const { AcpWsHub: AcpWsHub2 } = await Promise.resolve().then(() => (init_acp_ws_hub(), acp_ws_hub_exports));
+            AcpWsHub2.shared().unbindProvider(this.providerSessionId);
+          } catch {
+          }
+          this.serveView.providerSessionId = "";
+        }
+        if (this.transportMode === "stdio") {
+          try {
+            this.transport?.dispose();
+          } catch {
+          }
+          this.transport = null;
+          this.openStdioTransport({
+            cwd: opts.cwd,
+            model: opts.model ?? this.model,
+            effort: opts.effort ?? this.effort
+          });
+          await this.send("initialize", {
+            protocolVersion: 1,
+            clientCapabilities: {
+              fs: { readTextFile: true, writeTextFile: true },
+              terminal: true
+            },
+            clientInfo: { name: "agent-pane", version: "0.1.2" }
+          });
+        } else {
+          await this.openServeTransport();
+        }
+        const result = await this.send(
+          "session/new",
+          { cwd: opts.cwd || this.cwd, mcpServers: [] },
+          25e3
+        );
+        this.providerSessionId = result.sessionId ?? (0, import_node_crypto2.randomUUID)();
+        if (this.serveView) {
+          this.serveView.attachProviderSession(this.providerSessionId);
+        }
+        this.promptInFlight = false;
+        this.turnCancelled = false;
+        this.closed = false;
+        return { providerSessionId: this.providerSessionId };
       }
       /**
        * 撤回上一条用户消息 — thin wrapper around rewindToUserTurn.
@@ -7479,7 +7631,7 @@ async function createAgentProvider(opts) {
 }
 
 // ../bridge/src/workspace-snapshot.ts
-var import_node_child_process5 = require("node:child_process");
+var import_node_child_process4 = require("node:child_process");
 var import_node_fs8 = __toESM(require("node:fs"), 1);
 var import_node_path8 = __toESM(require("node:path"), 1);
 var import_node_os5 = __toESM(require("node:os"), 1);
@@ -7530,7 +7682,7 @@ function loadSnapshotFingerprints(snapshot) {
 }
 function isGitRepo(cwd) {
   try {
-    (0, import_node_child_process5.execFileSync)("git", ["rev-parse", "--is-inside-work-tree"], {
+    (0, import_node_child_process4.execFileSync)("git", ["rev-parse", "--is-inside-work-tree"], {
       cwd,
       stdio: ["ignore", "pipe", "ignore"]
     });
@@ -7540,7 +7692,7 @@ function isGitRepo(cwd) {
   }
 }
 function git(cwd, args) {
-  return (0, import_node_child_process5.execFileSync)("git", args, {
+  return (0, import_node_child_process4.execFileSync)("git", args, {
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -7676,13 +7828,13 @@ var WorkspaceSnapshotService = class {
 };
 
 // ../bridge/src/diff-engine.ts
-var import_node_child_process6 = require("node:child_process");
+var import_node_child_process5 = require("node:child_process");
 var import_node_fs9 = __toESM(require("node:fs"), 1);
 var import_node_path9 = __toESM(require("node:path"), 1);
 var import_node_crypto4 = require("node:crypto");
 function git2(cwd, args) {
   try {
-    return (0, import_node_child_process6.execFileSync)("git", args, {
+    return (0, import_node_child_process5.execFileSync)("git", args, {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
@@ -7717,7 +7869,7 @@ function fileFingerprint(cwd, relPath) {
 var DiffEngine = class {
   compute(cwd, snapshot) {
     try {
-      (0, import_node_child_process6.execFileSync)("git", ["rev-parse", "--is-inside-work-tree"], {
+      (0, import_node_child_process5.execFileSync)("git", ["rev-parse", "--is-inside-work-tree"], {
         cwd,
         stdio: ["ignore", "pipe", "ignore"]
       });
@@ -7964,6 +8116,18 @@ var SessionManager = class {
       await this.enqueueGlobal(() => this.handleCommandInner(cmd));
       return;
     }
+    if (cmd.type === "session.cancel") {
+      const live = this.live.get(cmd.sessionId);
+      if (live) {
+        void live.adapter.cancel(cmd.sessionId).catch((e) => {
+          console.warn(
+            `[session] cancel failed:`,
+            e instanceof Error ? e.message : e
+          );
+        });
+      }
+      return;
+    }
     const sid = "sessionId" in cmd && typeof cmd.sessionId === "string" ? cmd.sessionId : null;
     if (sid) {
       await this.enqueueSession(sid, () => this.handleCommandInner(cmd));
@@ -8010,7 +8174,14 @@ var SessionManager = class {
         }
         try {
           this.hydrateProviderTurns(live.adapter, cmd.sessionId);
-          await live.adapter.undoLastTurn();
+          const r = await live.adapter.undoLastTurn();
+          const texts = this.store.list(cmd.sessionId, 0).filter((e) => e.type === "UserMessageAppended");
+          await this.finishRewind(cmd.sessionId, live, {
+            restoredText: r.restoredText,
+            userTurnIndex: Math.max(0, texts.length - 1),
+            providerOk: r.providerOk,
+            note: r.note
+          });
         } catch (e) {
           this.broadcast({
             type: "error",
@@ -8027,7 +8198,8 @@ var SessionManager = class {
         }
         try {
           this.hydrateProviderTurns(live.adapter, cmd.sessionId);
-          await live.adapter.rewindToUserTurn(cmd.userTurnIndex);
+          const r = await live.adapter.rewindToUserTurn(cmd.userTurnIndex);
+          await this.finishRewind(cmd.sessionId, live, r);
         } catch (e) {
           this.broadcast({
             type: "error",
@@ -8083,6 +8255,85 @@ var SessionManager = class {
     const texts = this.store.list(sessionId, 0).filter((e) => e.type === "UserMessageAppended").map((e) => e.text ?? "");
     adapter.hydrateUserTurns(texts);
     return texts;
+  }
+  /**
+   * Truncate disk → optional Core rebind → notify UI (SessionRewound once).
+   * Order matters: UI re-prompts only after provider context is clean.
+   */
+  async finishRewind(sessionId, live, r) {
+    try {
+      this.store.truncateBeforeUserTurn(sessionId, r.userTurnIndex);
+      invalidateSessionEventsCache(sessionId);
+      const kept = this.store.list(sessionId, 0);
+      const msgCount = kept.filter((e) => e.type === "UserMessageAppended").length;
+      const prev = readMeta(sessionId);
+      if (prev) {
+        writeMeta({
+          ...prev,
+          cwd: live.cwd || prev.cwd,
+          messageCount: msgCount,
+          updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+        });
+        invalidateHistoryListCache();
+      }
+    } catch {
+    }
+    let providerOk = r.providerOk;
+    let note = r.note;
+    if (!providerOk) {
+      await this.rebindProviderAfterRewind(sessionId, live);
+      providerOk = true;
+      note = void 0;
+    }
+    this.broadcast({
+      type: "event",
+      event: {
+        type: "SessionRewound",
+        sessionId,
+        restoredText: r.restoredText,
+        userTurnIndex: r.userTurnIndex,
+        providerOk,
+        note,
+        at: nowIso(),
+        seq: 0
+      }
+    });
+  }
+  /**
+   * Core rewind failed / no points — start a clean provider session and inject
+   * a digest of the *already truncated* Pane log so Retry/Undo context matches UI.
+   */
+  async rebindProviderAfterRewind(sessionId, live) {
+    const rebind = live.adapter.rebindProviderSession;
+    if (!rebind) {
+      console.warn(
+        `[session] rebind not supported for provider ${live.adapter.id}`
+      );
+      return;
+    }
+    try {
+      const { providerSessionId } = await rebind.call(live.adapter, {
+        cwd: live.cwd,
+        model: live.model,
+        effort: live.effort
+      });
+      live.providerSessionId = providerSessionId;
+      const digest = buildHistoryDigest(sessionId, 40);
+      live.adapter.setContextPrefix(digest || null);
+      this.hydrateProviderTurns(live.adapter, sessionId);
+      console.log(
+        `[session] rebind after rewind session=${sessionId.slice(0, 8)} provider=${providerSessionId.slice(0, 8)} digestChars=${digest.length}`
+      );
+    } catch (e) {
+      console.warn(
+        `[session] rebind after rewind failed:`,
+        e instanceof Error ? e.message : e
+      );
+      this.broadcast({
+        type: "error",
+        message: `Provider rebind after undo failed: ${e instanceof Error ? e.message : String(e)}`
+      });
+    }
   }
   /**
    * History-only / dead agent rewind: truncate events + broadcast SessionRewound.
@@ -8585,7 +8836,7 @@ var SessionManager = class {
 };
 
 // ../bridge/src/http-api.ts
-var import_node_child_process7 = require("node:child_process");
+var import_node_child_process6 = require("node:child_process");
 var import_node_fs13 = __toESM(require("node:fs"), 1);
 var import_node_os9 = __toESM(require("node:os"), 1);
 var import_node_path13 = __toESM(require("node:path"), 1);
@@ -9003,7 +9254,7 @@ function defaultHookTemplate(nameBase) {
 // ../bridge/src/http-api.ts
 init_grok_signals_watcher();
 init_attachment_persist();
-var execFileAsync = (0, import_node_util.promisify)(import_node_child_process7.execFile);
+var execFileAsync = (0, import_node_util.promisify)(import_node_child_process6.execFile);
 var recentPath = import_node_path13.default.join(import_node_os9.default.homedir(), ".agent-pane", "recent.json");
 function parseSkillFrontmatter(raw) {
   const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);

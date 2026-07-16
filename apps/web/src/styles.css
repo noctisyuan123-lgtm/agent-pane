@@ -4301,6 +4301,12 @@ html.is-tauri {
   padding: 12px 14px;
   background: var(--glass);
   backdrop-filter: var(--blur);
+  transition: opacity 0.35s ease, transform 0.35s ease;
+}
+
+/* Fully completed plan — about to auto-dismiss */
+.todos.todos-all-done {
+  opacity: 0.55;
 }
 
 .todos h3 {
