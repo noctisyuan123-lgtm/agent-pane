@@ -3721,6 +3721,187 @@ var init_dist = __esm({
   }
 });
 
+// ../bridge/src/acp-stdio-transport.ts
+var readline, AcpStdioTransport;
+var init_acp_stdio_transport = __esm({
+  "../bridge/src/acp-stdio-transport.ts"() {
+    "use strict";
+    readline = __toESM(require("node:readline"), 1);
+    AcpStdioTransport = class {
+      proc = null;
+      rl = null;
+      nextId = 1;
+      pending = /* @__PURE__ */ new Map();
+      closed = false;
+      handlers = null;
+      attach(proc, handlers) {
+        this.detach();
+        this.closed = false;
+        this.proc = proc;
+        this.handlers = handlers;
+        this.rl = readline.createInterface({ input: proc.stdout });
+        this.rl.on("line", (line) => this.handleLine(line));
+      }
+      /** Replace handlers without rebinding the process (e.g. after reassignment). */
+      setHandlers(handlers) {
+        this.handlers = handlers;
+      }
+      isAlive() {
+        return Boolean(
+          this.proc && !this.closed && this.proc.exitCode === null && this.proc.killed !== true && this.proc.stdin && !this.proc.stdin.destroyed
+        );
+      }
+      get process() {
+        return this.proc;
+      }
+      write(obj) {
+        if (!this.proc?.stdin) return;
+        this.proc.stdin.write(JSON.stringify(obj) + "\n");
+      }
+      send(method, params, timeoutMs = 12e4) {
+        if (!this.proc?.stdin || this.closed) {
+          return Promise.reject(new Error("Agent not started"));
+        }
+        const id = this.nextId++;
+        this.write({ jsonrpc: "2.0", id, method, params });
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            if (!this.pending.has(id)) return;
+            this.pending.delete(id);
+            reject(new Error(`${method} timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+          this.pending.set(id, {
+            resolve: (v) => {
+              clearTimeout(timer);
+              resolve(v);
+            },
+            reject: (e) => {
+              clearTimeout(timer);
+              reject(e);
+            }
+          });
+        });
+      }
+      reply(id, result) {
+        this.write({ jsonrpc: "2.0", id, result });
+      }
+      replyError(id, message, code = -32e3) {
+        this.write({
+          jsonrpc: "2.0",
+          id,
+          error: { code, message }
+        });
+      }
+      handleLine(line) {
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (msg.id != null && msg.method == null) {
+          const p = this.pending.get(msg.id);
+          if (p) {
+            this.pending.delete(msg.id);
+            if (msg.error) p.reject(new Error(JSON.stringify(msg.error)));
+            else p.resolve(msg.result);
+          }
+          return;
+        }
+        if (msg.method) {
+          if (msg.id != null) {
+            void this.handlers?.onRequest(msg.id, msg.method, msg.params);
+          } else {
+            this.handlers?.onNotification(msg.method, msg.params);
+          }
+        }
+      }
+      /** Fail all pending RPCs and stop reading lines (does not kill the process). */
+      detach() {
+        this.closed = true;
+        try {
+          this.rl?.close();
+        } catch {
+        }
+        this.rl = null;
+        for (const [, p] of this.pending) {
+          p.reject(new Error("Agent transport closed"));
+        }
+        this.pending.clear();
+        this.proc = null;
+        this.handlers = null;
+      }
+      /** Kill child + detach. */
+      kill() {
+        try {
+          this.proc?.kill();
+        } catch {
+        }
+        this.detach();
+      }
+    };
+  }
+});
+
+// ../bridge/src/acp-text.ts
+function numField(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) {
+    return Number(v);
+  }
+  return void 0;
+}
+function unwrapAcpText(v) {
+  if (typeof v === "string") return v;
+  if (!v || typeof v !== "object") return "";
+  if (Array.isArray(v)) {
+    const parts = [];
+    for (const item of v) {
+      const t = unwrapAcpText(item);
+      if (t) parts.push(t);
+    }
+    return parts.join("\n").trim();
+  }
+  const o = v;
+  if (typeof o.text === "string" && o.text.trim()) return o.text;
+  if (o.content != null) {
+    const inner = unwrapAcpText(o.content);
+    if (inner) return inner;
+  }
+  for (const key of ["message", "error", "output", "rawOutput"]) {
+    const x = o[key];
+    if (typeof x === "string" && x.trim()) return x;
+    if (x && typeof x === "object") {
+      const inner = unwrapAcpText(x);
+      if (inner) return inner;
+    }
+  }
+  return "";
+}
+function summarize(v) {
+  if (v == null) return "";
+  if (typeof v === "string") return v.slice(0, 12e3);
+  const unwrapped = unwrapAcpText(v);
+  if (unwrapped) return unwrapped.slice(0, 12e3);
+  try {
+    return JSON.stringify(v).slice(0, 12e3);
+  } catch {
+    return String(v).slice(0, 12e3);
+  }
+}
+function mapTaskStatus(s) {
+  const x = (s ?? "pending").toLowerCase();
+  if (x.includes("progress") || x === "active") return "in_progress";
+  if (x.includes("complete") || x === "done") return "completed";
+  if (x.includes("cancel")) return "cancelled";
+  return "pending";
+}
+var init_acp_text = __esm({
+  "../bridge/src/acp-text.ts"() {
+    "use strict";
+  }
+});
+
 // ../bridge/src/grok-signals-watcher.ts
 function resolveGrokSignalsPaths(cwd, providerSessionId) {
   if (!cwd?.trim() || !providerSessionId?.trim()) return [];
@@ -4261,71 +4442,24 @@ var grok_acp_adapter_exports = {};
 __export(grok_acp_adapter_exports, {
   GrokAcpAdapter: () => GrokAcpAdapter
 });
-function summarize(v) {
-  if (v == null) return "";
-  if (typeof v === "string") return v.slice(0, 12e3);
-  const unwrapped = unwrapAcpText(v);
-  if (unwrapped) return unwrapped.slice(0, 12e3);
-  try {
-    return JSON.stringify(v).slice(0, 12e3);
-  } catch {
-    return String(v).slice(0, 12e3);
-  }
-}
-function unwrapAcpText(v) {
-  if (typeof v === "string") return v;
-  if (!v || typeof v !== "object") return "";
-  if (Array.isArray(v)) {
-    const parts = [];
-    for (const item of v) {
-      const t = unwrapAcpText(item);
-      if (t) parts.push(t);
-    }
-    return parts.join("\n").trim();
-  }
-  const o = v;
-  if (typeof o.text === "string" && o.text.trim()) return o.text;
-  if (o.content != null) {
-    const inner = unwrapAcpText(o.content);
-    if (inner) return inner;
-  }
-  for (const key of ["message", "error", "output", "rawOutput"]) {
-    const x = o[key];
-    if (typeof x === "string" && x.trim()) return x;
-    if (x && typeof x === "object") {
-      const inner = unwrapAcpText(x);
-      if (inner) return inner;
-    }
-  }
-  return "";
-}
-function mapTaskStatus(s) {
-  const x = (s ?? "pending").toLowerCase();
-  if (x.includes("progress") || x === "active") return "in_progress";
-  if (x.includes("complete") || x === "done") return "completed";
-  if (x.includes("cancel")) return "cancelled";
-  return "pending";
-}
-var import_node_child_process2, readline, import_node_fs6, import_node_path6, import_node_crypto, import_node_child_process3, GrokAcpAdapter;
+var import_node_child_process2, import_node_fs6, import_node_path6, import_node_crypto, import_node_child_process3, GrokAcpAdapter;
 var init_grok_acp_adapter = __esm({
   "../bridge/src/grok-acp-adapter.ts"() {
     "use strict";
     import_node_child_process2 = require("node:child_process");
-    readline = __toESM(require("node:readline"), 1);
     import_node_fs6 = __toESM(require("node:fs"), 1);
     import_node_path6 = __toESM(require("node:path"), 1);
     import_node_crypto = require("node:crypto");
     import_node_child_process3 = require("node:child_process");
     init_dist();
+    init_acp_stdio_transport();
+    init_acp_text();
     init_grok_signals_watcher();
     init_attachment_persist();
     init_path_env();
     GrokAcpAdapter = class {
       id = "grok-acp";
-      proc = null;
-      rl = null;
-      nextId = 1;
-      pending = /* @__PURE__ */ new Map();
+      transport = new AcpStdioTransport();
       handlers = [];
       domainSessionId = "";
       providerSessionId = "";
@@ -4364,9 +4498,7 @@ var init_grok_acp_adapter = __esm({
       }
       /** Child still running and stdin open. */
       isAlive() {
-        return Boolean(
-          this.proc && !this.closed && this.proc.exitCode === null && this.proc.killed !== true && this.proc.stdin && !this.proc.stdin.destroyed
-        );
+        return !this.closed && this.transport.isAlive();
       }
       emit(event) {
         for (const h of this.handlers) {
@@ -4378,66 +4510,22 @@ var init_grok_acp_adapter = __esm({
         }
       }
       write(obj) {
-        if (!this.proc?.stdin) return;
-        this.proc.stdin.write(JSON.stringify(obj) + "\n");
+        this.transport.write(obj);
       }
       send(method, params, timeoutMs = 12e4) {
-        if (!this.proc?.stdin || this.closed) {
-          return Promise.reject(new Error("Agent not started"));
-        }
-        const id = this.nextId++;
-        this.write({ jsonrpc: "2.0", id, method, params });
-        return new Promise((resolve, reject) => {
-          const timer = setTimeout(() => {
-            if (!this.pending.has(id)) return;
-            this.pending.delete(id);
-            reject(new Error(`${method} timed out after ${timeoutMs}ms`));
-          }, timeoutMs);
-          this.pending.set(id, {
-            resolve: (v) => {
-              clearTimeout(timer);
-              resolve(v);
-            },
-            reject: (e) => {
-              clearTimeout(timer);
-              reject(e);
-            }
-          });
-        });
+        return this.transport.send(method, params, timeoutMs);
       }
       reply(id, result) {
-        this.write({ jsonrpc: "2.0", id, result });
+        this.transport.reply(id, result);
       }
       replyError(id, message, code = -32e3) {
-        this.write({
-          jsonrpc: "2.0",
-          id,
-          error: { code, message }
-        });
+        this.transport.replyError(id, message, code);
       }
-      handleLine(line) {
-        let msg;
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          return;
-        }
-        if (msg.id != null && msg.method == null) {
-          const p = this.pending.get(msg.id);
-          if (p) {
-            this.pending.delete(msg.id);
-            if (msg.error) p.reject(new Error(JSON.stringify(msg.error)));
-            else p.resolve(msg.result);
-          }
-          return;
-        }
-        if (msg.method) {
-          if (msg.id != null) {
-            void this.handleServerRequest(msg.id, msg.method, msg.params);
-          } else {
-            this.handleNotification(msg.method, msg.params);
-          }
-        }
+      attachTransport(proc) {
+        this.transport.attach(proc, {
+          onRequest: (id, method, params) => this.handleServerRequest(id, method, params),
+          onNotification: (method, params) => this.handleNotification(method, params)
+        });
       }
       async handleServerRequest(id, method, params) {
         const p = params ?? {};
@@ -4718,13 +4806,6 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
           }
         }
       }
-      numField(v) {
-        if (typeof v === "number" && Number.isFinite(v)) return v;
-        if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) {
-          return Number(v);
-        }
-        return void 0;
-      }
       createTerminal(p) {
         const id = `term-${(0, import_node_crypto.randomUUID)()}`;
         const command = String(p.command ?? "");
@@ -4869,8 +4950,8 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
             this.emitActivity(null);
           } else if (kind === "auto_compact_started" || kind === "compact_started" || kind === "compacting") {
             this.emitActivity("Compacting conversation\u2026", "compact");
-            const used = this.numField(update.tokens_used ?? update.tokensUsed);
-            const size = this.numField(
+            const used = numField(update.tokens_used ?? update.tokensUsed);
+            const size = numField(
               update.context_window ?? update.contextWindow
             );
             if (used != null && size != null) {
@@ -4881,8 +4962,8 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
             const after = update.tokens_after ?? update.tokensAfter;
             const msg = before != null && after != null ? `Compacted \xB7 ${before} \u2192 ${after} tokens` : "Compact complete";
             this.emitActivity(msg, "compact");
-            const afterN = this.numField(after);
-            const size = this.numField(update.context_window ?? update.contextWindow) ?? (this.lastContextSize > 0 ? this.lastContextSize : void 0);
+            const afterN = numField(after);
+            const size = numField(update.context_window ?? update.contextWindow) ?? (this.lastContextSize > 0 ? this.lastContextSize : void 0);
             if (afterN != null && size != null) {
               this.emitContextUsage(afterN, size, "compact_done");
             }
@@ -4995,8 +5076,8 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
             break;
           }
           case "usage_update": {
-            const used = this.numField(update.used);
-            const size = this.numField(update.size);
+            const used = numField(update.used);
+            const size = numField(update.size);
             if (used != null && size != null) {
               this.emitContextUsage(used, size, "acp");
             }
@@ -5004,8 +5085,8 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
           }
           case "auto_compact_started":
           case "compact_started": {
-            const used = this.numField(update.tokens_used ?? update.tokensUsed);
-            const size = this.numField(
+            const used = numField(update.tokens_used ?? update.tokensUsed);
+            const size = numField(
               update.context_window ?? update.contextWindow
             );
             if (used != null && size != null) {
@@ -5016,10 +5097,10 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
           }
           case "auto_compact_completed":
           case "compact_completed": {
-            const after = this.numField(
+            const after = numField(
               update.tokens_after ?? update.tokensAfter
             );
-            const size = this.numField(update.context_window ?? update.contextWindow) ?? (this.lastContextSize > 0 ? this.lastContextSize : void 0);
+            const size = numField(update.context_window ?? update.contextWindow) ?? (this.lastContextSize > 0 ? this.lastContextSize : void 0);
             if (after != null && size != null) {
               this.emitContextUsage(after, size, "compact_done");
             }
@@ -5049,13 +5130,13 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
         if (opts.effort) agentArgs.push("--effort", opts.effort);
         if (this.autoApprove) agentArgs.push("--always-approve");
         agentArgs.push("stdio");
-        this.proc = (0, import_node_child_process2.spawn)(this.grokBin, agentArgs, {
+        const proc = (0, import_node_child_process2.spawn)(this.grokBin, agentArgs, {
           cwd: opts.cwd,
           stdio: ["pipe", "pipe", "pipe"],
           // Inherit bridge PATH (already augmented at boot); re-apply in case env was stripped.
           env: withHealthyEnv(process.env)
         });
-        this.proc.stderr?.on("data", (buf) => {
+        proc.stderr?.on("data", (buf) => {
           const line = buf.toString();
           try {
             const logDir = import_node_path6.default.join(
@@ -5073,11 +5154,10 @@ Do not use Read/read_file on images. If this image was attached by the user, it 
             console.error("[grok stderr]", line.slice(0, 500));
           }
         });
-        this.rl = readline.createInterface({ input: this.proc.stdout });
-        this.rl.on("line", (line) => this.handleLine(line));
-        this.proc.on("exit", (code) => {
+        this.attachTransport(proc);
+        proc.on("exit", (code) => {
           const unexpected = !this.closed;
-          this.proc = null;
+          this.transport.detach();
           this.stopSignalsWatcher();
           if (unexpected) {
             this.emit({
@@ -5535,9 +5615,7 @@ ${input.text}`;
           }
         }
         this.terminals.clear();
-        this.rl?.close();
-        this.proc?.kill();
-        this.proc = null;
+        this.transport.kill();
         if (this.domainSessionId) {
           this.emit({
             type: "SessionEnded",
@@ -6465,6 +6543,15 @@ async function createGrokAcpProvider(opts) {
   const { GrokAcpAdapter: GrokAcpAdapter2 } = await Promise.resolve().then(() => (init_grok_acp_adapter(), grok_acp_adapter_exports));
   return new GrokAcpAdapter2(opts);
 }
+async function createAgentProvider(opts) {
+  const mode = (process.env.AGENT_PANE_PROVIDER ?? "stdio").toLowerCase();
+  if (mode === "serve" || mode === "daemon") {
+    throw new Error(
+      "AGENT_PANE_PROVIDER=serve is reserved for grok agent serve (localhost WebSocket ACP). Not wired yet \u2014 use stdio (default). See docs/superpowers/specs/2026-07-16-phase0-session-id-provider.md \xA72.4"
+    );
+  }
+  return createGrokAcpProvider(opts);
+}
 
 // ../bridge/src/workspace-snapshot.ts
 var import_node_child_process4 = require("node:child_process");
@@ -7154,7 +7241,7 @@ var SessionManager = class {
       message: "Starting Grok agent\u2026",
       clientRequestId
     });
-    const adapter = await createGrokAcpProvider({
+    const adapter = await createAgentProvider({
       autoApprove: modeUsesAlwaysApprove(mode)
     });
     this.wireAdapter(adapter);
@@ -7267,7 +7354,7 @@ var SessionManager = class {
       message: "Resuming session\u2026",
       sessionId
     });
-    const adapter = await createGrokAcpProvider({
+    const adapter = await createAgentProvider({
       autoApprove: modeUsesAlwaysApprove(mode)
     });
     this.wireAdapter(adapter);

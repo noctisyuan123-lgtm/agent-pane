@@ -16,6 +16,16 @@ React UI  ──WS──►  Bridge  ──Domain Event Store──► UI
 - Grok CLI installed and signed in (`~/.grok/bin/grok`)
 - Prefer working inside a **git repository** (Diff / Reject work best there)
 
+### Grok CLI pin
+
+| Item | Value |
+|------|--------|
+| **Tested** | Grok CLI **0.2.101** (`~/.grok/version.json`) |
+| **Default binary** | `GROK_BIN` env, else `~/.grok/bin/grok` |
+| **Transport** | `grok agent … stdio` (ACP JSON-RPC). Optional `AGENT_PANE_PROVIDER=serve` is reserved, not wired yet. |
+
+Upgrade Grok in a dedicated PR; smoke resume + prompt + permission after bumps. See [`docs/architecture-agent-core-multi-front.md`](docs/architecture-agent-core-multi-front.md) §7.
+
 ## Desktop (recommended)
 
 Build macOS arm64 bundles with:

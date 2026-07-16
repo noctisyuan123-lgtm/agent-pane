@@ -2,7 +2,7 @@ import type { ClientCommand, DomainEvent } from "@agent-pane/shared";
 import { nowIso } from "@agent-pane/shared";
 import { EventStore, type StoredEvent } from "./event-store.js";
 import {
-  createGrokAcpProvider,
+  createAgentProvider,
   type AgentProvider,
 } from "./provider-api.js";
 import { WorkspaceSnapshotService } from "./workspace-snapshot.js";
@@ -518,7 +518,7 @@ export class SessionManager {
       clientRequestId,
     });
 
-    const adapter = await createGrokAcpProvider({
+    const adapter = await createAgentProvider({
       autoApprove: modeUsesAlwaysApprove(mode),
     });
     this.wireAdapter(adapter);
@@ -668,7 +668,7 @@ export class SessionManager {
       sessionId,
     });
 
-    const adapter = await createGrokAcpProvider({
+    const adapter = await createAgentProvider({
       autoApprove: modeUsesAlwaysApprove(mode),
     });
     this.wireAdapter(adapter);

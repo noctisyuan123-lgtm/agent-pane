@@ -1,5 +1,4 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import * as readline from "node:readline";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -7,6 +6,12 @@ import { execFile } from "node:child_process";
 import type { ContextRef, DomainEvent } from "@agent-pane/shared";
 import { nowIso } from "@agent-pane/shared";
 import type { AgentProvider } from "./provider-api.js";
+import { AcpStdioTransport } from "./acp-stdio-transport.js";
+import {
+  mapTaskStatus,
+  numField,
+  summarize,
+} from "./acp-text.js";
 import {
   GrokSignalsWatcher,
   resolveGrokSignalsPaths,
@@ -36,30 +41,15 @@ type AcpTerminal = {
   byteLimit: number;
 };
 
-type JsonRpcMsg = {
-  jsonrpc?: string;
-  id?: number | string;
-  method?: string;
-  params?: unknown;
-  result?: unknown;
-  error?: unknown;
-};
-
 /**
- * Grok ACP adapter — only place that speaks ACP.
+ * Grok ACP adapter — Grok packaging + DomainEvent mapping over stdio transport.
  * CRITICAL: when we advertise fs/terminal capabilities, we MUST answer
  * agent→client requests (fs/read_text_file, session/request_permission, …)
  * or the tool loop hangs forever.
  */
 export class GrokAcpAdapter implements AgentProvider {
   readonly id = "grok-acp";
-  private proc: ChildProcess | null = null;
-  private rl: readline.Interface | null = null;
-  private nextId = 1;
-  private pending = new Map<
-    number | string,
-    { resolve: (v: unknown) => void; reject: (e: Error) => void }
-  >();
+  private readonly transport = new AcpStdioTransport();
   private handlers: Array<(e: DomainEvent) => void> = [];
   private domainSessionId = "";
   private providerSessionId = "";
@@ -110,14 +100,7 @@ export class GrokAcpAdapter implements AgentProvider {
 
   /** Child still running and stdin open. */
   isAlive(): boolean {
-    return Boolean(
-      this.proc &&
-        !this.closed &&
-        this.proc.exitCode === null &&
-        this.proc.killed !== true &&
-        this.proc.stdin &&
-        !this.proc.stdin.destroyed
-    );
+    return !this.closed && this.transport.isAlive();
   }
 
   private emit(event: DomainEvent): void {
@@ -131,8 +114,7 @@ export class GrokAcpAdapter implements AgentProvider {
   }
 
   private write(obj: unknown): void {
-    if (!this.proc?.stdin) return;
-    this.proc.stdin.write(JSON.stringify(obj) + "\n");
+    this.transport.write(obj);
   }
 
   private send(
@@ -140,70 +122,24 @@ export class GrokAcpAdapter implements AgentProvider {
     params?: unknown,
     timeoutMs = 120_000
   ): Promise<unknown> {
-    // During start(), isAlive() may be strict; only require proc+stdin here
-    if (!this.proc?.stdin || this.closed) {
-      return Promise.reject(new Error("Agent not started"));
-    }
-    const id = this.nextId++;
-    this.write({ jsonrpc: "2.0", id, method, params });
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (!this.pending.has(id)) return;
-        this.pending.delete(id);
-        reject(new Error(`${method} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      this.pending.set(id, {
-        resolve: (v) => {
-          clearTimeout(timer);
-          resolve(v);
-        },
-        reject: (e) => {
-          clearTimeout(timer);
-          reject(e);
-        },
-      });
-    });
+    return this.transport.send(method, params, timeoutMs);
   }
 
   private reply(id: number | string, result: unknown): void {
-    this.write({ jsonrpc: "2.0", id, result });
+    this.transport.reply(id, result);
   }
 
   private replyError(id: number | string, message: string, code = -32000): void {
-    this.write({
-      jsonrpc: "2.0",
-      id,
-      error: { code, message },
-    });
+    this.transport.replyError(id, message, code);
   }
 
-  private handleLine(line: string): void {
-    let msg: JsonRpcMsg;
-    try {
-      msg = JSON.parse(line) as JsonRpcMsg;
-    } catch {
-      return;
-    }
-
-    // Client←Agent response to our request
-    if (msg.id != null && msg.method == null) {
-      const p = this.pending.get(msg.id);
-      if (p) {
-        this.pending.delete(msg.id);
-        if (msg.error) p.reject(new Error(JSON.stringify(msg.error)));
-        else p.resolve(msg.result);
-      }
-      return;
-    }
-
-    // Agent→Client request (must reply) or notification
-    if (msg.method) {
-      if (msg.id != null) {
-        void this.handleServerRequest(msg.id, msg.method, msg.params);
-      } else {
-        this.handleNotification(msg.method, msg.params);
-      }
-    }
+  private attachTransport(proc: ChildProcess): void {
+    this.transport.attach(proc, {
+      onRequest: (id, method, params) =>
+        this.handleServerRequest(id, method, params),
+      onNotification: (method, params) =>
+        this.handleNotification(method, params),
+    });
   }
 
   private async handleServerRequest(
@@ -582,14 +518,6 @@ export class GrokAcpAdapter implements AgentProvider {
     }
   }
 
-  private numField(v: unknown): number | undefined {
-    if (typeof v === "number" && Number.isFinite(v)) return v;
-    if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) {
-      return Number(v);
-    }
-    return undefined;
-  }
-
   private createTerminal(p: Record<string, unknown>): string {
     const id = `term-${randomUUID()}`;
     const command = String(p.command ?? "");
@@ -766,8 +694,8 @@ export class GrokAcpAdapter implements AgentProvider {
         kind === "compacting"
       ) {
         this.emitActivity("Compacting conversation…", "compact");
-        const used = this.numField(update.tokens_used ?? update.tokensUsed);
-        const size = this.numField(
+        const used = numField(update.tokens_used ?? update.tokensUsed);
+        const size = numField(
           update.context_window ?? update.contextWindow
         );
         if (used != null && size != null) {
@@ -784,9 +712,9 @@ export class GrokAcpAdapter implements AgentProvider {
             ? `Compacted · ${before} → ${after} tokens`
             : "Compact complete";
         this.emitActivity(msg, "compact");
-        const afterN = this.numField(after);
+        const afterN = numField(after);
         const size =
-          this.numField(update.context_window ?? update.contextWindow) ??
+          numField(update.context_window ?? update.contextWindow) ??
           (this.lastContextSize > 0 ? this.lastContextSize : undefined);
         if (afterN != null && size != null) {
           this.emitContextUsage(afterN, size, "compact_done");
@@ -937,8 +865,8 @@ export class GrokAcpAdapter implements AgentProvider {
         break;
       }
       case "usage_update": {
-        const used = this.numField(update.used);
-        const size = this.numField(update.size);
+        const used = numField(update.used);
+        const size = numField(update.size);
         if (used != null && size != null) {
           this.emitContextUsage(used, size, "acp");
         }
@@ -946,8 +874,8 @@ export class GrokAcpAdapter implements AgentProvider {
       }
       case "auto_compact_started":
       case "compact_started": {
-        const used = this.numField(update.tokens_used ?? update.tokensUsed);
-        const size = this.numField(
+        const used = numField(update.tokens_used ?? update.tokensUsed);
+        const size = numField(
           update.context_window ?? update.contextWindow
         );
         if (used != null && size != null) {
@@ -958,11 +886,11 @@ export class GrokAcpAdapter implements AgentProvider {
       }
       case "auto_compact_completed":
       case "compact_completed": {
-        const after = this.numField(
+        const after = numField(
           update.tokens_after ?? update.tokensAfter
         );
         const size =
-          this.numField(update.context_window ?? update.contextWindow) ??
+          numField(update.context_window ?? update.contextWindow) ??
           (this.lastContextSize > 0 ? this.lastContextSize : undefined);
         if (after != null && size != null) {
           this.emitContextUsage(after, size, "compact_done");
@@ -1014,14 +942,14 @@ export class GrokAcpAdapter implements AgentProvider {
     if (this.autoApprove) agentArgs.push("--always-approve");
     agentArgs.push("stdio");
 
-    this.proc = spawn(this.grokBin, agentArgs, {
+    const proc = spawn(this.grokBin, agentArgs, {
       cwd: opts.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       // Inherit bridge PATH (already augmented at boot); re-apply in case env was stripped.
       env: withHealthyEnv(process.env),
     });
 
-    this.proc.stderr?.on("data", (buf: Buffer) => {
+    proc.stderr?.on("data", (buf: Buffer) => {
       const line = buf.toString();
       try {
         const logDir = path.join(
@@ -1041,12 +969,11 @@ export class GrokAcpAdapter implements AgentProvider {
       }
     });
 
-    this.rl = readline.createInterface({ input: this.proc.stdout! });
-    this.rl.on("line", (line) => this.handleLine(line));
+    this.attachTransport(proc);
 
-    this.proc.on("exit", (code) => {
+    proc.on("exit", (code) => {
       const unexpected = !this.closed;
-      this.proc = null;
+      this.transport.detach();
       this.stopSignalsWatcher();
       if (unexpected) {
         this.emit({
@@ -1656,9 +1583,7 @@ export class GrokAcpAdapter implements AgentProvider {
       }
     }
     this.terminals.clear();
-    this.rl?.close();
-    this.proc?.kill();
-    this.proc = null;
+    this.transport.kill();
     if (this.domainSessionId) {
       this.emit({
         type: "SessionEnded",
@@ -1668,69 +1593,4 @@ export class GrokAcpAdapter implements AgentProvider {
       });
     }
   }
-}
-
-function summarize(v: unknown): string {
-  if (v == null) return "";
-  if (typeof v === "string") return v.slice(0, 12_000);
-  const unwrapped = unwrapAcpText(v);
-  if (unwrapped) return unwrapped.slice(0, 12_000);
-  try {
-    // 保留足够长度以便前端解析 diff content[]
-    return JSON.stringify(v).slice(0, 12_000);
-  } catch {
-    return String(v).slice(0, 12_000);
-  }
-}
-
-/**
- * Pull human-readable text out of ACP tool content shapes, e.g.
- * `[{type:"content", content:{type:"text", text:"Cannot read binary file…"}}]`
- * so ToolFailed / turn-log don't dump raw JSON.
- */
-function unwrapAcpText(v: unknown): string {
-  if (typeof v === "string") return v;
-  if (!v || typeof v !== "object") return "";
-
-  if (Array.isArray(v)) {
-    const parts: string[] = [];
-    for (const item of v) {
-      const t = unwrapAcpText(item);
-      if (t) parts.push(t);
-    }
-    return parts.join("\n").trim();
-  }
-
-  const o = v as Record<string, unknown>;
-
-  // { type: "text", text: "…" }
-  if (typeof o.text === "string" && o.text.trim()) return o.text;
-
-  // { type: "content", content: { type: "text", text } | […] }
-  if (o.content != null) {
-    const inner = unwrapAcpText(o.content);
-    if (inner) return inner;
-  }
-
-  // { message / error / output }
-  for (const key of ["message", "error", "output", "rawOutput"] as const) {
-    const x = o[key];
-    if (typeof x === "string" && x.trim()) return x;
-    if (x && typeof x === "object") {
-      const inner = unwrapAcpText(x);
-      if (inner) return inner;
-    }
-  }
-
-  return "";
-}
-
-function mapTaskStatus(
-  s?: string
-): "pending" | "in_progress" | "completed" | "cancelled" {
-  const x = (s ?? "pending").toLowerCase();
-  if (x.includes("progress") || x === "active") return "in_progress";
-  if (x.includes("complete") || x === "done") return "completed";
-  if (x.includes("cancel")) return "cancelled";
-  return "pending";
 }

@@ -110,3 +110,25 @@ export async function createGrokAcpProvider(opts?: {
   const { GrokAcpAdapter } = await import("./grok-acp-adapter.js");
   return new GrokAcpAdapter(opts);
 }
+
+/**
+ * Host entry: pick provider by env.
+ * - `stdio` (default): spawn `grok agent … stdio` (current)
+ * - `serve`: reserved for `grok agent serve` WebSocket ACP (not wired yet)
+ *
+ * Prefer out-of-process always; never embed Core by default.
+ */
+export async function createAgentProvider(opts?: {
+  grokBin?: string;
+  autoApprove?: boolean;
+}): Promise<AgentProvider> {
+  const mode = (process.env.AGENT_PANE_PROVIDER ?? "stdio").toLowerCase();
+  if (mode === "serve" || mode === "daemon") {
+    throw new Error(
+      "AGENT_PANE_PROVIDER=serve is reserved for grok agent serve " +
+        "(localhost WebSocket ACP). Not wired yet — use stdio (default). " +
+        "See docs/superpowers/specs/2026-07-16-phase0-session-id-provider.md §2.4"
+    );
+  }
+  return createGrokAcpProvider(opts);
+}

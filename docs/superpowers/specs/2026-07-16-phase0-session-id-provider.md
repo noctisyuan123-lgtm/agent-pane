@@ -138,7 +138,16 @@ Do **not** mix glass UI polish into these PRs.
 
 **Stop line for “large project wave 1”:** PR-A…C — **landed**.  
 **Wave 2 (thin Host boundary):** PR-D…E — **landed** (2026-07-16).  
-Next: extract ACP transport modules / optional DaemonAcpProvider (`grok agent serve`).
+**Wave 3 (extract + factory):** **landed** (2026-07-16).
+
+| Wave 3 item | Status |
+|-------------|--------|
+| Extract `acp-text.ts` (summarize / unwrap / mapTaskStatus / numField) | **done** |
+| Extract `acp-stdio-transport.ts` (JSON-RPC over child stdio) | **done** |
+| `GrokAcpAdapter` composes transport | **done** |
+| `createAgentProvider()` env switch (`stdio` default; `serve` reserved) | **done** |
+| README Grok CLI pin 0.2.101 | **done** |
+| Full `DaemonAcpProvider` WebSocket client for `grok agent serve` | **not wired** (factory throws clear error; next wave when multi-session cold-start hurts) |
 
 ---
 
