@@ -4,11 +4,14 @@ import path from "node:path";
 
 const GROK_DIR = path.join(os.homedir(), ".grok");
 const RULES_DIR = path.join(GROK_DIR, "rules");
+const HOOKS_DIR = path.join(GROK_DIR, "hooks");
 const MEMORY_INDEX = path.join(GROK_DIR, "memory", "MEMORY.md");
 const GROK_CONFIG = path.join(GROK_DIR, "config.toml");
 const CURSOR_MCP = path.join(os.homedir(), ".cursor", "mcp.json");
 
 const SAFE_RULE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,120}\.md$/;
+const SAFE_HOOK_JSON = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,120}\.json$/;
+const SAFE_HOOK_SCRIPT = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,120}\.(sh|py|js|mjs|cjs|ts)$/;
 const SECRET_ENV_RE = /(KEY|TOKEN|SECRET|PASSWORD|AUTH)/i;
 const MASK = "••••••••";
 
@@ -359,4 +362,172 @@ export function writeCursorMcp(jsonText: string): CustomizeMcpState {
   ensureParent(CURSOR_MCP);
   fs.writeFileSync(CURSOR_MCP, pretty, "utf8");
   return loadCustomizeMcp();
+}
+
+// ── Hooks (~/.grok/hooks/*.json + companion scripts) ──────────────
+
+export type CustomizeHookFile = {
+  id: string;
+  name: string;
+  path: string;
+  kind: "json" | "script";
+  content: string;
+  /** Event names declared in a hook JSON (empty for scripts). */
+  events: string[];
+};
+
+export type CustomizeHooksState = {
+  hooksDir: string;
+  files: CustomizeHookFile[];
+};
+
+function parseHookEvents(content: string): string[] {
+  try {
+    const parsed = JSON.parse(content) as { hooks?: Record<string, unknown> };
+    if (!parsed?.hooks || typeof parsed.hooks !== "object") return [];
+    return Object.keys(parsed.hooks).sort();
+  } catch {
+    return [];
+  }
+}
+
+function resolveHookPath(name: string): string {
+  const p = path.join(HOOKS_DIR, name);
+  if (path.resolve(p) !== path.resolve(HOOKS_DIR, name)) {
+    throw new Error("invalid path");
+  }
+  return p;
+}
+
+/** List global Grok hooks under ~/.grok/hooks. */
+export function listCustomizeHooks(): CustomizeHooksState {
+  const files: CustomizeHookFile[] = [];
+  try {
+    if (!fs.existsSync(HOOKS_DIR)) {
+      return { hooksDir: HOOKS_DIR, files: [] };
+    }
+    const names = fs.readdirSync(HOOKS_DIR).sort();
+    for (const name of names) {
+      const isJson = SAFE_HOOK_JSON.test(name);
+      const isScript = SAFE_HOOK_SCRIPT.test(name);
+      if (!isJson && !isScript) continue;
+      const p = path.join(HOOKS_DIR, name);
+      try {
+        const st = fs.statSync(p);
+        if (!st.isFile()) continue;
+        const content = fs.readFileSync(p, "utf8");
+        files.push({
+          id: name,
+          name,
+          path: p,
+          kind: isJson ? "json" : "script",
+          content,
+          events: isJson ? parseHookEvents(content) : [],
+        });
+      } catch {
+        /* skip */
+      }
+    }
+  } catch {
+    /* skip */
+  }
+  return { hooksDir: HOOKS_DIR, files };
+}
+
+function validateHookJson(content: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (e) {
+    throw new Error(
+      `invalid JSON: ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("hook file root must be an object");
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (!("hooks" in obj) || typeof obj.hooks !== "object" || obj.hooks === null) {
+    throw new Error('hook file must contain a "hooks" object');
+  }
+  return `${JSON.stringify(parsed, null, 2)}\n`;
+}
+
+/** Create or overwrite a hook JSON / script in ~/.grok/hooks. */
+export function writeCustomizeHook(
+  name: string,
+  content: string
+): CustomizeHookFile {
+  if (typeof content !== "string") throw new Error("content must be a string");
+  if (content.length > 512_000) throw new Error("file too large (max 512KB)");
+
+  const trimmed = String(name || "").trim();
+  const isJson = SAFE_HOOK_JSON.test(trimmed);
+  const isScript = SAFE_HOOK_SCRIPT.test(trimmed);
+  if (!isJson && !isScript) {
+    throw new Error(
+      "invalid name (use name.json or name.sh|py|js|mjs|cjs|ts)"
+    );
+  }
+
+  let body = content;
+  if (isJson) {
+    body = validateHookJson(content);
+  }
+
+  fs.mkdirSync(HOOKS_DIR, { recursive: true });
+  const p = resolveHookPath(trimmed);
+  fs.writeFileSync(p, body, { encoding: "utf8", mode: isScript ? 0o755 : 0o644 });
+  // Ensure scripts stay executable even if umask stripped bits
+  if (isScript) {
+    try {
+      fs.chmodSync(p, 0o755);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return {
+    id: trimmed,
+    name: trimmed,
+    path: p,
+    kind: isJson ? "json" : "script",
+    content: body,
+    events: isJson ? parseHookEvents(body) : [],
+  };
+}
+
+/** Delete a hook file under ~/.grok/hooks (name only, no path escape). */
+export function deleteCustomizeHook(name: string): void {
+  const trimmed = String(name || "").trim();
+  if (!SAFE_HOOK_JSON.test(trimmed) && !SAFE_HOOK_SCRIPT.test(trimmed)) {
+    throw new Error("invalid name");
+  }
+  const p = resolveHookPath(trimmed);
+  if (!fs.existsSync(p)) throw new Error("file not found");
+  fs.unlinkSync(p);
+}
+
+/** Default template for a new SessionStart hook. */
+export function defaultHookTemplate(nameBase: string): string {
+  const safe = nameBase.replace(/[^a-zA-Z0-9._-]/g, "-") || "my-hook";
+  return `${JSON.stringify(
+    {
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: `echo '[${safe}] session start in' "$(pwd)"`,
+                timeout: 5,
+              },
+            ],
+          },
+        ],
+      },
+    },
+    null,
+    2
+  )}\n`;
 }

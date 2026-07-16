@@ -146,12 +146,10 @@ export function importGrokSession(
   let title = "";
   const openTools = new Map<string, string>();
 
-  const push = (ev: Omit<DomainEvent, "seq" | "sessionId" | "at"> & {
-    at?: string;
-  }) => {
+  const push = (ev: Record<string, unknown> & { type: string; at?: string }) => {
     seq += 1;
     events.push({
-      ...(ev as DomainEvent),
+      ...ev,
       seq,
       sessionId: id,
       at: ev.at ?? createdAt,

@@ -1614,6 +1614,10 @@ export class GrokAcpAdapter implements AgentProvider {
     });
   }
 
+  hasPendingPermission(requestId: string): boolean {
+    return this.pendingPermissions.has(requestId);
+  }
+
   async respondPermission(requestId: string, allow: boolean): Promise<void> {
     const pending = this.pendingPermissions.get(requestId);
     this.emit({

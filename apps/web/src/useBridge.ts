@@ -15,14 +15,24 @@ import {
 } from "./toolFormat";
 import {
   eventsToChatItems,
+  eventsToChatItemsAsync,
   formatDurationSec,
+  sliceLastUserTurns,
   sliceMessagesBeforeUserTurn,
   userTextAtTurn,
   userTurnIndexAt,
   type ChatItem,
   type TurnLogLine,
 } from "./chatFromEvents";
-import { parseSessionInfoUsage } from "./contextUsage";
+
+/**
+ * Cap how much of a huge history mounts into the DOM at once. GrokBuild's
+ * native list virtualizes for free; our chat has no windowing, so without
+ * this a big session mounts thousands of markdown/highlighted-code nodes on
+ * every switch — that churn (not the JSON parse) is what piles up memory
+ * after repeated clicking. "Load earlier" expands from the full cached array.
+ */
+const HISTORY_WINDOW_TURNS = 40;
 
 export type { ChatItem, TurnLogLine } from "./chatFromEvents";
 export {
@@ -178,10 +188,62 @@ export function useBridge() {
       : "agent";
   });
   const [messages, setMessages] = useState<ChatItem[]>([]);
+  /** Mirror of messages for stash-on-switch without stale closures */
+  const messagesRef = useRef<ChatItem[]>([]);
+  messagesRef.current = messages;
+  /** How many earlier items are hidden by the render window (0 = fully shown) */
+  const [hiddenHistoryCount, setHiddenHistoryCount] = useState(0);
+  const paintWindowed = useCallback((full: ChatItem[]) => {
+    const { visible, hiddenCount } = sliceLastUserTurns(
+      full,
+      HISTORY_WINDOW_TURNS
+    );
+    setMessages(visible);
+    setHiddenHistoryCount(hiddenCount);
+  }, []);
+  const loadEarlierHistory = useCallback(() => {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    const full = sessionChatCacheRef.current.get(sid)?.messages;
+    if (!full) return;
+    setMessages(full);
+    setHiddenHistoryCount(0);
+  }, []);
+  /**
+   * In-memory chat cache — avoid re-parsing multi‑MB jsonl on every click.
+   * Keep only a few sessions: large ChatItem trees were piling up like a leak
+   * after continuous switching.
+   */
+  const sessionChatCacheRef = useRef<
+    Map<string, { messages: ChatItem[]; at: number }>
+  >(new Map());
+  const stashSessionChat = useCallback((id: string | null | undefined) => {
+    if (!id) return;
+    const msgs = messagesRef.current;
+    if (!msgs.length) return;
+    const cache = sessionChatCacheRef.current;
+    // Shallow-copy the array so later setState cannot alias the cache entry
+    cache.set(id, { messages: msgs.slice(), at: Date.now() });
+    while (cache.size > 4) {
+      let oldestId: string | null = null;
+      let oldestAt = Infinity;
+      for (const [k, v] of cache) {
+        if (v.at < oldestAt) {
+          oldestAt = v.at;
+          oldestId = k;
+        }
+      }
+      if (oldestId) cache.delete(oldestId);
+      else break;
+    }
+  }, []);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [diffs, setDiffs] = useState<DiffFileMeta[]>([]);
   const [permissions, setPermissions] = useState<PermissionReq[]>([]);
   const [busy, setBusy] = useState(false);
+  // NOTE: do NOT tick busyElapsed in this hook — a 200ms setState here
+  // re-rendered the entire App (sidebar + markdown chat) and made rapid
+  // session switching feel frozen. Elapsed UI lives in AgentActivityStrip.
   const [contextUsage, setContextUsage] = useState<{
     used: number;
     size: number;
@@ -223,9 +285,13 @@ export function useBridge() {
   const toolStartRef = useRef(new Map<string, number>());
   /** Wall-clock start of current user turn (Worked for Xs) */
   const turnStartedAtRef = useRef<number | null>(null);
-  /** When current busy wait began (for "Waiting for response… 2.2s") */
-  const busySinceRef = useRef<number | null>(null);
-  const [busyElapsed, setBusyElapsed] = useState(0);
+  /**
+   * Active session for event gating. Intentionally NOT synced from `sessionId`
+   * state on every render — that race reverted optimistic openHistorySession
+   * pins when WS re-rendered with stale state before setSessionId committed,
+   * making sidebar clicks feel stuck.
+   */
+  const sessionIdRef = useRef<string | null>(null);
   /**
    * Message waiting for SessionStarted (create / resume).
    * Flushed inside SessionStarted — NOT via useEffect (effect cleanup was
@@ -235,31 +301,52 @@ export function useBridge() {
     text: string;
     attachments?: { path: string; kind: "file" | "folder" }[];
   } | null>(null);
-  const sessionIdRef = useRef<string | null>(null);
-  sessionIdRef.current = sessionId;
+  /**
+   * Which session we're attaching to over WS:
+   * - {kind:'new', requestId} → waiting for SessionStarted with matching clientRequestId
+   * - {kind:'resume', sessionId} → waiting for / applying that sessionId
+   * - null → only paint events for sessionIdRef.current
+   */
+  const pendingAttachRef = useRef<
+    | { kind: "new"; requestId: string }
+    | { kind: "resume"; sessionId: string }
+    | null
+  >(null);
+  /** Bumps on each openHistorySession; stale async work must not overwrite UI. */
+  const openHistGenRef = useRef(0);
+  /** While loading history for a session, suppress live paint for that id */
+  const suppressPaintRef = useRef<string | null>(null);
+  /** sessionId → currently working (turn in flight) */
+  const busyBySessionRef = useRef<Record<string, boolean>>({});
+  const [busySessionIds, setBusySessionIds] = useState<string[]>([]);
+  const busySessionKeyRef = useRef("");
+  /** Sessions with a live agent process (from bridge `live` messages) */
+  const [liveSessionIds, setLiveSessionIds] = useState<string[]>([]);
+  const liveSessionIdsRef = useRef<string[]>([]);
+  liveSessionIdsRef.current = liveSessionIds;
+  /** Coarse AgentActivity phase for the 3-line strip status row */
+  const [activityPhase, setActivityPhase] = useState<
+    | "idle"
+    | "working"
+    | "thinking"
+    | "tool"
+    | "permission"
+    | "compact"
+    | "queue"
+    | "sleeping"
+    | "error"
+    | null
+  >(null);
+  /** Subagent model label when present on AgentActivity (line-1 secondary) */
+  const [activitySubagentModel, setActivitySubagentModel] = useState<
+    string | null
+  >(null);
   /** After SessionRewound: retry resends, edit fills composer, undo just restores */
   const afterRewindRef = useRef<null | {
     kind: "retry" | "edit" | "undo";
     text: string;
     userTurnIndex: number;
   }>(null);
-
-  // Tick elapsed while busy for CLI-style "Waiting for response… 1.2s"
-  useEffect(() => {
-    if (!busy) {
-      busySinceRef.current = null;
-      setBusyElapsed(0);
-      return;
-    }
-    if (busySinceRef.current == null) busySinceRef.current = Date.now();
-    const tick = () => {
-      const t0 = busySinceRef.current ?? Date.now();
-      setBusyElapsed(Date.now() - t0);
-    };
-    tick();
-    const id = window.setInterval(tick, 200);
-    return () => window.clearInterval(id);
-  }, [busy]);
 
   const sealThoughtLogLine = useCallback(() => {
     if (thoughtStartRef.current == null) return;
@@ -290,12 +377,33 @@ export function useBridge() {
     ws.send(JSON.stringify(cmd));
   }, []);
 
+  const syncBusyFromMap = useCallback(() => {
+    const ids = Object.entries(busyBySessionRef.current)
+      .filter(([, v]) => v)
+      .map(([k]) => k)
+      .sort();
+    const key = ids.join("\0");
+    // Avoid re-render storms: every WS event used to setState a fresh array
+    // even when the busy set was unchanged, which remounted sidebar rows
+    // under the cursor mid-click.
+    if (key !== busySessionKeyRef.current) {
+      busySessionKeyRef.current = key;
+      setBusySessionIds(ids);
+    }
+    const active = sessionIdRef.current;
+    if (active) setBusy(!!busyBySessionRef.current[active]);
+    else setBusy(false);
+  }, []);
+
   const flushPendingPrompt = useCallback(
     (sid: string) => {
       const pending = pendingPromptRef.current;
       if (!pending?.text?.trim() && !(pending?.attachments?.length)) return;
       pendingPromptRef.current = null;
-      setBusy(true);
+      // Per-session busy — never setBusy(true) blindly; user may have switched
+      // to an idle session B while A's attach+flush was still pending.
+      busyBySessionRef.current[sid] = true;
+      syncBusyFromMap();
       setStatusMsg(null);
       send({
         type: "session.prompt",
@@ -304,10 +412,63 @@ export function useBridge() {
         attachments: pending?.attachments,
       });
     },
-    [send]
+    [send, syncBusyFromMap]
+  );
+
+  const noteSessionBusy = useCallback(
+    (event: DomainEvent) => {
+      const id = event.sessionId;
+      if (!id) return;
+      // Only user/tool start a "working" turn — not every residual chunk,
+      // or busy sticks forever after MessageDone (sidebar particles).
+      if (
+        event.type === "UserMessageAppended" ||
+        event.type === "ToolStarted"
+      ) {
+        busyBySessionRef.current[id] = true;
+      } else if (
+        event.type === "MessageDone" ||
+        event.type === "SessionEnded" ||
+        event.type === "SessionError"
+      ) {
+        busyBySessionRef.current[id] = false;
+      } else if (
+        event.type === "ToolFinished" ||
+        event.type === "ToolFailed"
+      ) {
+        // If no other tools are in flight we still wait for MessageDone;
+        // do not clear here (assistant may keep talking after the tool).
+      }
+      syncBusyFromMap();
+    },
+    [syncBusyFromMap]
   );
 
   const applyEvent = useCallback((event: DomainEvent) => {
+    // Always track busy for sidebar dots — even when not painting this session
+    noteSessionBusy(event);
+
+    // Drop paint for non-active sessions (bridge fans out all live sessions).
+    // Replay path is exempt — it intentionally rebuilds one session's timeline.
+    if (!replayingRef.current) {
+      if (suppressPaintRef.current === event.sessionId) return;
+
+      const pending = pendingAttachRef.current;
+      const active = sessionIdRef.current;
+      let allow = false;
+      if (pending?.kind === "new") {
+        allow =
+          event.type === "SessionStarted" &&
+          (event as { clientRequestId?: string }).clientRequestId ===
+            pending.requestId;
+      } else if (pending?.kind === "resume") {
+        allow = event.sessionId === pending.sessionId;
+      } else if (active) {
+        allow = event.sessionId === active;
+      }
+      if (!allow) return;
+    }
+
     // 去重：永远带上 at+type。旧 resume 会重复 seq=1..N，只按 seq 去重会把后半段
     //（尤其最后一轮）整段吞掉。真重复事件 at 相同，仍可挡住。
     const ri = replayingRef.current ? replayIndexRef.current : -1;
@@ -333,7 +494,21 @@ export function useBridge() {
       : String(event.seq ?? event.at ?? Date.now());
 
     switch (event.type) {
-      case "SessionStarted":
+      case "SessionStarted": {
+        const pending = pendingAttachRef.current;
+        const expectNew =
+          pending?.kind === "new" &&
+          (event as { clientRequestId?: string }).clientRequestId ===
+            pending.requestId;
+        const expectThis =
+          pending?.kind === "resume" && pending.sessionId === event.sessionId;
+        const alreadyActive = sessionIdRef.current === event.sessionId;
+        // Ignore hijack: another session's SessionStarted must not steal the UI
+        if (!replayingRef.current && !expectNew && !expectThis && !alreadyActive) {
+          break;
+        }
+        if (expectNew || expectThis) pendingAttachRef.current = null;
+
         setSessionId(event.sessionId);
         sessionIdRef.current = event.sessionId;
         setCwd(event.cwd);
@@ -377,11 +552,12 @@ export function useBridge() {
           }
           // Flush queued message here (not useEffect) so resume never "eats" Send
           if (pendingPromptRef.current) {
-            setBusy(true);
+            busyBySessionRef.current[event.sessionId] = true;
+            syncBusyFromMap();
             const sid = event.sessionId;
             window.setTimeout(() => flushPendingPrompt(sid), 30);
           } else {
-            setBusy(false);
+            syncBusyFromMap();
           }
         }
         if (!event.resumed || replayingRef.current) {
@@ -390,6 +566,7 @@ export function useBridge() {
           toolsGroupId.current = `tools-${event.sessionId}-live`;
         }
         break;
+      }
 
       case "UserMessageAppended":
         setMessages((m) => {
@@ -466,6 +643,8 @@ export function useBridge() {
         if (thoughtStartRef.current == null) {
           thoughtStartRef.current = Date.now();
         }
+        // Soft status for line-3 while thoughts stream (unless a tool activity owns the strip)
+        setActivityPhase((p) => (p === "tool" || p === "permission" ? p : "thinking"));
         const id = thoughtLiveId.current;
         const prev =
           (thoughtBufMap.current.get(id) ?? "") + event.text;
@@ -512,7 +691,11 @@ export function useBridge() {
           turnStartedAtRef.current = null;
         }
         turnDoneRef.current = true;
-        setBusy(false);
+        setActivityPhase(null);
+        setActivitySubagentModel(null);
+        // noteSessionBusy already cleared the map — sync, don't blanket setBusy(false)
+        // (that used to clear busy while viewing another live session after a gate miss).
+        syncBusyFromMap();
         break;
 
       case "ToolStarted": {
@@ -612,6 +795,27 @@ export function useBridge() {
       case "AgentActivity": {
         const text = event.text?.trim() || null;
         setStatusMsg(text);
+        const phase = event.phase ?? (text ? "working" : null);
+        setActivityPhase(text ? phase : null);
+        const subagentModel =
+          typeof event.subagentModel === "string"
+            ? event.subagentModel.trim()
+            : event.agentKind === "subagent" && typeof event.model === "string"
+              ? event.model.trim()
+              : "";
+        setActivitySubagentModel(subagentModel || null);
+        // Keep busy/isLive aligned while a tool process is reporting
+        if (
+          event.sessionId &&
+          (phase === "tool" ||
+            phase === "sleeping" ||
+            phase === "permission" ||
+            (text != null &&
+              /^(Running|Using|Calling|Permission|Queued:)/i.test(text)))
+        ) {
+          busyBySessionRef.current[event.sessionId] = true;
+          syncBusyFromMap();
+        }
         break;
       }
 
@@ -741,18 +945,20 @@ export function useBridge() {
         break;
       case "SessionError":
         setResuming(false);
+        setActivityPhase(null);
+        setActivitySubagentModel(null);
         // Idle agent exit is expected — don't flash a red error, just mark resumable
         if (
           /exited|disconnect|not alive|EPIPE/i.test(event.message) &&
           !/fail|无法|error|崩溃/i.test(event.message)
         ) {
-          setBusy(false);
+          syncBusyFromMap();
           setStatusMsg(null);
           setHistoryOnly(true);
           break;
         }
         setError(event.message);
-        setBusy(false);
+        syncBusyFromMap();
         setStatusMsg(null);
         // agent 挂了 / 断线：标 historyOnly，下次 Send 会 resume 同一 session
         if (
@@ -764,7 +970,9 @@ export function useBridge() {
         }
         break;
       case "SessionEnded":
-        setBusy(false);
+        setActivityPhase(null);
+        setActivitySubagentModel(null);
+        syncBusyFromMap();
         setResuming(false);
         setStatusMsg(null);
         // Idle death / stop — keep timeline, allow resume on next send
@@ -823,7 +1031,7 @@ export function useBridge() {
       default:
         break;
     }
-  }, [flushPendingPrompt, send, sealThoughtLogLine, pushTurnLog]);
+  }, [flushPendingPrompt, send, sealThoughtLogLine, pushTurnLog, noteSessionBusy, syncBusyFromMap]);
 
   useEffect(() => {
     let closed = false;
@@ -854,35 +1062,70 @@ export function useBridge() {
           else if (msg.type === "replay") {
             for (const e of msg.events) applyEvent(e);
           } else if (msg.type === "error") {
-            setError(msg.message);
-            setBusy(false);
-            setResuming(false);
-            setStatusMsg(null);
-            // Resume/create failed before SessionStarted — put queued text back
-            const pending = pendingPromptRef.current;
-            if (pending?.text?.trim()) {
-              setRestoredDraft(pending.text);
-              pendingPromptRef.current = null;
-              setMessages((m) =>
-                m.filter(
-                  (x) =>
-                    !(
-                      x.kind === "user" &&
-                      x.id.startsWith("u-optimistic-") &&
-                      x.text === pending.text
+            const errSid = (msg as { sessionId?: string }).sessionId;
+            const errReq = (msg as { clientRequestId?: string }).clientRequestId;
+            const pending = pendingAttachRef.current;
+            const forPending =
+              (pending?.kind === "new" &&
+                errReq != null &&
+                errReq === pending.requestId) ||
+              (pending?.kind === "resume" &&
+                errSid != null &&
+                errSid === pending.sessionId);
+            const forActive =
+              errSid != null && errSid === sessionIdRef.current;
+            if (!forPending && !forActive && sessionIdRef.current != null) {
+              // Foreign untagged/other-session error — ignore state steal
+            } else {
+              setError(msg.message);
+              if (forPending || forActive || sessionIdRef.current == null) {
+                if (errSid) busyBySessionRef.current[errSid] = false;
+                syncBusyFromMap();
+                setResuming(false);
+                setStatusMsg(null);
+                if (forPending) pendingAttachRef.current = null;
+                const pendingPrompt = pendingPromptRef.current;
+                if (pendingPrompt?.text?.trim()) {
+                  setRestoredDraft(pendingPrompt.text);
+                  pendingPromptRef.current = null;
+                  setMessages((m) =>
+                    m.filter(
+                      (x) =>
+                        !(
+                          x.kind === "user" &&
+                          x.id.startsWith("u-optimistic-") &&
+                          x.text === pendingPrompt.text
+                        )
                     )
-                )
-              );
-            }
-            if (
-              /Unknown session|not found|exited|disconnect|恢复|resume|timeout|Authentication|认证/i.test(
-                msg.message
-              )
-            ) {
-              setHistoryOnly(true);
+                  );
+                }
+                if (
+                  /Unknown session|not found|exited|disconnect|恢复|resume|timeout|Authentication|认证/i.test(
+                    msg.message
+                  )
+                ) {
+                  setHistoryOnly(true);
+                }
+              }
             }
           } else if (msg.type === "status") {
-            setStatusMsg(msg.message?.trim() ? msg.message : null);
+            const stSid = (msg as { sessionId?: string }).sessionId;
+            const stReq = (msg as { clientRequestId?: string }).clientRequestId;
+            const pending = pendingAttachRef.current;
+            const forPending =
+              (pending?.kind === "new" &&
+                stReq != null &&
+                stReq === pending.requestId) ||
+              (pending?.kind === "resume" &&
+                stSid != null &&
+                stSid === pending.sessionId);
+            if (forPending) {
+              setStatusMsg(msg.message?.trim() ? msg.message : null);
+            }
+          } else if (msg.type === "live") {
+            setLiveSessionIds(
+              Array.isArray(msg.sessionIds) ? msg.sessionIds.map(String) : []
+            );
           } else if (msg.type === "notice") {
             setNotice({
               kind: msg.kind,
@@ -951,6 +1194,14 @@ export function useBridge() {
     setContextUsage(null);
     setHistoryOnly(false);
     setSessionId(null); // 清掉旧 id，避免发到死会话
+    sessionIdRef.current = null;
+    setActivityPhase(null);
+    setActivitySubagentModel(null);
+    const requestId =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `req-${Date.now()}`;
+    pendingAttachRef.current = { kind: "new", requestId };
     // Only mark busy (red Stop) when a prompt is queued — bare New Agent is idle
     const willPrompt = Boolean(pendingPromptRef.current);
     setBusy(willPrompt);
@@ -967,6 +1218,7 @@ export function useBridge() {
       model: model.trim() || undefined,
       effort: effectiveEffort,
       permissionMode: permissionModeFor(agentMode),
+      clientRequestId: requestId,
     });
   }, [cwd, model, effort, effortFast, effectiveEffort, agentMode, send]);
 
@@ -982,12 +1234,32 @@ export function useBridge() {
       setResuming(true);
       setBusy(true);
       setError(null);
-      setStatusMsg("正在恢复会话…");
+      setStatusMsg("Resuming session…");
+      pendingAttachRef.current = { kind: "resume", sessionId: histSessionId };
+      sessionIdRef.current = histSessionId;
+      setSessionId(histSessionId);
+      busyBySessionRef.current[histSessionId] = true;
+      syncBusyFromMap();
       // Hard unlock if resume never completes (auth hang / silent stall)
       window.setTimeout(() => {
+        // User may have switched sessions — never steal that chat's UI
+        if (sessionIdRef.current !== histSessionId) {
+          busyBySessionRef.current[histSessionId] = false;
+          syncBusyFromMap();
+          const p = pendingAttachRef.current;
+          if (p?.kind === "resume" && p.sessionId === histSessionId) {
+            pendingAttachRef.current = null;
+          }
+          return;
+        }
         setResuming((r) => {
           if (!r) return r;
-          setBusy(false);
+          const p = pendingAttachRef.current;
+          if (p?.kind === "resume" && p.sessionId === histSessionId) {
+            pendingAttachRef.current = null;
+          }
+          busyBySessionRef.current[histSessionId] = false;
+          syncBusyFromMap();
           setStatusMsg(null);
           setHistoryOnly(true);
           const pending = pendingPromptRef.current;
@@ -1020,28 +1292,122 @@ export function useBridge() {
         permissionMode: permissionModeFor(agentMode),
       });
     },
-    [cwd, model, effort, effortFast, effectiveEffort, agentMode, send]
+    [cwd, model, effort, effortFast, effectiveEffort, agentMode, send, syncBusyFromMap]
   );
 
   /**
    * Open from history: local event replay only (Cursor-style).
    * Does NOT spawn Grok / session/new — that happens lazily on Send via resumeSession.
+   * @returns `{ scrubbed: true }` when an empty/zombie session was removed
    */
   const openHistorySession = useCallback(
-    async (histSessionId: string, histCwd: string) => {
+    async (
+      histSessionId: string,
+      histCwd: string,
+      signal?: AbortSignal
+    ): Promise<{ scrubbed?: boolean } | void> => {
+      const gen = ++openHistGenRef.current;
+      const stillCurrent = () =>
+        gen === openHistGenRef.current && !signal?.aborted;
+      const prevId = sessionIdRef.current;
+
+      // Stash leaving session so A↔B rapid switches don't re-parse multi‑MB jsonl
+      if (prevId && prevId !== histSessionId) {
+        stashSessionChat(prevId);
+      }
+
+      // Pin active session immediately so in-flight WS from other sessions is ignored
+      pendingAttachRef.current = null;
+      sessionIdRef.current = histSessionId;
+      setSessionId(histSessionId);
+      // Drop resume UI lock when leaving an in-flight resume
+      setResuming(false);
+      setError(null);
+      setStatusMsg(null);
+      setActivityPhase(null);
+      setActivitySubagentModel(null);
+      setContextUsage(null);
+      setBusy(!!busyBySessionRef.current[histSessionId]);
+      pendingPromptRef.current = null;
+      setHiddenHistoryCount(0);
+
+      const cached = sessionChatCacheRef.current.get(histSessionId);
+      if (cached?.messages?.length) {
+        // Instant paint from memory, windowed like a virtualized list —
+        // real root cause of "连切卡死" was mounting the WHOLE history's
+        // DOM (markdown + syntax highlight) on every switch, not the parse.
+        suppressPaintRef.current = null;
+        paintWindowed(cached.messages);
+        setTasks([]);
+        setDiffs([]);
+        setPermissions([]);
+        const stillLive =
+          liveSessionIdsRef.current.includes(histSessionId) ||
+          !!busyBySessionRef.current[histSessionId];
+        setHistoryOnly(!stillLive);
+        setBusy(!!busyBySessionRef.current[histSessionId]);
+        turnDoneRef.current = !stillLive;
+        seenSeq.current.clear();
+        setCwd(histCwd);
+        localStorage.setItem("agent-pane-cwd", histCwd);
+        if (!stillLive) {
+          // History-only: memory is enough. Skip multi‑MB re-parse.
+          return;
+        }
+        // Live: paint cache now. Debounced catch-up — rapid A↔B must not
+        // stack concurrent full-history converts (felt like a memory leak).
+        const catchGen = gen;
+        window.setTimeout(() => {
+          if (openHistGenRef.current !== catchGen || signal?.aborted) return;
+          void (async () => {
+            try {
+              const { fetchSessionEvents } = await import("./api");
+              if (!stillCurrent()) return;
+              const events = (await fetchSessionEvents(
+                histSessionId,
+                true,
+                signal
+              )) as DomainEvent[];
+              if (!stillCurrent()) return;
+              const built = await eventsToChatItemsAsync(events, {
+                shouldContinue: stillCurrent,
+              });
+              if (!built || !stillCurrent()) return;
+              sessionChatCacheRef.current.set(histSessionId, {
+                messages: built.slice(),
+                at: Date.now(),
+              });
+              paintWindowed(built);
+            } catch {
+              /* aborted or network — keep cached paint */
+            }
+          })();
+        }, 450);
+        return;
+      } else if (prevId !== histSessionId) {
+        suppressPaintRef.current = histSessionId;
+        setMessages([]);
+        setTasks([]);
+        setDiffs([]);
+        setPermissions([]);
+      } else {
+        suppressPaintRef.current = histSessionId;
+      }
+
       try {
-        setError(null);
-        setStatusMsg(null);
-        setBusy(true);
-        // Drop any queued prompt from a previous resume attempt
-        pendingPromptRef.current = null;
-        const { fetchSessionEvents, deleteSessionApi, invalidateHistoryClientCache } =
-          await import("./api");
+        const {
+          fetchSessionEvents,
+          deleteSessionApi,
+          invalidateHistoryClientCache,
+        } = await import("./api");
+        if (!stillCurrent()) return;
         // Force disk read + clear dedupe so re-open isn't filtered by seenSeq
         const events = (await fetchSessionEvents(
           histSessionId,
-          true
+          true,
+          signal
         )) as DomainEvent[];
+        if (!stillCurrent()) return;
         const hasUser = events.some((e) => e.type === "UserMessageAppended");
         if (!events.length || !hasUser) {
           try {
@@ -1050,10 +1416,21 @@ export function useBridge() {
             /* already gone */
           }
           invalidateHistoryClientCache(histSessionId);
+          if (!stillCurrent()) return;
+          suppressPaintRef.current = null;
           setBusy(false);
           setError("Session is gone or empty — removed from history");
-          return;
+          return { scrubbed: true };
         }
+
+        const built = await eventsToChatItemsAsync(events, {
+          shouldContinue: stillCurrent,
+        });
+        if (!built || !stillCurrent()) return;
+        // Re-check immediately before mutating UI — avoids TOCTOU where a newer
+        // click wins the gen counter but this stale load still setMessages().
+        if (!stillCurrent()) return;
+
         setTasks([]);
         setDiffs([]);
         setPermissions([]);
@@ -1062,71 +1439,17 @@ export function useBridge() {
         postToolsAssistantId.current = null;
         turnDoneRef.current = true;
         seenSeq.current.clear();
-        setSessionId(histSessionId);
         setCwd(histCwd);
         localStorage.setItem("agent-pane-cwd", histCwd);
-        const built = eventsToChatItems(events);
-        setMessages(built);
-        let lastUsage: {
-          used: number;
-          size: number;
-          source:
-            | "acp"
-            | "compact"
-            | "compact_done"
-            | "signals"
-            | "session_info"
-            | "estimate";
-          at?: string;
-          pct?: number;
-        } | null = null;
-        let assistantScan = "";
+        // Fill seenSeq sync, grab provider id — then drop `events` for GC
         let infoProviderId: string | undefined;
-        const takeUsage = (
-          next: NonNullable<typeof lastUsage>
-        ): void => {
+        for (let i = 0; i < events.length; i++) {
+          const e = events[i]!;
           if (
-            lastUsage &&
-            next.source === "signals" &&
-            lastUsage.source === "session_info" &&
-            next.used + 500 < lastUsage.used
+            e.type === "ContextUsage" &&
+            typeof e.providerSessionId === "string"
           ) {
-            return;
-          }
-          if (
-            lastUsage &&
-            next.source === "signals" &&
-            next.used + 500 < lastUsage.used &&
-            lastUsage.source !== "compact_done"
-          ) {
-            return;
-          }
-          lastUsage = next;
-        };
-        for (const e of events) {
-          if (e.type === "MessageChunk" && typeof e.text === "string") {
-            assistantScan += e.text;
-          } else if (e.type === "MessageDone") {
-            const info = parseSessionInfoUsage(assistantScan);
-            assistantScan = "";
-            if (info?.providerSessionId) infoProviderId = info.providerSessionId;
-            if (info && info.size > 0) {
-              takeUsage({
-                used: info.used,
-                size: info.size,
-                source: "session_info",
-                pct: info.pct,
-              });
-            }
-          } else if (e.type === "ContextUsage") {
-            takeUsage({
-              used: e.used,
-              size: e.size,
-              source: e.source,
-              at: e.at,
-              pct: e.pct,
-            });
-            if (e.providerSessionId) infoProviderId = e.providerSessionId;
+            infoProviderId = e.providerSessionId;
           }
           const th =
             typeof (e as { text?: string }).text === "string"
@@ -1136,86 +1459,95 @@ export function useBridge() {
             `${histSessionId}:${e.seq ?? "x"}:${e.at ?? ""}:${e.type}:${th}`
           );
         }
-        // Local transcript size — CLI imports / history often lack matching signals
-        // (resume creates a fresh Grok id with digest-only context).
-        const { estimateMessagesTokens } = await import("./contextUsage");
-        const estimated = estimateMessagesTokens(built);
-        const fallbackSize = 500_000;
-        try {
-          const { fetchContextUsage } = await import("./api");
-          const u = await fetchContextUsage({
-            sessionId: histSessionId,
-            cwd: histCwd,
-            providerSessionId: infoProviderId,
-          });
-          if (u) {
-            // Tiny signals vs fat transcript → digest resume; prefer estimate
-            const signalsTooSmall =
-              estimated > 8_000 && u.used + 2_000 < estimated * 0.5;
-            if (signalsTooSmall) {
-              takeUsage({
-                used: estimated,
-                size: u.size > 0 ? u.size : fallbackSize,
-                source: "estimate",
-                pct: Math.min(
-                  100,
-                  Math.round(
-                    (estimated / (u.size > 0 ? u.size : fallbackSize)) * 100
-                  )
-                ),
-              });
-            } else {
-              takeUsage({
-                used: u.used,
-                size: u.size,
-                source: u.source,
-                pct: u.pct,
-              });
+
+        sessionChatCacheRef.current.set(histSessionId, {
+          messages: built.slice(),
+          at: Date.now(),
+        });
+        paintWindowed(built);
+
+        // Paint chat first — usage fetch must NOT retain the events array
+        suppressPaintRef.current = null;
+        const stillLive =
+          liveSessionIdsRef.current.includes(histSessionId) ||
+          !!busyBySessionRef.current[histSessionId];
+        setHistoryOnly(!stillLive);
+        setBusy(!!busyBySessionRef.current[histSessionId]);
+
+        void (async () => {
+          if (!stillCurrent()) return;
+          const { estimateMessagesTokens } = await import("./contextUsage");
+          if (!stillCurrent()) return;
+          const estimated = estimateMessagesTokens(built);
+          const fallbackSize = 500_000;
+          let lastUsage: {
+            used: number;
+            size: number;
+            source:
+              | "acp"
+              | "compact"
+              | "compact_done"
+              | "signals"
+              | "session_info"
+              | "estimate";
+            at?: string;
+            pct?: number;
+          } | null = null;
+          try {
+            const { fetchContextUsage } = await import("./api");
+            const u = await fetchContextUsage({
+              sessionId: histSessionId,
+              cwd: histCwd,
+              providerSessionId: infoProviderId,
+            });
+            if (!stillCurrent()) return;
+            if (u) {
+              const signalsTooSmall =
+                estimated > 8_000 && u.used + 2_000 < estimated * 0.5;
+              if (signalsTooSmall) {
+                lastUsage = {
+                  used: estimated,
+                  size: u.size > 0 ? u.size : fallbackSize,
+                  source: "estimate",
+                  pct: Math.min(
+                    100,
+                    Math.round(
+                      (estimated / (u.size > 0 ? u.size : fallbackSize)) * 100
+                    )
+                  ),
+                };
+              } else {
+                lastUsage = {
+                  used: u.used,
+                  size: u.size,
+                  source: u.source,
+                  pct: u.pct,
+                };
+              }
             }
+          } catch {
+            /* ignore */
           }
-        } catch {
-          /* ignore */
-        }
-        if (!lastUsage && estimated > 0) {
-          lastUsage = {
-            used: estimated,
-            size: fallbackSize,
-            source: "estimate",
-            pct: Math.min(100, Math.round((estimated / fallbackSize) * 100)),
-          };
-        }
-        // takeUsage mutates lastUsage outside TS control-flow tracking
-        const usageNow = lastUsage;
-        if (
-          usageNow &&
-          usageNow.source !== "session_info" &&
-          estimated > 8_000 &&
-          usageNow.used + 2_000 < estimated * 0.5
-        ) {
-          lastUsage = {
-            used: estimated,
-            size: usageNow.size > 0 ? usageNow.size : fallbackSize,
-            source: "estimate",
-            pct: Math.min(
-              100,
-              Math.round(
-                (estimated /
-                  (usageNow.size > 0 ? usageNow.size : fallbackSize)) *
-                  100
-              )
-            ),
-          };
-        }
-        setContextUsage(lastUsage);
-        setHistoryOnly(true);
-        setBusy(false);
+          if (!lastUsage && estimated > 0) {
+            lastUsage = {
+              used: estimated,
+              size: fallbackSize,
+              source: "estimate",
+              pct: Math.min(100, Math.round((estimated / fallbackSize) * 100)),
+            };
+          }
+          if (!stillCurrent()) return;
+          setContextUsage(lastUsage);
+        })();
       } catch (e) {
+        if (signal?.aborted || !stillCurrent()) return;
+        suppressPaintRef.current = null;
         replayingRef.current = false;
         setBusy(false);
         setError(e instanceof Error ? e.message : String(e));
       }
     },
-    []
+    [stashSessionChat]
   );
 
   const prompt = useCallback(
@@ -1229,6 +1561,8 @@ export function useBridge() {
       }
       // Allow slash-only commands (/compact) and attachment-only sends
       if (!text.trim() && !(attachments && attachments.length)) return;
+      busyBySessionRef.current[sessionId] = true;
+      syncBusyFromMap();
       send({
         type: "session.prompt",
         sessionId,
@@ -1237,13 +1571,18 @@ export function useBridge() {
         permissionMode: permissionModeFor(agentMode),
       });
     },
-    [send, sessionId, agentMode]
+    [send, sessionId, agentMode, syncBusyFromMap]
   );
 
   const cancel = useCallback(() => {
-    if (sessionId) send({ type: "session.cancel", sessionId });
-    setBusy(false);
-  }, [send, sessionId]);
+    if (sessionId) {
+      send({ type: "session.cancel", sessionId });
+      busyBySessionRef.current[sessionId] = false;
+      syncBusyFromMap();
+    } else {
+      setBusy(false);
+    }
+  }, [send, sessionId, syncBusyFromMap]);
 
   const lastUserText = useCallback((): string | null => {
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -1396,7 +1735,12 @@ export function useBridge() {
 
   const respondPermission = useCallback(
     (requestId: string, allow: boolean) => {
-      send({ type: "permission.respond", requestId, allow });
+      send({
+        type: "permission.respond",
+        requestId,
+        allow,
+        sessionId: sessionIdRef.current ?? undefined,
+      });
     },
     [send]
   );
@@ -1422,10 +1766,10 @@ export function useBridge() {
     error,
     setError,
     statusMsg,
+    activityPhase,
+    activitySubagentModel,
     notice,
     clearNotice: () => setNotice(null),
-    /** ms since busy started — for "Waiting for response… 2.2s" */
-    busyElapsed,
     sessionId,
     cwd,
     setCwd,
@@ -1439,11 +1783,18 @@ export function useBridge() {
     agentMode,
     setAgentMode,
     messages,
+    /** Items older than the render window that "Load earlier" can restore */
+    hiddenHistoryCount,
+    loadEarlierHistory,
     contextUsage,
     tasks,
     diffs,
     permissions,
     busy,
+    /** Session ids currently mid-turn (for sidebar working dots) */
+    busySessionIds,
+    /** Session ids with a live agent process */
+    liveSessionIds,
     /** Resume in flight — Send must stay Send, not Stop */
     resuming,
     historyOnly,

@@ -37,6 +37,8 @@ export type DomainEvent =
       /** Re-attached to an existing history session — UI must not wipe messages */
       resumed?: boolean;
       providerSessionId?: string;
+      /** Echo of session.create clientRequestId for parallel-create correlation */
+      clientRequestId?: string;
     })
   | (DomainEventBase & { type: "SessionEnded"; stopReason: string })
   | (DomainEventBase & { type: "SessionError"; message: string })
@@ -128,6 +130,11 @@ export type DomainEvent =
         | "queue"
         | "sleeping"
         | "error";
+      /** When a subagent is running — shown muted on the process outline line */
+      subagentModel?: string;
+      /** Optional agent kind; "subagent" + model also drives the outline chip */
+      agentKind?: "main" | "subagent";
+      model?: string;
     })
   /**
    * Agent-reported context window fill (ACP `usage_update` or Grok compact).
@@ -170,6 +177,8 @@ export type ClientCommand =
       effort?: ReasoningEffort | string;
       /** agent=always-approve · auto=default · plan=no edits */
       permissionMode?: AgentMode | string;
+      /** Correlate SessionStarted when multiple creates run in parallel */
+      clientRequestId?: string;
     }
   | {
       /** Re-attach live agent to an existing history session (same id) */
@@ -197,7 +206,13 @@ export type ClientCommand =
    * Removes that user message and everything after (Claude Code Undo/Retry/Edit).
    */
   | { type: "session.rewindTo"; sessionId: string; userTurnIndex: number }
-  | { type: "permission.respond"; requestId: string; allow: boolean }
+  | {
+      type: "permission.respond";
+      requestId: string;
+      allow: boolean;
+      /** Prefer routing to this live session when multiple agents run */
+      sessionId?: string;
+    }
   | { type: "diff.accept"; sessionId: string; filePath: string | "*" }
   | { type: "diff.reject"; sessionId: string; filePath: string | "*" }
   | { type: "diff.refresh"; sessionId: string };
@@ -206,8 +221,8 @@ export type ServerMessage =
   | { type: "hello"; version: string }
   | { type: "event"; event: DomainEvent }
   | { type: "replay"; sessionId: string; events: DomainEvent[] }
-  | { type: "error"; message: string }
-  | { type: "status"; message: string }
+  | { type: "error"; message: string; sessionId?: string; clientRequestId?: string }
+  | { type: "status"; message: string; sessionId?: string; clientRequestId?: string }
   /** Ephemeral UI panel — not persisted into chat / model context */
   | {
       type: "notice";
@@ -215,7 +230,10 @@ export type ServerMessage =
       title: string;
       /** Markdown body */
       body: string;
-    };
+      sessionId?: string;
+    }
+  /** Which domain sessions currently have a live agent process */
+  | { type: "live"; sessionIds: string[] };
 
 export function nowIso(): string {
   return new Date().toISOString();

@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -6,6 +7,7 @@ import {
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
@@ -15,6 +17,7 @@ import { AgentBrowserPanel } from "./AgentBrowserPanel";
 import { CustomizePanel } from "./CustomizePanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { SessionWorkingDots } from "./SessionWorkingDots";
+import { AgentActivityStrip } from "./AgentActivityStrip";
 import { WorkspacePicker } from "./WorkspacePicker";
 import {
   buildContextBreakdown,
@@ -106,6 +109,162 @@ function folderName(p: string): string {
   if (!p) return "";
   const parts = p.replace(/\/$/, "").split("/").filter(Boolean);
   return parts[parts.length - 1] || p;
+}
+
+function truncateOneLine(text: string, max = 72): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, max - 1).trimEnd()}…`;
+}
+
+/** Top-line task outline for the Cursor-style activity strip.
+ * Prefer plan/task title or tool-row label — never dump the user's raw prompt.
+ */
+/** Latest running tool row, if any (external process — not sister herself). */
+function findRunningTool(messages: ChatItem[]): {
+  label: string;
+  title: string;
+} | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.kind !== "tools" || !m.tools.length) continue;
+    const running = [...m.tools].reverse().find((t) => t.status === "running");
+    if (!running) continue;
+    const raw = running.label?.trim() || "";
+    if (!raw) continue;
+    const title = raw.replace(/^Ran\s+/i, "").trim() || raw;
+    return { label: raw, title };
+  }
+  return null;
+}
+
+/**
+ * External process block (tools / subagents) — excludes sister-only thinking.
+ * Particles + outline + detail only when this is true.
+ */
+function hasExternalProcess(
+  messages: ChatItem[],
+  phase: string | null | undefined,
+  statusMsg: string | null,
+  subagentModel: string | null | undefined
+): boolean {
+  if (subagentModel?.trim()) return true;
+  if (findRunningTool(messages)) return true;
+  if (phase === "tool" || phase === "sleeping" || phase === "permission") {
+    return true;
+  }
+  if (
+    statusMsg != null &&
+    /^(Running|Using|Calling|Permission|Queued:)/i.test(statusMsg)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Line-1 process outline — tool/subagent title only (never user prompt). */
+function activityOutline(
+  messages: ChatItem[],
+  tasks: { content: string; status: string }[],
+  subagentModel: string | null | undefined
+): string {
+  // Prefer in-progress plan/task when a subagent (or similar) owns a named step
+  if (subagentModel?.trim()) {
+    const inProg = tasks.find((t) => t.status === "in_progress");
+    if (inProg?.content?.trim()) return truncateOneLine(inProg.content);
+  }
+  const running = findRunningTool(messages);
+  if (running) return truncateOneLine(running.title);
+  const inProg = tasks.find((t) => t.status === "in_progress");
+  if (inProg?.content?.trim()) return truncateOneLine(inProg.content);
+  // Last completed tool title while still in tool phase (brief gap)
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.kind === "tools" && m.tools.length) {
+      const tool = m.tools[m.tools.length - 1]!;
+      const label = tool.label?.trim();
+      if (label) {
+        return truncateOneLine(label.replace(/^Ran\s+/i, "").trim() || label);
+      }
+    }
+  }
+  return "Working…";
+}
+
+/** Line-2 concrete action from tool activity / statusMsg. */
+function activityDetail(
+  statusMsg: string | null,
+  phase: string | null | undefined,
+  messages: ChatItem[]
+): string {
+  const toolish =
+    phase === "tool" ||
+    phase === "permission" ||
+    phase === "sleeping" ||
+    (statusMsg != null &&
+      /^(Running|Using|Calling|Permission|Queued:)/i.test(statusMsg));
+  if (toolish && statusMsg?.trim()) {
+    return truncateOneLine(statusMsg, 96);
+  }
+  const running = findRunningTool(messages);
+  if (running) {
+    const raw = running.label;
+    if (/^Ran\s+/i.test(raw)) {
+      return truncateOneLine(`Running ${raw.replace(/^Ran\s+/i, "")}`, 96);
+    }
+    if (/^Running\b/i.test(raw)) return truncateOneLine(raw, 96);
+    return truncateOneLine(`Running ${raw}`, 96);
+  }
+  return "";
+}
+
+/** Line-3 Cursor-like agent status (not a tool command). */
+function activityStatusLine(
+  phase: string | null | undefined,
+  statusMsg: string | null,
+  messages: ChatItem[],
+  busy: boolean,
+  busyElapsed: number
+): string {
+  const thinking =
+    phase === "thinking" ||
+    (statusMsg != null && /^Thinking/i.test(statusMsg));
+  if (thinking) {
+    // Mirror timeline "Thought briefly" for short streams
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]!;
+      if (m.kind === "thought" && m.text.trim()) {
+        return m.text.trim().length < 40
+          ? "Thought briefly"
+          : "Thinking…";
+      }
+    }
+    return "Thought briefly";
+  }
+  if (phase === "compact" || (statusMsg != null && /compact/i.test(statusMsg))) {
+    return "Compacting…";
+  }
+  if (phase === "permission") return "Waiting for permission…";
+  if (phase === "queue") return "Planning next moves";
+  if (phase === "working") {
+    if (statusMsg && /waiting for model/i.test(statusMsg)) {
+      const sec = (busyElapsed / 1000).toFixed(1);
+      return `Waiting for model… ${sec}s`;
+    }
+    return "Planning next moves";
+  }
+  if (phase === "tool" || phase === "sleeping") {
+    // Soft status under an active tool
+    return "Working…";
+  }
+  if (busy) {
+    const sec = (busyElapsed / 1000).toFixed(1);
+    return `Waiting for response… ${sec}s`;
+  }
+  if (statusMsg?.trim() && !/^(Running|Using|Calling)/i.test(statusMsg)) {
+    return truncateOneLine(statusMsg, 64);
+  }
+  return "";
 }
 
 /** Models from `grok models` on this machine — passed to `grok agent -m`. */
@@ -282,6 +441,33 @@ function useAutoGrow(
   return crowded;
 }
 
+const mdComponents = {
+  table: ({ children }: { children?: ReactNode }) => (
+    <div className="md-table-wrap">
+      <table>{children}</table>
+    </div>
+  ),
+};
+
+/**
+ * Every WS tick during streaming (tokens, tool events, activity phase…)
+ * re-renders the whole App, and with no memo boundary React re-ran the full
+ * remark/rehype-highlight pipeline for EVERY visible bubble on EVERY tick —
+ * not just the one actively streaming. That's the real "还是挺卡" during
+ * generation. `text` is a primitive, so memo skips untouched bubbles for free.
+ */
+const MemoMarkdown = memo(function MemoMarkdown({ text }: { text: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeHighlight]}
+      components={mdComponents}
+    >
+      {text}
+    </ReactMarkdown>
+  );
+});
+
 export function App() {
   const b = useBridge();
   const [input, setInput] = useState("");
@@ -291,6 +477,14 @@ export function App() {
     () => peekHistoryCache() ?? []
   );
   const [expandedCwd, setExpandedCwd] = useState<Record<string, boolean>>({});
+  /** Optimistic sidebar highlight — pointerdown before history load finishes. */
+  const [sidebarSelectedId, setSidebarSelectedId] = useState<string | null>(
+    null
+  );
+  const activeSessionId = sidebarSelectedId ?? b.sessionId;
+  useEffect(() => {
+    setSidebarSelectedId(b.sessionId);
+  }, [b.sessionId]);
   const [manualOpen, setManualOpen] = useState(false);
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
   const homeLabelRef = useRef<HTMLButtonElement>(null);
@@ -497,8 +691,10 @@ export function App() {
     setHistory(h);
   }, []);
 
+  // Refresh history on mount only — NOT on every session switch.
+  // sessionId-triggered refreshLists remounted the sidebar mid-click and
+  // stacked network work during rapid switching (felt like a freeze).
   useEffect(() => {
-    // 首屏强制拉 history，避免空 cache / 以为「记录没了」
     void refreshLists(true);
   }, [refreshLists]);
 
@@ -636,13 +832,6 @@ export function App() {
       setRightRailW((w) => Math.max(w, Math.max(sidebarW + 120, 400)));
     }
   };
-
-  // 有真实对话后再刷 history（空 New Agent 不应进侧栏）
-  useEffect(() => {
-    if (!b.sessionId || b.messages.length === 0) return;
-    const t = setTimeout(() => void refreshLists(true), 800);
-    return () => clearTimeout(t);
-  }, [b.sessionId, b.messages.length, refreshLists]);
 
   const NEAR_BOTTOM_PX = 48;
   /** Re-pin only when truly at bottom (hysteresis — avoids 一抽一抽). */
@@ -1028,7 +1217,7 @@ export function App() {
       b.createSession();
       return;
     }
-    // Multitask: fork a parallel agent for this send (keep current chat in history)
+    // Multitask: fork a parallel live agent (other sessions keep running)
     if (b.agentMode === "multitask" && b.messages.length > 0) {
       setInput("");
       setAttachments([]);
@@ -1058,12 +1247,26 @@ export function App() {
     requestAnimationFrame(() => taRef.current?.focus());
   };
 
-  const openHist = async (sessionId: string, cwd: string) => {
-    await b.openHistorySession(sessionId, cwd);
-    setExpandedCwd({ [cwd]: true });
-    // If open scrubbed a zombie, refresh sidebar so it disappears
-    invalidateHistoryClientCache(sessionId);
-    await refreshLists(true);
+  const histAbortRef = useRef<AbortController | null>(null);
+  const openHist = (sessionId: string, cwd: string) => {
+    // Expand target folder without collapsing others / without forcing a remount
+    // when already open (pointerdown→setState was swallowing the click).
+    setExpandedCwd((prev) => (prev[cwd] ? prev : { ...prev, [cwd]: true }));
+    setSidebarSelectedId((prev) => (prev === sessionId ? prev : sessionId));
+    // Cancel in-flight history load — rapid multi-click was stacking fetches
+    // and feeling like a freeze.
+    histAbortRef.current?.abort();
+    const ac = new AbortController();
+    histAbortRef.current = ac;
+    void (async () => {
+      const result = await b.openHistorySession(sessionId, cwd, ac.signal);
+      if (ac.signal.aborted) return;
+      // Only refresh sidebar when a zombie session was scrubbed
+      if (result?.scrubbed) {
+        invalidateHistoryClientCache(sessionId);
+        void refreshLists(true);
+      }
+    })();
   };
 
   // CLI / single-instance: `agent-pane open <sessionId>` → same as sidebar open
@@ -1973,6 +2176,12 @@ export function App() {
         aria-hidden
         onMouseDown={startWindowDrag}
       />
+      {/* Web 预览：假红绿灯，用来对折叠键高度（桌面有真灯会隐藏） */}
+      <div className="traffic-lights-mock" aria-hidden>
+        <i />
+        <i />
+        <i />
+      </div>
       <button
         type="button"
         className="sidebar-toggle"
@@ -1980,13 +2189,23 @@ export function App() {
         aria-label={sidebarCollapsed ? "Show sidebar" : "Collapse sidebar"}
         aria-pressed={!sidebarCollapsed}
         onClick={() => setSidebarCollapsed((v) => !v)}
+        style={{
+          // 比灯略大、中线对齐；再往右一点（与 CSS 变量一致）
+          top: 17, // 20 + 12/2 - 18/2
+          left: 86,
+          height: 18,
+          width: 18,
+        }}
       >
         <IconSidebar size={16} />
       </button>
-      <aside
-        className={`sidebar${sidebarCollapsed ? " collapsed" : ""}`}
-        style={sidebarCollapsed ? undefined : { width: sidebarW }}
+      <div
+        className={`sidebar-rail${sidebarCollapsed ? " collapsed" : ""}`}
         aria-hidden={sidebarCollapsed}
+      >
+      <aside
+        className="sidebar"
+        style={sidebarCollapsed ? undefined : { width: sidebarW }}
       >
         <button
           type="button"
@@ -2039,18 +2258,25 @@ export function App() {
                 <div
                   key={s.sessionId}
                   className={`side-item session row nested ${
-                    b.sessionId === s.sessionId ? "active" : ""
+                    activeSessionId === s.sessionId ? "active" : ""
                   } ${
-                    b.busy && b.sessionId === s.sessionId ? "working" : ""
+                    b.busySessionIds?.includes(s.sessionId) ? "working" : ""
                   }`}
                 >
                   <button
                     type="button"
                     className="session-main"
-                    onClick={() => void openHist(s.sessionId, s.cwd)}
+                    onPointerDown={(e) => {
+                      // Open on pointerdown — a prior setState here remounted the
+                      // row and dropped the subsequent click (multi-click stuck).
+                      if (e.button !== 0) return;
+                      e.preventDefault();
+                      openHist(s.sessionId, s.cwd);
+                    }}
+                    onClick={() => openHist(s.sessionId, s.cwd)}
                     title={`${s.title || "Untitled"}\n${s.cwd}`}
                   >
-                    {b.busy && b.sessionId === s.sessionId && (
+                    {b.busySessionIds?.includes(s.sessionId) && (
                       <SessionWorkingDots />
                     )}
                     <span className="name">{s.title || "Untitled"}</span>
@@ -2150,9 +2376,9 @@ export function App() {
                       <div
                         key={s.sessionId}
                         className={`side-item session row nested ${
-                          b.sessionId === s.sessionId ? "active" : ""
+                          activeSessionId === s.sessionId ? "active" : ""
                         } ${
-                          b.busy && b.sessionId === s.sessionId
+                          b.busySessionIds?.includes(s.sessionId)
                             ? "working"
                             : ""
                         }`}
@@ -2160,10 +2386,15 @@ export function App() {
                         <button
                           type="button"
                           className="session-main"
-                          onClick={() => void openHist(s.sessionId, s.cwd)}
+                          onPointerDown={(e) => {
+                            if (e.button !== 0) return;
+                            e.preventDefault();
+                            openHist(s.sessionId, s.cwd);
+                          }}
+                          onClick={() => openHist(s.sessionId, s.cwd)}
                           title={s.title}
                         >
-                          {b.busy && b.sessionId === s.sessionId && (
+                          {b.busySessionIds?.includes(s.sessionId) && (
                             <SessionWorkingDots />
                           )}
                           <span className="name">{s.title || "Untitled"}</span>
@@ -2218,6 +2449,7 @@ export function App() {
           }}
         />
       </aside>
+      </div>
 
       <div className="stage">
         <div
@@ -2345,6 +2577,15 @@ export function App() {
               }}
             >
               <div className="chat-inner">
+              {b.hiddenHistoryCount > 0 && (
+                <button
+                  type="button"
+                  className="ghost-btn compact load-earlier-btn"
+                  onClick={() => b.loadEarlierHistory()}
+                >
+                  展开更早的消息 ({b.hiddenHistoryCount})
+                </button>
+              )}
               {groupChatIntoTurns(b.messages, { busy: b.busy }).map((turn) => {
                 const flatIndex = (item: ChatItem) =>
                   b.messages.findIndex((x) => x.id === item.id);
@@ -2403,12 +2644,27 @@ export function App() {
                     );
                   }
                   if (m.kind === "tools") {
+                    // Activity strip owns live tool UI. Hide the old tl block
+                    // whenever a process is active — don't rely on turn.isLive
+                    // alone (busy can be false while statusMsg still says Running).
+                    const processLive =
+                      turn.isLive ||
+                      b.busy ||
+                      Boolean(b.activitySubagentModel) ||
+                      b.activityPhase === "tool" ||
+                      b.activityPhase === "sleeping" ||
+                      b.activityPhase === "permission" ||
+                      m.tools.some((t) => t.status === "running") ||
+                      (b.statusMsg != null &&
+                        /^(Running|Using|Calling|Permission|Queued:)/i.test(
+                          b.statusMsg
+                        ));
+                    if (processLive) return null;
                     return (
                       <ToolTimeline
                         key={m.id}
                         tools={m.tools}
-                        defaultOpen={turn.isLive}
-                        liveMaxRows={turn.isLive ? 2 : undefined}
+                        defaultOpen={false}
                       />
                     );
                   }
@@ -2440,19 +2696,7 @@ export function App() {
                 ) => (
                   <div className="msg assistant" key={m.id}>
                     <div className="assistant-text">
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        rehypePlugins={[rehypeHighlight]}
-                        components={{
-                          table: ({ children }) => (
-                            <div className="md-table-wrap">
-                              <table>{children}</table>
-                            </div>
-                          ),
-                        }}
-                      >
-                        {m.text}
-                      </ReactMarkdown>
+                      <MemoMarkdown text={m.text} />
                     </div>
                     <div className="resp-actions">
                       <button
@@ -2656,28 +2900,37 @@ export function App() {
                 </div>
               )}
 
-              {/* Cursor-style text shimmer while waiting */}
-              {(b.busy || Boolean(b.statusMsg)) && (
-                <div className="agent-activity" aria-live="polite">
-                  <span className="agent-activity-text agent-activity-shimmer">
-                    {(() => {
-                      const base =
-                        b.statusMsg ||
-                        (b.busy ? "Waiting for response…" : "");
-                      if (!b.busy || !base) return base;
-                      if (
-                        /waiting|working|thinking|model|response|compacting/i.test(
-                          base
-                        )
-                      ) {
-                        const sec = (b.busyElapsed / 1000).toFixed(1);
-                        if (/\d+(\.\d+)?s\s*$/.test(base)) return base;
-                        return `${base.replace(/\.\.\.$/, "…")} ${sec}s`;
-                      }
-                      return base;
-                    })()}
-                  </span>
-                </div>
+              {/* Process rows only for tools/subagents; sister-only → status line */}
+              {(b.busy || Boolean(b.statusMsg) || Boolean(b.activityPhase)) && (
+                <AgentActivityStrip
+                  showProcess={hasExternalProcess(
+                    b.messages,
+                    b.activityPhase,
+                    b.statusMsg,
+                    b.activitySubagentModel
+                  )}
+                  outline={activityOutline(
+                    b.messages,
+                    b.tasks,
+                    b.activitySubagentModel
+                  )}
+                  secondary={b.activitySubagentModel || null}
+                  detail={activityDetail(
+                    b.statusMsg,
+                    b.activityPhase,
+                    b.messages
+                  )}
+                  busy={b.busy}
+                  statusForElapsed={(elapsed) =>
+                    activityStatusLine(
+                      b.activityPhase,
+                      b.statusMsg,
+                      b.messages,
+                      b.busy,
+                      elapsed
+                    )
+                  }
+                />
               )}
 
               <div ref={bottomRef} />

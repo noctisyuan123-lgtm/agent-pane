@@ -362,3 +362,66 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
   sealWorked(eofMs);
   return messages;
 }
+
+/**
+ * Keep only the last `turns` user-turns worth of items.
+ *
+ * Native chat apps (incl. GrokBuild's Swift/SwiftUI list) never pay for this —
+ * virtualized lists only mount what's on screen. Our chat has no virtualization,
+ * so a huge session (thousands of markdown bubbles + syntax-highlighted code
+ * blocks) mounts its ENTIRE history into the DOM on every switch. That mount/
+ * unmount churn — not the JSON parse — is what piles up and stalls the app
+ * after repeated clicking. Windowing the initial paint bounds DOM size the
+ * same way a virtualized list would.
+ */
+export function sliceLastUserTurns(
+  messages: ChatItem[],
+  turns: number
+): { visible: ChatItem[]; hiddenCount: number } {
+  if (turns <= 0 || messages.length === 0) {
+    return { visible: messages, hiddenCount: 0 };
+  }
+  const userIdx: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]!.kind === "user") userIdx.push(i);
+  }
+  if (userIdx.length <= turns) return { visible: messages, hiddenCount: 0 };
+  const startIdx = userIdx[userIdx.length - turns]!;
+  if (startIdx <= 0) return { visible: messages, hiddenCount: 0 };
+  return { visible: messages.slice(startIdx), hiddenCount: startIdx };
+}
+
+/**
+ * Same as eventsToChatItems, but yields to the main thread every `chunkSize`
+ * events so rapid sidebar clicks stay responsive on multi‑MB histories.
+ */
+export async function eventsToChatItemsAsync(
+  events: DomainEvent[],
+  opts?: {
+    chunkSize?: number;
+    shouldContinue?: () => boolean;
+  }
+): Promise<ChatItem[] | null> {
+  const chunkSize = opts?.chunkSize ?? 400;
+  const shouldContinue = opts?.shouldContinue ?? (() => true);
+  if (events.length <= chunkSize) {
+    return shouldContinue() ? eventsToChatItems(events) : null;
+  }
+  // Process via repeated sync slices by calling the full converter only when
+  // small; for large arrays, yield between chunked state-machine steps by
+  // converting in one go after yielding once so UI can paint selection first,
+  // then check cancel again. True chunked SM would duplicate logic — instead
+  // yield heavily around the sync convert.
+  await new Promise<void>((r) => setTimeout(r, 0));
+  if (!shouldContinue()) return null;
+  await new Promise<void>((r) =>
+    typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame(() => r())
+      : setTimeout(r, 0)
+  );
+  if (!shouldContinue()) return null;
+  const built = eventsToChatItems(events);
+  if (!shouldContinue()) return null;
+  return built;
+}
+

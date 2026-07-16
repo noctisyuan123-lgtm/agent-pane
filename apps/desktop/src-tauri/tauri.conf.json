@@ -28,8 +28,8 @@
         "hiddenTitle": true,
         "acceptFirstMouse": true,
         "trafficLightPosition": {
-          "x": 14,
-          "y": 16
+          "x": 24,
+          "y": 20
         },
         "shadow": true
       }

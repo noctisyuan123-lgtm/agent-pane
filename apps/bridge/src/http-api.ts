@@ -20,6 +20,10 @@ import {
   loadCustomizeMcp,
   patchGrokMcp,
   writeCursorMcp,
+  listCustomizeHooks,
+  writeCustomizeHook,
+  deleteCustomizeHook,
+  defaultHookTemplate,
   type GrokMcpPatch,
 } from "./customize-config.js";
 import {
@@ -467,6 +471,56 @@ export async function handleHttp(
         state = writeCursorMcp(body.cursorJson);
       }
       json(res, 200, state);
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    return true;
+  }
+
+  // Customize: ~/.grok/hooks/*.json (+ companion scripts)
+  if (url.pathname === "/api/customize/hooks" && req.method === "GET") {
+    json(res, 200, listCustomizeHooks());
+    return true;
+  }
+
+  if (url.pathname === "/api/customize/hooks" && req.method === "PUT") {
+    try {
+      const body = JSON.parse(await readBody(req)) as {
+        name?: string;
+        content?: string;
+        create?: boolean;
+      };
+      if (!body.name || typeof body.content !== "string") {
+        json(res, 400, { error: "name and content required" });
+        return true;
+      }
+      let content = body.content;
+      if (body.create && !content.trim()) {
+        const base = body.name.replace(/\.json$/i, "");
+        content = defaultHookTemplate(base);
+      }
+      const file = writeCustomizeHook(body.name, content);
+      json(res, 200, { file, ...listCustomizeHooks() });
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    return true;
+  }
+
+  if (url.pathname === "/api/customize/hooks" && req.method === "DELETE") {
+    try {
+      const body = JSON.parse(await readBody(req)) as { name?: string };
+      const name = body.name || url.searchParams.get("name") || "";
+      if (!name) {
+        json(res, 400, { error: "name required" });
+        return true;
+      }
+      deleteCustomizeHook(name);
+      json(res, 200, listCustomizeHooks());
     } catch (e) {
       json(res, 400, {
         error: e instanceof Error ? e.message : String(e),

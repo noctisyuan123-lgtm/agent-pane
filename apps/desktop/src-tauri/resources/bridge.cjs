@@ -6326,6 +6326,9 @@ ${input.text}`;
       at: nowIso()
     });
   }
+  hasPendingPermission(requestId) {
+    return this.pendingPermissions.has(requestId);
+  }
   async respondPermission(requestId, allow) {
     const pending = this.pendingPermissions.get(requestId);
     this.emit({
@@ -6759,12 +6762,45 @@ var SessionManager = class {
   live = /* @__PURE__ */ new Map();
   broadcast;
   permissionMode;
+  /** Serialize create/resume only — prompts must run concurrently across sessions */
+  globalQueue = Promise.resolve();
+  sessionQueues = /* @__PURE__ */ new Map();
   constructor(opts) {
     this.store = opts.store ?? new EventStore();
     this.snapshots = new WorkspaceSnapshotService();
     this.diffEngine = new DiffEngine();
     this.broadcast = opts.broadcast;
     this.permissionMode = opts.permissionMode ?? "auto";
+  }
+  /** Tell UI which sessions currently have a live agent */
+  broadcastLive() {
+    this.broadcast({
+      type: "live",
+      sessionIds: [...this.live.keys()]
+    });
+  }
+  listLiveSessionIds() {
+    return [...this.live.keys()];
+  }
+  enqueueGlobal(fn) {
+    const run = this.globalQueue.then(fn);
+    this.globalQueue = run.then(
+      () => void 0,
+      () => void 0
+    );
+    return run;
+  }
+  enqueueSession(sessionId, fn) {
+    const prev = this.sessionQueues.get(sessionId) ?? Promise.resolve();
+    const run = prev.then(fn);
+    this.sessionQueues.set(
+      sessionId,
+      run.then(
+        () => void 0,
+        () => void 0
+      )
+    );
+    return run;
   }
   publish(event) {
     if (event.type === "SessionStarted" && event.resumed) {
@@ -6839,21 +6875,36 @@ var SessionManager = class {
     } catch {
     }
     this.live.delete(sessionId);
+    this.broadcastLive();
     this.store.purge(sessionId);
   }
   /** After disk delete: purge store even if session was not live. */
   purgeSession(sessionId) {
     this.live.delete(sessionId);
     this.store.purge(sessionId);
+    this.broadcastLive();
   }
   async handleCommand(cmd) {
+    if (cmd.type === "session.create" || cmd.type === "session.resume") {
+      await this.enqueueGlobal(() => this.handleCommandInner(cmd));
+      return;
+    }
+    const sid = "sessionId" in cmd && typeof cmd.sessionId === "string" ? cmd.sessionId : null;
+    if (sid) {
+      await this.enqueueSession(sid, () => this.handleCommandInner(cmd));
+      return;
+    }
+    await this.handleCommandInner(cmd);
+  }
+  async handleCommandInner(cmd) {
     switch (cmd.type) {
       case "session.create":
         await this.createSession(
           cmd.cwd,
           cmd.model,
           cmd.permissionMode ?? this.permissionMode,
-          cmd.effort
+          cmd.effort,
+          cmd.clientRequestId
         );
         break;
       case "session.resume":
@@ -6919,8 +6970,19 @@ var SessionManager = class {
         break;
       }
       case "permission.respond": {
+        const sid = cmd.sessionId;
+        if (sid) {
+          const live = this.live.get(sid);
+          if (live) {
+            await live.adapter.respondPermission(cmd.requestId, cmd.allow);
+            break;
+          }
+        }
         for (const s of this.live.values()) {
-          await s.adapter.respondPermission(cmd.requestId, cmd.allow);
+          if (s.adapter.hasPendingPermission(cmd.requestId)) {
+            await s.adapter.respondPermission(cmd.requestId, cmd.allow);
+            break;
+          }
         }
         break;
       }
@@ -6967,7 +7029,10 @@ var SessionManager = class {
       at: nowIso()
     });
   }
-  /** 关掉所有（或指定 cwd）旧 adapter，避免 grok agent 进程堆僵尸 */
+  /**
+   * Stop live adapters (optional cwd filter). Kept for explicit teardown —
+   * create/resume no longer call this so multiple agents can run in parallel.
+   */
   async stopLiveSessions(filterCwd) {
     const entries = [...this.live.entries()];
     for (const [id, s] of entries) {
@@ -6978,6 +7043,7 @@ var SessionManager = class {
       }
       this.live.delete(id);
     }
+    this.broadcastLive();
   }
   wireAdapter(adapter) {
     adapter.onEvent((e) => {
@@ -7005,18 +7071,19 @@ var SessionManager = class {
       const s = this.live.get(domainSessionId);
       if (s?.adapter === adapter) {
         this.live.delete(domainSessionId);
+        this.broadcastLive();
       }
     });
   }
-  async createSession(cwd, model, permissionMode, effort) {
-    await this.stopLiveSessions();
+  async createSession(cwd, model, permissionMode, effort, clientRequestId) {
     const mode = normalizePermissionMode(
       permissionMode ?? this.permissionMode ?? "agent"
     );
     this.permissionMode = mode;
     this.broadcast({
       type: "status",
-      message: "\u6B63\u5728\u542F\u52A8 Grok agent\u2026"
+      message: "Starting Grok agent\u2026",
+      clientRequestId
     });
     const adapter = new GrokAcpAdapter({
       autoApprove: modeUsesAlwaysApprove(mode)
@@ -7034,7 +7101,8 @@ var SessionManager = class {
     } catch (e) {
       this.broadcast({
         type: "error",
-        message: `\u542F\u52A8\u5931\u8D25: ${e instanceof Error ? e.message : String(e)}`
+        message: `Start failed: ${e instanceof Error ? e.message : String(e)}`,
+        clientRequestId
       });
       return;
     }
@@ -7050,6 +7118,7 @@ var SessionManager = class {
       adapter,
       acceptedFp: /* @__PURE__ */ new Map()
     });
+    this.broadcastLive();
     this.publish({
       type: "SessionStarted",
       sessionId: domainSessionId,
@@ -7057,6 +7126,7 @@ var SessionManager = class {
       model,
       resumed: false,
       providerSessionId,
+      clientRequestId,
       at: nowIso()
     });
     try {
@@ -7123,17 +7193,10 @@ var SessionManager = class {
     this.permissionMode = mode;
     const meta = readMeta(sessionId);
     const providerSessionId = meta?.providerSessionId ?? existing?.providerSessionId;
-    const others = [...this.live.entries()].filter(([id]) => id !== sessionId);
-    for (const [id, s] of others) {
-      try {
-        await s.adapter.stop();
-      } catch {
-      }
-      this.live.delete(id);
-    }
     this.broadcast({
       type: "status",
-      message: "\u6B63\u5728\u6062\u590D\u4F1A\u8BDD\u2026"
+      message: "Resuming session\u2026",
+      sessionId
     });
     const adapter = new GrokAcpAdapter({
       autoApprove: modeUsesAlwaysApprove(mode)
@@ -7159,7 +7222,8 @@ var SessionManager = class {
       const hint = /timed out/i.test(raw) && !/登录|login|Authentication|认证/i.test(raw) ? "\uFF08\u53EF\u518D\u70B9 Send \u91CD\u8BD5\uFF09" : "";
       this.broadcast({
         type: "error",
-        message: `\u6062\u590D\u4F1A\u8BDD\u5931\u8D25: ${raw}${hint}`
+        message: `Resume failed: ${raw}${hint}`,
+        sessionId
       });
       return;
     }
@@ -7176,6 +7240,7 @@ var SessionManager = class {
       adapter,
       acceptedFp: /* @__PURE__ */ new Map()
     });
+    this.broadcastLive();
     this.hydrateAdapterTurns(adapter, sessionId);
     this.publish({
       type: "SessionStarted",
@@ -7445,10 +7510,13 @@ var import_node_os7 = __toESM(require("node:os"), 1);
 var import_node_path10 = __toESM(require("node:path"), 1);
 var GROK_DIR = import_node_path10.default.join(import_node_os7.default.homedir(), ".grok");
 var RULES_DIR = import_node_path10.default.join(GROK_DIR, "rules");
+var HOOKS_DIR = import_node_path10.default.join(GROK_DIR, "hooks");
 var MEMORY_INDEX = import_node_path10.default.join(GROK_DIR, "memory", "MEMORY.md");
 var GROK_CONFIG = import_node_path10.default.join(GROK_DIR, "config.toml");
 var CURSOR_MCP = import_node_path10.default.join(import_node_os7.default.homedir(), ".cursor", "mcp.json");
 var SAFE_RULE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,120}\.md$/;
+var SAFE_HOOK_JSON = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,120}\.json$/;
+var SAFE_HOOK_SCRIPT = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,120}\.(sh|py|js|mjs|cjs|ts)$/;
 var SECRET_ENV_RE = /(KEY|TOKEN|SECRET|PASSWORD|AUTH)/i;
 var MASK = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022";
 function ensureParent(file) {
@@ -7711,6 +7779,137 @@ function writeCursorMcp(jsonText) {
   ensureParent(CURSOR_MCP);
   import_node_fs10.default.writeFileSync(CURSOR_MCP, pretty, "utf8");
   return loadCustomizeMcp();
+}
+function parseHookEvents(content) {
+  try {
+    const parsed = JSON.parse(content);
+    if (!parsed?.hooks || typeof parsed.hooks !== "object") return [];
+    return Object.keys(parsed.hooks).sort();
+  } catch {
+    return [];
+  }
+}
+function resolveHookPath(name) {
+  const p = import_node_path10.default.join(HOOKS_DIR, name);
+  if (import_node_path10.default.resolve(p) !== import_node_path10.default.resolve(HOOKS_DIR, name)) {
+    throw new Error("invalid path");
+  }
+  return p;
+}
+function listCustomizeHooks() {
+  const files = [];
+  try {
+    if (!import_node_fs10.default.existsSync(HOOKS_DIR)) {
+      return { hooksDir: HOOKS_DIR, files: [] };
+    }
+    const names = import_node_fs10.default.readdirSync(HOOKS_DIR).sort();
+    for (const name of names) {
+      const isJson = SAFE_HOOK_JSON.test(name);
+      const isScript = SAFE_HOOK_SCRIPT.test(name);
+      if (!isJson && !isScript) continue;
+      const p = import_node_path10.default.join(HOOKS_DIR, name);
+      try {
+        const st = import_node_fs10.default.statSync(p);
+        if (!st.isFile()) continue;
+        const content = import_node_fs10.default.readFileSync(p, "utf8");
+        files.push({
+          id: name,
+          name,
+          path: p,
+          kind: isJson ? "json" : "script",
+          content,
+          events: isJson ? parseHookEvents(content) : []
+        });
+      } catch {
+      }
+    }
+  } catch {
+  }
+  return { hooksDir: HOOKS_DIR, files };
+}
+function validateHookJson(content) {
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (e) {
+    throw new Error(
+      `invalid JSON: ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("hook file root must be an object");
+  }
+  const obj = parsed;
+  if (!("hooks" in obj) || typeof obj.hooks !== "object" || obj.hooks === null) {
+    throw new Error('hook file must contain a "hooks" object');
+  }
+  return `${JSON.stringify(parsed, null, 2)}
+`;
+}
+function writeCustomizeHook(name, content) {
+  if (typeof content !== "string") throw new Error("content must be a string");
+  if (content.length > 512e3) throw new Error("file too large (max 512KB)");
+  const trimmed = String(name || "").trim();
+  const isJson = SAFE_HOOK_JSON.test(trimmed);
+  const isScript = SAFE_HOOK_SCRIPT.test(trimmed);
+  if (!isJson && !isScript) {
+    throw new Error(
+      "invalid name (use name.json or name.sh|py|js|mjs|cjs|ts)"
+    );
+  }
+  let body = content;
+  if (isJson) {
+    body = validateHookJson(content);
+  }
+  import_node_fs10.default.mkdirSync(HOOKS_DIR, { recursive: true });
+  const p = resolveHookPath(trimmed);
+  import_node_fs10.default.writeFileSync(p, body, { encoding: "utf8", mode: isScript ? 493 : 420 });
+  if (isScript) {
+    try {
+      import_node_fs10.default.chmodSync(p, 493);
+    } catch {
+    }
+  }
+  return {
+    id: trimmed,
+    name: trimmed,
+    path: p,
+    kind: isJson ? "json" : "script",
+    content: body,
+    events: isJson ? parseHookEvents(body) : []
+  };
+}
+function deleteCustomizeHook(name) {
+  const trimmed = String(name || "").trim();
+  if (!SAFE_HOOK_JSON.test(trimmed) && !SAFE_HOOK_SCRIPT.test(trimmed)) {
+    throw new Error("invalid name");
+  }
+  const p = resolveHookPath(trimmed);
+  if (!import_node_fs10.default.existsSync(p)) throw new Error("file not found");
+  import_node_fs10.default.unlinkSync(p);
+}
+function defaultHookTemplate(nameBase) {
+  const safe = nameBase.replace(/[^a-zA-Z0-9._-]/g, "-") || "my-hook";
+  return `${JSON.stringify(
+    {
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: `echo '[${safe}] session start in' "$(pwd)"`,
+                timeout: 5
+              }
+            ]
+          }
+        ]
+      }
+    },
+    null,
+    2
+  )}
+`;
 }
 
 // ../bridge/src/http-api.ts
@@ -8064,6 +8263,48 @@ async function handleHttp(req, res, hooks = {}) {
         state = writeCursorMcp(body.cursorJson);
       }
       json(res, 200, state);
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/customize/hooks" && req.method === "GET") {
+    json(res, 200, listCustomizeHooks());
+    return true;
+  }
+  if (url.pathname === "/api/customize/hooks" && req.method === "PUT") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      if (!body.name || typeof body.content !== "string") {
+        json(res, 400, { error: "name and content required" });
+        return true;
+      }
+      let content = body.content;
+      if (body.create && !content.trim()) {
+        const base = body.name.replace(/\.json$/i, "");
+        content = defaultHookTemplate(base);
+      }
+      const file = writeCustomizeHook(body.name, content);
+      json(res, 200, { file, ...listCustomizeHooks() });
+    } catch (e) {
+      json(res, 400, {
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
+    return true;
+  }
+  if (url.pathname === "/api/customize/hooks" && req.method === "DELETE") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const name = body.name || url.searchParams.get("name") || "";
+      if (!name) {
+        json(res, 400, { error: "name required" });
+        return true;
+      }
+      deleteCustomizeHook(name);
+      json(res, 200, listCustomizeHooks());
     } catch (e) {
       json(res, 400, {
         error: e instanceof Error ? e.message : String(e)
@@ -8852,6 +9093,15 @@ wss.on("connection", (ws, req) => {
   }
   clients.add(ws);
   ws.send(JSON.stringify({ type: "hello", version: "0.1.0" }));
+  try {
+    ws.send(
+      JSON.stringify({
+        type: "live",
+        sessionIds: sessions.listLiveSessionIds()
+      })
+    );
+  } catch {
+  }
   ws.on("message", async (raw) => {
     try {
       const cmd = JSON.parse(String(raw));

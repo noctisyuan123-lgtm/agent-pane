@@ -1,12 +1,16 @@
 import { useEffect, useState } from "react";
 import {
+  deleteCustomizeHook,
   fetchCustomizeFiles,
+  fetchCustomizeHooks,
   fetchCustomizeMcp,
   fetchSkills,
   revealInFinder,
   saveCustomizeFile,
+  saveCustomizeHook,
   saveCustomizeMcp,
   type CustomizeFile,
+  type CustomizeHookFile,
   type CustomizeMcpState,
   type GrokMcpServer,
   type SkillEntry,
@@ -18,7 +22,10 @@ import {
   IconLayers,
   IconList,
   IconPencil,
+  IconPlus,
+  IconSpark,
   IconTerminal,
+  IconTrash,
 } from "./icons";
 
 const MEMORY_INDEX = "/Users/maybach/.grok/memory/MEMORY.md";
@@ -63,6 +70,17 @@ export function CustomizePanel({
   const [mcpError, setMcpError] = useState<string | null>(null);
   const [mcpSaved, setMcpSaved] = useState(false);
 
+  const [hooksDir, setHooksDir] = useState("");
+  const [hookFiles, setHookFiles] = useState<CustomizeHookFile[]>([]);
+  const [hooksLoading, setHooksLoading] = useState(false);
+  const [hookEditing, setHookEditing] = useState<string | null>(null);
+  const [hookDraft, setHookDraft] = useState("");
+  const [hookBusy, setHookBusy] = useState(false);
+  const [hookError, setHookError] = useState<string | null>(null);
+  const [hookSaved, setHookSaved] = useState<string | null>(null);
+  const [newHookName, setNewHookName] = useState("");
+  const [showNewHook, setShowNewHook] = useState(false);
+
   const reloadFiles = async () => {
     setFilesLoading(true);
     try {
@@ -88,6 +106,20 @@ export function CustomizePanel({
     }
   };
 
+  const reloadHooks = async () => {
+    setHooksLoading(true);
+    try {
+      const state = await fetchCustomizeHooks();
+      setHooksDir(state.hooksDir || "");
+      setHookFiles(state.files ?? []);
+    } catch {
+      setHooksDir("");
+      setHookFiles([]);
+    } finally {
+      setHooksLoading(false);
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     setSkillsLoading(true);
@@ -103,6 +135,7 @@ export function CustomizePanel({
       });
     void reloadFiles();
     void reloadMcp();
+    void reloadHooks();
     return () => {
       cancelled = true;
     };
@@ -209,6 +242,84 @@ export function CustomizePanel({
       setMcpError(e instanceof Error ? e.message : String(e));
     } finally {
       setMcpBusy(false);
+    }
+  };
+
+  const openHookEdit = (f: CustomizeHookFile) => {
+    setHookEditing(f.name);
+    setHookDraft(f.content);
+    setHookError(null);
+    setHookSaved(null);
+    setShowNewHook(false);
+  };
+
+  const cancelHookEdit = () => {
+    setHookEditing(null);
+    setHookDraft("");
+    setHookError(null);
+    setShowNewHook(false);
+    setNewHookName("");
+  };
+
+  const saveHookEdit = async () => {
+    if (!hookEditing) return;
+    setHookBusy(true);
+    setHookError(null);
+    try {
+      const state = await saveCustomizeHook(hookEditing, hookDraft, false);
+      setHooksDir(state.hooksDir);
+      setHookFiles(state.files);
+      setHookSaved(state.file.name);
+      setHookEditing(null);
+      setHookDraft("");
+      window.setTimeout(() => setHookSaved(null), 2000);
+    } catch (e) {
+      setHookError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setHookBusy(false);
+    }
+  };
+
+  const createHook = async () => {
+    let name = newHookName.trim();
+    if (!name) {
+      setHookError("给 hook 起个名字");
+      return;
+    }
+    if (!/\.(json|sh|py|js|mjs|cjs|ts)$/i.test(name)) {
+      name = `${name}.json`;
+    }
+    setHookBusy(true);
+    setHookError(null);
+    try {
+      const state = await saveCustomizeHook(name, "", true);
+      setHooksDir(state.hooksDir);
+      setHookFiles(state.files);
+      setShowNewHook(false);
+      setNewHookName("");
+      openHookEdit(state.file);
+      setHookSaved(state.file.name);
+      window.setTimeout(() => setHookSaved(null), 2000);
+    } catch (e) {
+      setHookError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setHookBusy(false);
+    }
+  };
+
+  const removeHook = async (name: string) => {
+    if (!window.confirm(`删除 hook「${name}」？此操作不可撤销。`)) return;
+    setHookBusy(true);
+    setHookError(null);
+    try {
+      const state = await deleteCustomizeHook(name);
+      setHooksDir(state.hooksDir);
+      setHookFiles(state.files);
+      if (hookEditing === name) cancelHookEdit();
+    } catch (e) {
+      setHookError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setHookBusy(false);
     }
   };
 
@@ -386,6 +497,174 @@ export function CustomizePanel({
               />
               {fileError && (
                 <div className="customize-error">{fileError}</div>
+              )}
+            </div>
+          )}
+        </section>
+
+        <section className="customize-section">
+          <h3>
+            <IconSpark size={14} /> Hooks
+          </h3>
+          <p className="customize-hint">
+            读写 <code>~/.grok/hooks/*.json</code>
+            （及同目录脚本）。改完<strong>新会话</strong>生效；可挂
+            SessionStart / PreToolUse / UserPromptSubmit 等。
+          </p>
+
+          <div className="customize-editor-actions" style={{ marginBottom: 8 }}>
+            {hooksDir && (
+              <button
+                type="button"
+                className="customize-mini"
+                onClick={() => void revealInFinder(hooksDir)}
+              >
+                Reveal hooks/
+              </button>
+            )}
+            <button
+              type="button"
+              className="customize-mini"
+              onClick={() => void reloadHooks()}
+              disabled={hooksLoading || hookBusy}
+            >
+              Refresh
+            </button>
+            <button
+              type="button"
+              className="customize-mini customize-mini-primary"
+              onClick={() => {
+                setShowNewHook(true);
+                setHookEditing(null);
+                setHookDraft("");
+                setHookError(null);
+              }}
+              disabled={hookBusy}
+            >
+              <IconPlus size={11} /> New hook
+            </button>
+          </div>
+
+          {hooksLoading && (
+            <div className="customize-empty">Loading hooks…</div>
+          )}
+          {!hooksLoading && hookFiles.length === 0 && !showNewHook && (
+            <div className="customize-empty">
+              还没有 hook。点 New hook 在{" "}
+              <code>~/.grok/hooks/</code> 建一个。
+            </div>
+          )}
+          {!hooksLoading && hookFiles.length > 0 && (
+            <div className="customize-rows">
+              {hookFiles.map((f) => (
+                <div key={f.id} className="customize-row">
+                  <span className="customize-row-label">
+                    {f.kind === "json" ? "Hook" : "Script"}
+                  </span>
+                  <code className="customize-path">{f.name}</code>
+                  {f.events.length > 0 && (
+                    <span className="customize-hook-events">
+                      {f.events.join(" · ")}
+                    </span>
+                  )}
+                  {hookSaved === f.name && (
+                    <span className="customize-saved">Saved</span>
+                  )}
+                  <button
+                    type="button"
+                    className="customize-mini"
+                    onClick={() => openHookEdit(f)}
+                    disabled={hookBusy}
+                  >
+                    <IconPencil size={11} /> Edit
+                  </button>
+                  <button
+                    type="button"
+                    className="customize-mini"
+                    onClick={() => void removeHook(f.name)}
+                    disabled={hookBusy}
+                    title="Delete"
+                  >
+                    <IconTrash size={11} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {showNewHook && (
+            <div className="customize-editor">
+              <div className="customize-editor-head">
+                <span>New hook file</span>
+                <div className="customize-editor-actions">
+                  <button
+                    type="button"
+                    className="customize-mini"
+                    disabled={hookBusy}
+                    onClick={cancelHookEdit}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="customize-mini customize-mini-primary"
+                    disabled={hookBusy}
+                    onClick={() => void createHook()}
+                  >
+                    {hookBusy ? "Creating…" : "Create"}
+                  </button>
+                </div>
+              </div>
+              <label className="customize-field">
+                <span>Filename（默认补 .json）</span>
+                <input
+                  type="text"
+                  value={newHookName}
+                  onChange={(e) => setNewHookName(e.target.value)}
+                  placeholder="my-session-start.json"
+                  spellCheck={false}
+                />
+              </label>
+              {hookError && (
+                <div className="customize-error">{hookError}</div>
+              )}
+            </div>
+          )}
+
+          {hookEditing && (
+            <div className="customize-editor">
+              <div className="customize-editor-head">
+                <span>
+                  Editing <code>{hookEditing}</code>
+                </span>
+                <div className="customize-editor-actions">
+                  <button
+                    type="button"
+                    className="customize-mini"
+                    disabled={hookBusy}
+                    onClick={cancelHookEdit}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="customize-mini customize-mini-primary"
+                    disabled={hookBusy}
+                    onClick={() => void saveHookEdit()}
+                  >
+                    {hookBusy ? "Saving…" : "Save to disk"}
+                  </button>
+                </div>
+              </div>
+              <textarea
+                className="customize-textarea customize-textarea-json"
+                value={hookDraft}
+                onChange={(e) => setHookDraft(e.target.value)}
+                spellCheck={false}
+                rows={16}
+              />
+              {hookError && (
+                <div className="customize-error">{hookError}</div>
               )}
             </div>
           )}

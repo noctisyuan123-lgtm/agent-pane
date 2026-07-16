@@ -6,14 +6,36 @@
    */
   color-scheme: dark;
   /* 窗壳几乎不挡 vibrancy；主区深半透明（要看得见磨砂，别做成实色） */
-  --bg-deep: rgba(10, 10, 10, 0.22);
-  --bg-deep-solid: #0a0a0a;
-  /* 聊天主区：颜色压深 + 仍透（alpha ~0.62，比旧 0.72 更深底、仍半透明） */
-  --bg-editor: rgba(12, 12, 14, 0.62);
-  --bg-editor-solid: #151515;
-  /* 侧栏：贴近 GrokBuild .sidebar material 的轻遮罩 */
-  --bg-sidebar: rgba(22, 22, 22, 0.34);
-  --bg-sidebar-solid: #161616;
+  --bg-deep: rgba(8, 8, 8, 0.22);
+  --bg-deep-solid: #080808;
+  /*
+   * 结构：
+   * - 气泡外 = 几乎不透的正文底（stage / 右栏 / 左轨 border 框）
+   * - 气泡内 = 真洞（无正文底）+ 薄 glass，漏壁纸 / vibrancy
+   * 左轨用 border 做外框挖洞，不是渐变贴纸、也不是整窗垫一层再盖。
+   */
+  /* 正文：茶灰偏灰 */
+  --bg-pane: 28, 27, 26;
+  --bg-editor: rgba(var(--bg-pane), 0.92);
+  --bg-editor-solid: #1c1b1a;
+  /*
+   * 气泡：再压暗一点（深灰黑），alpha 略收，仍能透壁纸。
+   */
+  --bg-sidebar: rgba(14, 14, 14, 0.48);
+  --bg-sidebar-solid: #121212;
+  --sidebar-bubble-inset: 10px;
+  --sidebar-bubble-gap-right: 8px;
+  --sidebar-bubble-radius: 16px;
+  /*
+   * 红绿灯 / 折叠键共用坐标（与 tauri trafficLightPosition 对齐）。
+   * 折叠键 top 必须跟灯顶一致；之前中线算法在 WebView 里对不齐。
+   */
+  --sidebar-lights-x: 24px;
+  --sidebar-lights-y: 20px;
+  --sidebar-lights-size: 12px;
+  /* 折叠键比灯略大，垂直仍以灯带中线对齐；再往右一点 */
+  --sidebar-toggle-left: 86px;
+  --sidebar-toggle-size: 18px;
   /* 不要径向 vignette：WebView/8-bit 会 banding 出「深浅相接光环」 */
   --bg-glow: none;
   /* elevated / composer / bubble ≈ regularMaterial 半透明 */
@@ -75,6 +97,7 @@ body,
   color: var(--text);
   font-family: var(--font);
   font-size: 13.5px;
+  font-weight: 400;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -103,8 +126,8 @@ a {
   height: 100%;
   max-height: 100%;
   overflow: hidden;
-  /* Keep shell nearly clear — let Sidebar vibrancy + per-pane glass show */
-  background: var(--bg-deep);
+  /* 透明：气泡洞才能漏到 vibrancy/壁纸；正文底只铺在 stage / 右栏 / 左轨边框 */
+  background: transparent;
   position: relative;
   /* 一圈立体描边：外亮内暗，贴窗口内侧 */
   box-shadow:
@@ -121,7 +144,8 @@ a {
   position: absolute;
   top: 0;
   left: 0;
-  width: var(--sidebar-w, 248px);
+  /* 气泡 inset + 侧栏宽 + 一点右侧空隙 */
+  width: calc(var(--sidebar-w, 248px) + 20px);
   height: 42px;
   z-index: 55;
   -webkit-app-region: drag;
@@ -147,25 +171,33 @@ a {
 }
 
 /*
- * Pin beside macOS green traffic light. Compact hit box; glyph is wider than tall.
+ * 折叠键：与红绿灯同顶、同高、同一水平带。
+ * 用 !important 压掉任何层叠；数值只来自 :root 变量。
  */
 .sidebar-toggle {
-  position: absolute;
-  top: 5px;
-  left: 88px;
-  z-index: 70;
-  width: 22px;
-  height: 20px;
+  position: absolute !important;
+  /* 垂直：灯带中线对齐（键比灯大时顶会略上移） */
+  top: calc(
+    var(--sidebar-lights-y) + var(--sidebar-lights-size) / 2 -
+      var(--sidebar-toggle-size) / 2
+  ) !important;
+  left: var(--sidebar-toggle-left) !important;
+  z-index: 80;
+  width: var(--sidebar-toggle-size) !important;
+  height: var(--sidebar-toggle-size) !important;
+  min-height: 0 !important;
   border: none;
-  border-radius: 6px;
+  border-radius: 5px;
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  display: inline-flex;
+  display: inline-flex !important;
   align-items: center;
   justify-content: center;
-  padding: 0;
-  line-height: 0;
+  padding: 0 !important;
+  margin: 0 !important;
+  line-height: 0 !important;
+  box-sizing: border-box;
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
@@ -176,9 +208,42 @@ a {
 }
 
 .sidebar-toggle svg {
-  width: 16px;
-  height: 12px;
+  width: 16px !important;
+  height: 13px !important;
   display: block;
+  flex-shrink: 0;
+}
+
+/* Web 预览用假红绿灯，方便对高度（Tauri 里隐藏） */
+.traffic-lights-mock {
+  display: none;
+  position: absolute;
+  top: var(--sidebar-lights-y);
+  left: var(--sidebar-lights-x);
+  z-index: 80;
+  height: var(--sidebar-lights-size);
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+html.no-vibrancy .traffic-lights-mock,
+body.web-preview .traffic-lights-mock {
+  display: flex;
+}
+.traffic-lights-mock i {
+  display: block;
+  width: var(--sidebar-lights-size);
+  height: var(--sidebar-lights-size);
+  border-radius: 50%;
+}
+.traffic-lights-mock i:nth-child(1) {
+  background: #ff5f57;
+}
+.traffic-lights-mock i:nth-child(2) {
+  background: #febc2e;
+}
+.traffic-lights-mock i:nth-child(3) {
+  background: #28c840;
 }
 
 /* Sidebar controls above the drag strip */
@@ -193,43 +258,77 @@ a {
   app-region: no-drag;
 }
 
-/* 侧栏顶：给 traffic lights 留空，并允许拖 */
-.sidebar {
+/*
+ * 左侧轨道：透明洞 + overflow 裁切。
+ * 气泡用 100vmax 同色 box-shadow 把「圆角外侧」填成正文底（跟 stage 连续），
+ * 圆角洞是真的，不是方框 border、也不是四条渐变贴纸。
+ */
+.sidebar-rail {
   position: relative;
   display: flex;
   flex-direction: column;
+  flex-shrink: 0;
+  height: 100%;
+  min-height: 0;
+  padding: var(--sidebar-bubble-inset) var(--sidebar-bubble-gap-right)
+    var(--sidebar-bubble-inset) var(--sidebar-bubble-inset);
+  box-sizing: border-box;
+  background: transparent;
+  overflow: hidden; /* 裁住气泡外扩的 正文底 shadow，别盖到 stage */
+  transition: width 0.16s ease, min-width 0.16s ease, padding 0.16s ease,
+    opacity 0.12s ease;
+}
+
+.sidebar-rail.collapsed {
+  width: 0 !important;
+  min-width: 0 !important;
+  max-width: 0 !important;
+  padding: 0 !important;
+  opacity: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.sidebar-rail.collapsed .sidebar-resizer {
+  display: none;
+}
+
+/*
+ * 气泡：坐在真洞里 → 薄 glass 漏壁纸。
+ * 第一层 shadow 用正文底铺满圆角外（被 rail overflow 裁成左轨一圈）。
+ */
+.sidebar {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
   gap: 2px;
-  padding: 44px 8px 12px; /* top ≈ lights + 间距 */
+  /* 顶：给气泡内 traffic lights + toggle 留空（灯 y=20） */
+  padding: 42px 8px 12px;
+  margin: 0;
   height: 100%;
   min-height: 0;
   width: var(--sidebar-w);
   min-width: 180px;
   max-width: 420px;
-  flex-shrink: 0;
-  overflow: hidden; /* 外层不滚 */
-  background-color: var(--bg-sidebar-solid); /* 无 vibrancy 兜底 */
-  /* Light veil only — blur is mostly NSVisualEffect Sidebar underneath */
-  backdrop-filter: blur(20px) saturate(160%);
-  -webkit-backdrop-filter: blur(20px) saturate(160%);
-  border-right: 1px solid var(--glass-border);
+  flex: 1 1 auto;
+  overflow: hidden;
+  background-color: transparent;
+  background: var(--bg-sidebar);
+  backdrop-filter: blur(22px) saturate(150%);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  border-radius: var(--sidebar-bubble-radius);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  /* 先画的在上层：勾线在上，正文底 fill 垫在最下（仅圆角外） */
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.45),
+    0 8px 28px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.18),
+    0 0 0 100vmax var(--bg-editor);
   font-size: var(--side-font);
   transition: width 0.16s ease, min-width 0.16s ease, padding 0.16s ease,
-    opacity 0.12s ease, border-color 0.12s ease;
-}
-
-.sidebar.collapsed {
-  width: 0 !important;
-  min-width: 0 !important;
-  max-width: 0 !important;
-  padding-left: 0;
-  padding-right: 0;
-  border-right-color: transparent;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.sidebar.collapsed .sidebar-resizer {
-  display: none;
+    opacity 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
 }
 
 /* Always leave Overlay title chrome clear of scroll content */
@@ -241,22 +340,17 @@ a {
   padding-top: 42px;
 }
 
-@supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
-  .sidebar {
-    background-color: transparent;
-    background: var(--bg-sidebar);
-  }
-}
-
-/* Drag edge to resize sidebar */
+/* Drag edge to resize sidebar — sit on bubble's right rim */
 .sidebar-resizer {
   position: absolute;
-  top: 0;
+  top: 12px;
+  bottom: 12px;
   right: -3px;
   width: 6px;
-  height: 100%;
+  height: auto;
   cursor: col-resize;
   z-index: 50;
+  border-radius: 4px;
   -webkit-app-region: no-drag;
 }
 .sidebar-resizer:hover,
@@ -457,7 +551,7 @@ a {
   height: 100%;
   overflow: hidden;
   position: relative; /* jump-bottom 定位 */
-  /* Deep glass — no backdrop-filter; isolation keeps stream paint stable */
+  /* 正文底：几乎不透；与左轨 border 同色连续 */
   background: var(--bg-editor);
   background-image: none;
   /* Isolate paint from sidebar vibrancy while streaming DOM churns */
@@ -474,8 +568,7 @@ a {
   min-width: 180px;
   height: 100%;
   border-left: none;
-  /* Deep glass — no backdrop-filter; blur over transparent webview flickers
-   * hard while the chat stream invalidates layers underneath. */
+  /* 与 stage 同色正文底 */
   background: var(--bg-editor);
   overflow: hidden;
   /* Only animate tab open/collapse — NOT while dragging (feels laggy) */
@@ -2499,17 +2592,21 @@ a {
   padding: 8px 10px;
 }
 
-/* CLI-style live activity — Cursor text shimmer */
+/*
+ * Cursor-style live activity:
+ *   (dots) bold outline …  [subagent model]
+ *          fine detail …
+ *   status …
+ * Process block only when tools/subagents run; sister-only → status alone.
+ */
 .agent-activity {
   display: flex;
-  align-items: center;
-  gap: 9px;
-  font-size: 12.5px;
-  color: rgba(255, 255, 255, 0.42);
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
   padding: 2px 2px 2px;
   /* Sit snug under the last bubble (offsets .chat-inner gap: 26px) */
   margin: -18px 0 0;
-  line-height: 1.4;
   user-select: none;
   background: transparent;
   border: none;
@@ -2520,40 +2617,137 @@ a {
   padding-bottom: 6px;
 }
 
-.agent-activity-text {
+.agent-activity-process {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+}
+
+.agent-activity-dots {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+
+.agent-activity-process-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.agent-activity-outline-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.agent-activity-outline {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.88);
   letter-spacing: 0.01em;
 }
 
-.agent-activity-shimmer {
-  background-image: linear-gradient(
-    90deg,
-    color-mix(in srgb, currentColor 55%, transparent) 0%,
-    color-mix(in srgb, currentColor 55%, transparent) 25%,
-    rgba(255, 255, 255, 0.92) 50%,
-    color-mix(in srgb, currentColor 55%, transparent) 75%,
-    color-mix(in srgb, currentColor 55%, transparent) 100%
-  );
-  background-size: 200% 100%;
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: agent-text-shimmer 2s linear infinite;
+.agent-activity-secondary {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.38);
+  letter-spacing: 0.01em;
 }
 
-@keyframes agent-text-shimmer {
-  0% {
-    background-position: 200% 0;
+.agent-activity-detail-row {
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.agent-activity-detail {
+  font-size: 12px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.42);
+  letter-spacing: 0.01em;
+}
+
+.agent-activity-status-row {
+  min-width: 0;
+  line-height: 1.3;
+  /* Flush left under the whole strip (not nested under outline text) */
+  margin-top: 8px;
+}
+
+.agent-activity--status-only .agent-activity-status-row {
+  margin-top: 0;
+}
+
+.agent-activity-status {
+  font-size: 11px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.32);
+  letter-spacing: 0.01em;
+}
+
+.agent-activity-slide-wrap {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.agent-activity-outline.agent-activity-slide-wrap {
+  flex: 1;
+  min-width: 0;
+}
+
+.agent-activity-slide {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-activity-slide-enter {
+  animation: agent-activity-enter 280ms ease-out forwards;
+}
+
+.agent-activity-slide-exit {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  animation: agent-activity-exit 280ms ease-in forwards;
+  pointer-events: none;
+}
+
+@keyframes agent-activity-enter {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
   }
   to {
-    background-position: -200% 0;
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes agent-activity-exit {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-8px);
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .agent-activity-shimmer {
+  .agent-activity-slide-enter,
+  .agent-activity-slide-exit {
     animation: none;
-    background-image: none;
-    -webkit-text-fill-color: currentColor;
   }
 }
 
@@ -3062,6 +3256,11 @@ a {
   box-sizing: border-box;
 }
 
+.load-earlier-btn {
+  align-self: center;
+  margin-bottom: 4px;
+}
+
 .msg {
   display: flex;
   flex-direction: column;
@@ -3177,11 +3376,10 @@ a {
   max-width: 100%;
   overflow-wrap: anywhere;
   word-break: break-word;
-  /* Match denser system medium (right reference), not thin Inter 450 */
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
     "Hiragino Sans GB", system-ui, sans-serif;
-  font-weight: 480;
-  -webkit-font-smoothing: auto;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
 }
 
 .msg-attach-row {
@@ -3241,8 +3439,8 @@ a {
   max-width: 100%;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
     "Hiragino Sans GB", system-ui, sans-serif;
-  font-weight: 480;
-  -webkit-font-smoothing: auto;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
 }
 
 .msg.assistant .bubble p {
@@ -4658,6 +4856,17 @@ a {
 .customize-mcp-env code {
   color: rgba(200, 210, 220, 0.7);
   font-size: 11px;
+}
+
+.customize-hook-events {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, 0.38);
+  letter-spacing: 0.01em;
 }
 
 @media (max-width: 720px) {

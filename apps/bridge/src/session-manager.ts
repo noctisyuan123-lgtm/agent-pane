@@ -101,6 +101,9 @@ export class SessionManager {
   private live = new Map<string, LiveSession>();
   private broadcast: Broadcast;
   private permissionMode: string;
+  /** Serialize create/resume only — prompts must run concurrently across sessions */
+  private globalQueue: Promise<void> = Promise.resolve();
+  private sessionQueues = new Map<string, Promise<void>>();
 
   constructor(opts: {
     store?: EventStore;
@@ -112,6 +115,43 @@ export class SessionManager {
     this.diffEngine = new DiffEngine();
     this.broadcast = opts.broadcast;
     this.permissionMode = opts.permissionMode ?? "auto";
+  }
+
+  /** Tell UI which sessions currently have a live agent */
+  private broadcastLive(): void {
+    this.broadcast({
+      type: "live",
+      sessionIds: [...this.live.keys()],
+    });
+  }
+
+  listLiveSessionIds(): string[] {
+    return [...this.live.keys()];
+  }
+
+  private enqueueGlobal(fn: () => Promise<void>): Promise<void> {
+    const run = this.globalQueue.then(fn);
+    this.globalQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  private enqueueSession(
+    sessionId: string,
+    fn: () => Promise<void>
+  ): Promise<void> {
+    const prev = this.sessionQueues.get(sessionId) ?? Promise.resolve();
+    const run = prev.then(fn);
+    this.sessionQueues.set(
+      sessionId,
+      run.then(
+        () => undefined,
+        () => undefined
+      )
+    );
+    return run;
   }
 
   private publish(event: DomainEvent): StoredEvent {
@@ -202,6 +242,7 @@ export class SessionManager {
       /* best effort */
     }
     this.live.delete(sessionId);
+    this.broadcastLive();
     // Drop in-memory events so list/load cannot resurrect the folder
     this.store.purge(sessionId);
   }
@@ -210,16 +251,37 @@ export class SessionManager {
   purgeSession(sessionId: string): void {
     this.live.delete(sessionId);
     this.store.purge(sessionId);
+    this.broadcastLive();
   }
 
   async handleCommand(cmd: ClientCommand): Promise<void> {
+    // create/resume mutate the live map — keep a global mutex to avoid orphans
+    if (cmd.type === "session.create" || cmd.type === "session.resume") {
+      await this.enqueueGlobal(() => this.handleCommandInner(cmd));
+      return;
+    }
+    // prompt/cancel/diff/permission: per-session queue so session A sleeping
+    // does not block session B from sending
+    const sid =
+      "sessionId" in cmd && typeof cmd.sessionId === "string"
+        ? cmd.sessionId
+        : null;
+    if (sid) {
+      await this.enqueueSession(sid, () => this.handleCommandInner(cmd));
+      return;
+    }
+    await this.handleCommandInner(cmd);
+  }
+
+  private async handleCommandInner(cmd: ClientCommand): Promise<void> {
     switch (cmd.type) {
       case "session.create":
         await this.createSession(
           cmd.cwd,
           cmd.model,
           cmd.permissionMode ?? this.permissionMode,
-          cmd.effort
+          cmd.effort,
+          cmd.clientRequestId
         );
         break;
       case "session.resume":
@@ -287,8 +349,20 @@ export class SessionManager {
         break;
       }
       case "permission.respond": {
+        const sid = cmd.sessionId;
+        if (sid) {
+          const live = this.live.get(sid);
+          if (live) {
+            await live.adapter.respondPermission(cmd.requestId, cmd.allow);
+            break;
+          }
+        }
+        // Route to the adapter that owns this requestId (multi-live safe)
         for (const s of this.live.values()) {
-          await s.adapter.respondPermission(cmd.requestId, cmd.allow);
+          if (s.adapter.hasPendingPermission(cmd.requestId)) {
+            await s.adapter.respondPermission(cmd.requestId, cmd.allow);
+            break;
+          }
         }
         break;
       }
@@ -347,7 +421,10 @@ export class SessionManager {
     });
   }
 
-  /** 关掉所有（或指定 cwd）旧 adapter，避免 grok agent 进程堆僵尸 */
+  /**
+   * Stop live adapters (optional cwd filter). Kept for explicit teardown —
+   * create/resume no longer call this so multiple agents can run in parallel.
+   */
   private async stopLiveSessions(filterCwd?: string): Promise<void> {
     const entries = [...this.live.entries()];
     for (const [id, s] of entries) {
@@ -359,6 +436,7 @@ export class SessionManager {
       }
       this.live.delete(id);
     }
+    this.broadcastLive();
   }
 
   private wireAdapter(adapter: GrokAcpAdapter): void {
@@ -389,6 +467,7 @@ export class SessionManager {
       const s = this.live.get(domainSessionId);
       if (s?.adapter === adapter) {
         this.live.delete(domainSessionId);
+        this.broadcastLive();
       }
     });
   }
@@ -397,10 +476,10 @@ export class SessionManager {
     cwd: string,
     model?: string,
     permissionMode?: string,
-    effort?: string
+    effort?: string,
+    clientRequestId?: string
   ): Promise<void> {
-    // 先清旧会话——这是「New Agent 点了像死了」的主因
-    await this.stopLiveSessions();
+    // Multi-live: do NOT stop other sessions — Multitask / New Agent run in parallel
 
     const mode = normalizePermissionMode(
       permissionMode ?? this.permissionMode ?? "agent"
@@ -409,7 +488,8 @@ export class SessionManager {
 
     this.broadcast({
       type: "status",
-      message: "正在启动 Grok agent…",
+      message: "Starting Grok agent…",
+      clientRequestId,
     });
 
     const adapter = new GrokAcpAdapter({
@@ -436,7 +516,8 @@ export class SessionManager {
     } catch (e) {
       this.broadcast({
         type: "error",
-        message: `启动失败: ${e instanceof Error ? e.message : String(e)}`,
+        message: `Start failed: ${e instanceof Error ? e.message : String(e)}`,
+        clientRequestId,
       });
       return;
     }
@@ -454,6 +535,7 @@ export class SessionManager {
       adapter,
       acceptedFp: new Map(),
     });
+    this.broadcastLive();
 
     this.publish({
       type: "SessionStarted",
@@ -462,6 +544,7 @@ export class SessionManager {
       model,
       resumed: false,
       providerSessionId,
+      clientRequestId,
       at: nowIso(),
     });
 
@@ -552,20 +635,11 @@ export class SessionManager {
     const providerSessionId =
       meta?.providerSessionId ?? existing?.providerSessionId;
 
-    // Stop other lives but do NOT purge this session's event store
-    const others = [...this.live.entries()].filter(([id]) => id !== sessionId);
-    for (const [id, s] of others) {
-      try {
-        await s.adapter.stop();
-      } catch {
-        /* best effort */
-      }
-      this.live.delete(id);
-    }
-
+    // Multi-live: do NOT stop other sessions
     this.broadcast({
       type: "status",
-      message: "正在恢复会话…",
+      message: "Resuming session…",
+      sessionId,
     });
 
     const adapter = new GrokAcpAdapter({
@@ -601,7 +675,8 @@ export class SessionManager {
           : "";
       this.broadcast({
         type: "error",
-        message: `恢复会话失败: ${raw}${hint}`,
+        message: `Resume failed: ${raw}${hint}`,
+        sessionId,
       });
       return;
     }
@@ -622,6 +697,7 @@ export class SessionManager {
       adapter,
       acceptedFp: new Map(),
     });
+    this.broadcastLive();
     this.hydrateAdapterTurns(adapter, sessionId);
 
     this.publish({

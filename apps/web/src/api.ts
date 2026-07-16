@@ -24,8 +24,24 @@ export type HistoryGroup = {
 /** Client-side cache for history list */
 let historyMem: { at: number; groups: HistoryGroup[] } | null = null;
 const HISTORY_TTL = 15_000;
+/**
+ * Tiny LRU for non-force event reads. Force loads (openHistory) must NOT
+ * accumulate here — multi‑MB jsonl × N sessions was leaking until the UI
+ * froze after rapid switching.
+ */
 const eventsMem = new Map<string, { at: number; events: unknown[] }>();
 const EVENTS_TTL = 60_000;
+const EVENTS_MEM_MAX = 2;
+
+function rememberEvents(sessionId: string, events: unknown[]): void {
+  eventsMem.delete(sessionId);
+  eventsMem.set(sessionId, { at: Date.now(), events });
+  while (eventsMem.size > EVENTS_MEM_MAX) {
+    const oldest = eventsMem.keys().next().value;
+    if (oldest == null) break;
+    eventsMem.delete(oldest);
+  }
+}
 
 export async function fetchHistory(force = false): Promise<HistoryGroup[]> {
   if (
@@ -72,24 +88,26 @@ export async function fetchSessionMeta(
 
 export async function fetchSessionEvents(
   sessionId: string,
-  force = true
+  force = true,
+  signal?: AbortSignal
 ): Promise<unknown[]> {
-  // 打开历史默认强制拉盘，避免脏缓存「加载不出来」
   const hit = eventsMem.get(sessionId);
   if (!force && hit && Date.now() - hit.at < EVENTS_TTL) {
     return hit.events;
   }
   const res = await fetch(
-    `${BRIDGE_HTTP}/api/history/${encodeURIComponent(sessionId)}/events?force=1`
+    `${BRIDGE_HTTP}/api/history/${encodeURIComponent(sessionId)}/events?force=1`,
+    signal ? { signal } : undefined
   );
   if (!res.ok) {
-    // 失败时才回退缓存
     if (hit?.events?.length) return hit.events;
     throw new Error(`Failed to load history HTTP ${res.status}`);
   }
   const data = (await res.json()) as { events: unknown[] };
   const events = data.events ?? [];
-  eventsMem.set(sessionId, { at: Date.now(), events });
+  // Only remember non-force hits in the tiny LRU. Force=openHistory paths
+  // return the array for one-shot convert then let GC reclaim it.
+  if (!force) rememberEvents(sessionId, events);
   return events;
 }
 
@@ -319,6 +337,70 @@ export async function saveCustomizeMcp(input: {
     throw new Error(msg);
   }
   return (await res.json()) as CustomizeMcpState;
+}
+
+export type CustomizeHookFile = {
+  id: string;
+  name: string;
+  path: string;
+  kind: "json" | "script";
+  content: string;
+  events: string[];
+};
+
+export type CustomizeHooksState = {
+  hooksDir: string;
+  files: CustomizeHookFile[];
+};
+
+export async function fetchCustomizeHooks(): Promise<CustomizeHooksState> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/customize/hooks`);
+  if (!res.ok) return { hooksDir: "", files: [] };
+  return (await res.json()) as CustomizeHooksState;
+}
+
+export async function saveCustomizeHook(
+  name: string,
+  content: string,
+  create = false
+): Promise<{ file: CustomizeHookFile } & CustomizeHooksState> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/customize/hooks`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, content, create }),
+  });
+  if (!res.ok) {
+    let msg = `save hook failed HTTP ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body.error) msg = body.error;
+    } catch {
+      /* keep */
+    }
+    throw new Error(msg);
+  }
+  return (await res.json()) as { file: CustomizeHookFile } & CustomizeHooksState;
+}
+
+export async function deleteCustomizeHook(
+  name: string
+): Promise<CustomizeHooksState> {
+  const res = await fetch(`${BRIDGE_HTTP}/api/customize/hooks`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    let msg = `delete hook failed HTTP ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body.error) msg = body.error;
+    } catch {
+      /* keep */
+    }
+    throw new Error(msg);
+  }
+  return (await res.json()) as CustomizeHooksState;
 }
 
 export async function rememberPath(p: string): Promise<void> {

@@ -67,6 +67,17 @@ wss.on("connection", (ws, req) => {
 
   clients.add(ws);
   ws.send(JSON.stringify({ type: "hello", version: "0.1.0" }));
+  // Snapshot of currently live agents (multi-session)
+  try {
+    ws.send(
+      JSON.stringify({
+        type: "live",
+        sessionIds: sessions.listLiveSessionIds(),
+      })
+    );
+  } catch {
+    /* ignore */
+  }
 
   ws.on("message", async (raw) => {
     try {
