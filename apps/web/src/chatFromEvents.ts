@@ -19,6 +19,12 @@ export type ChatItem =
       text: string;
       id: string;
       attachments?: ContextRef[];
+      /**
+       * 0-based index in the full Pane timeline (not the windowed paint array).
+       * Set when building from events / live UserMessageAppended so Retry/Undo
+       * never confuse local window indices with global turn indices.
+       */
+      userTurnIndex?: number;
     }
   | { kind: "assistant"; text: string; id: string }
   /** Short pre-tool narration — muted, not a full reply bubble */
@@ -48,6 +54,45 @@ export function sliceMessagesBeforeUserTurn(
   messages: ChatItem[],
   userTurnIndex: number
 ): ChatItem[] {
+  if (!Number.isFinite(userTurnIndex) || userTurnIndex < 0) {
+    return messages;
+  }
+
+  // Count total users — refuse to wipe everything when index looks bogus
+  let totalUsers = 0;
+  for (const m of messages) {
+    if (m.kind === "user") totalUsers++;
+  }
+  if (totalUsers === 0) return messages;
+  // userTurnIndex must be in [0, totalUsers). If larger, no-op (don't wipe).
+  if (userTurnIndex >= totalUsers) return messages;
+
+  // Prefer stamped global index when unique and consistent with count position.
+  let stampedHits = 0;
+  let stampedAt = -1;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (
+      m?.kind === "user" &&
+      typeof m.userTurnIndex === "number" &&
+      m.userTurnIndex === userTurnIndex
+    ) {
+      stampedHits++;
+      stampedAt = i;
+    }
+  }
+  if (stampedHits === 1 && stampedAt >= 0) {
+    // Sanity: stamped cut should leave (userTurnIndex) user bubbles before it
+    let before = 0;
+    for (let i = 0; i < stampedAt; i++) {
+      if (messages[i]?.kind === "user") before++;
+    }
+    if (before === userTurnIndex) {
+      return messages.slice(0, stampedAt);
+    }
+    // Stamp disagrees with position — fall through to count-based
+  }
+
   let turn = -1;
   for (let i = 0; i < messages.length; i++) {
     if (messages[i]?.kind === "user") {
@@ -218,6 +263,7 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
           attachments: event.attachments?.length
             ? event.attachments
             : undefined,
+          userTurnIndex: turn - 1, // turn is 1-based here
         });
         break;
       }

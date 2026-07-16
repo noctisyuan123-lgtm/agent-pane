@@ -1,8 +1,12 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import {
+  spawn,
+  execFile,
+  execFileSync,
+  type ChildProcess,
+} from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
 import type { ContextRef, DomainEvent } from "@agent-pane/shared";
 import { nowIso } from "@agent-pane/shared";
 import type { AgentProvider } from "./provider-api.js";
@@ -88,8 +92,10 @@ export class GrokAcpAdapter implements AgentProvider {
   private absorbUpdates = false;
   /** Resume digest preamble for first prompt after session/new. */
   private contextPrefix: string | null = null;
-  /** ACP terminal/create sessions */
+  /** ACP terminal/create sessions — scoped to THIS Pane session only */
   private terminals = new Map<string, AcpTerminal>();
+  /** In-flight tool_call ids (for cancel → ToolFailed UI) */
+  private activeTools = new Map<string, string>();
 
   constructor(opts?: {
     grokBin?: string;
@@ -892,6 +898,7 @@ export class GrokAcpAdapter implements AgentProvider {
         const toolId = String(update.toolCallId ?? update.id ?? randomUUID());
         const title = String(update.title ?? update.kind ?? "tool");
         const toolKind = String(update.kind ?? "other");
+        this.activeTools.set(toolId, title);
         this.emit({
           type: "ToolStarted",
           sessionId: sid,
@@ -919,6 +926,7 @@ export class GrokAcpAdapter implements AgentProvider {
           summarize(update);
 
         if (status === "failed" || status === "error") {
+          this.activeTools.delete(toolId);
           this.emit({
             type: "ToolFailed",
             sessionId: sid,
@@ -927,6 +935,7 @@ export class GrokAcpAdapter implements AgentProvider {
             at,
           });
         } else if (status === "completed" || status === "success") {
+          this.activeTools.delete(toolId);
           this.emit({
             type: "ToolFinished",
             sessionId: sid,
@@ -1330,14 +1339,118 @@ export class GrokAcpAdapter implements AgentProvider {
   }
 
   /**
-   * 取消当前 turn。
-   * ACP 规定 session/cancel 是 **notification（无 id）**，
-   * 若带 id 当 request 发，Grok 会回 Method not found，生成不会停。
+   * Kill every ACP terminal process tree owned by THIS adapter (this Pane
+   * session). Other live sessions have their own adapter.terminals maps.
+   */
+  private killSessionProcessTree(signal: NodeJS.Signals = "SIGTERM"): number {
+    let killed = 0;
+    for (const term of this.terminals.values()) {
+      if (term.exited) continue;
+      const pid = term.proc.pid;
+      if (pid && pid > 0) {
+        this.killPidTree(pid, signal);
+        killed++;
+      } else {
+        try {
+          term.proc.kill(signal);
+          killed++;
+        } catch {
+          /* ignore */
+        }
+      }
+      term.exited = true;
+      term.signal = signal;
+      term.exitCode = term.exitCode ?? 1;
+      for (const w of term.waiters.splice(0)) w();
+    }
+    return killed;
+  }
+
+  /** Recurse children via pgrep -P, then signal the root pid. Session-local only. */
+  private killPidTree(pid: number, signal: NodeJS.Signals): void {
+    if (!Number.isFinite(pid) || pid <= 0) return;
+    if (process.platform !== "win32") {
+      try {
+        const out = execFileSync("pgrep", ["-P", String(pid)], {
+          encoding: "utf8",
+        });
+        for (const line of out.split("\n")) {
+          const child = Number(line.trim());
+          if (Number.isFinite(child) && child > 0) {
+            this.killPidTree(child, signal);
+          }
+        }
+      } catch {
+        /* no children */
+      }
+    }
+    try {
+      process.kill(pid, signal);
+    } catch {
+      /* already dead */
+    }
+  }
+
+  /**
+   * 取消当前 turn：停模型 + 杀本 session 的脚本/终端树 + 标工具失败。
+   * 不碰其他 live session（各自独立 adapter / terminals）。
+   * ACP 规定 session/cancel 是 **notification（无 id）**。
+   *
+   * Order matters: Core cancel FIRST (stop tool loop / subagents), then hard-kill
+   * host ACP terminals. Waking wait_for_exit before Core cancel can look like
+   * "tool finished" and let the model keep talking.
    */
   async cancel(_sessionId: string): Promise<void> {
     this.turnCancelled = true;
+    const at = nowIso();
 
-    // 取消进行中的权限请求
+    // 1) Tell Core immediately (this providerSession only) — soft-stop model + tool loop
+    if (this.providerSessionId) {
+      try {
+        this.transport?.notify("session/cancel", {
+          sessionId: this.providerSessionId,
+        });
+      } catch (e) {
+        console.warn(
+          `[adapter] session/cancel notify failed:`,
+          e instanceof Error ? e.message : e
+        );
+      }
+    }
+
+    // 2) Hard-kill host-side ACP terminals (sleep / bash) for THIS session only
+    const nTerm = this.killSessionProcessTree("SIGTERM");
+    if (nTerm > 0) {
+      const pids: number[] = [];
+      for (const term of this.terminals.values()) {
+        const pid = term.proc.pid;
+        if (pid && pid > 0) pids.push(pid);
+      }
+      setTimeout(() => {
+        for (const pid of pids) {
+          try {
+            process.kill(pid, 0);
+            this.killPidTree(pid, "SIGKILL");
+          } catch {
+            /* gone */
+          }
+        }
+      }, 600);
+    }
+
+    // 3) Mark open tools failed so UI stops "Running…"
+    for (const [toolId, title] of this.activeTools) {
+      this.emit({
+        type: "ToolFailed",
+        sessionId: this.domainSessionId,
+        toolId,
+        error: `Interrupted by user${title ? ` (${title})` : ""}`,
+        at,
+      });
+    }
+    this.activeTools.clear();
+
+    // 4) Cancel pending permissions
     for (const [requestId, pending] of this.pendingPermissions) {
       this.reply(pending.rpcId, { outcome: { outcome: "cancelled" } });
       this.emit({
@@ -1345,20 +1458,16 @@ export class GrokAcpAdapter implements AgentProvider {
         sessionId: this.domainSessionId,
         requestId,
         allow: false,
-        at: nowIso(),
+        at,
       });
     }
     this.pendingPermissions.clear();
 
-    // 关键：notification，不要 id，不要 await 响应
-    if (this.providerSessionId) {
-      this.transport?.notify("session/cancel", {
-        sessionId: this.providerSessionId,
-      });
-    }
-
-    // 立刻让 UI 脱 busy；prompt 的 JSON-RPC 稍后会以 cancelled 回来
-    if (this.promptInFlight) {
+    // 5) UI drop busy immediately; in-flight session/prompt RPC returns cancelled later
+    const wasInFlight = this.promptInFlight;
+    this.promptInFlight = false;
+    this.emitActivity(null);
+    if (wasInFlight) {
       this.emit({
         type: "MessageDone",
         sessionId: this.domainSessionId,
@@ -1366,13 +1475,20 @@ export class GrokAcpAdapter implements AgentProvider {
         at: nowIso(),
       });
     }
+    console.log(
+      `[adapter] cancel session=${this.domainSessionId.slice(0, 8)} ` +
+        `provider=${(this.providerSessionId || "").slice(0, 8)} ` +
+        `terminalsKilled=${nTerm} wasInFlight=${wasInFlight}`
+    );
   }
 
   /**
    * Discard user turn `userTurnIndex` and everything after (Claude Code Undo).
-   * 1) cancel in-flight turn
-   * 2) best-effort Grok `_x.ai/rewind/*` to that prompt index
-   * 3) always emit SessionRewound so UI + event store can truncate
+   * 1) cancel only if a prompt is in flight (idle cancel injects
+   *    `[Request interrupted by user]` into Core context — never do that for Retry)
+   * 2) best-effort Grok `_x.ai/rewind/*` (verify points shrunk)
+   * 3) emit SessionRewound so Host truncates Pane log
+   * Host rebinds with digest when providerOk is false.
    */
   async rewindToUserTurn(userTurnIndex: number): Promise<{
     restoredText: string;
@@ -1391,96 +1507,170 @@ export class GrokAcpAdapter implements AgentProvider {
       throw new Error("Invalid turn to undo");
     }
 
-    await this.cancel(this.domainSessionId);
+    // Only cancel when generating — idle cancel pollutes Core with interrupt noise.
+    if (this.promptInFlight) {
+      await this.cancel(this.domainSessionId);
+    }
 
     const restoredText = this.userTurns[userTurnIndex]!;
     let providerOk = false;
     let note: string | undefined;
 
     try {
-      const pts = (await this.send("_x.ai/rewind/points", {
-        sessionId: this.providerSessionId,
-      })) as {
-        rewind_points?: Array<{ prompt_index: number; prompt_preview?: string }>;
+      const listPoints = async () => {
+        const pts = (await this.send("_x.ai/rewind/points", {
+          sessionId: this.providerSessionId,
+        })) as {
+          rewind_points?: Array<{
+            prompt_index: number;
+            prompt_preview?: string;
+          }>;
+        };
+        return pts?.rewind_points ?? [];
       };
 
-      const points = pts?.rewind_points ?? [];
-      if (points.length === 0) {
-        note = "UI undid the turn; Grok had no rewind point";
+      const pointsBefore = await listPoints();
+      if (pointsBefore.length === 0) {
+        note = "Grok had no rewind point — will rebind provider context";
       } else {
         // Align Pane userTurns with Grok points (resume may add digest turns)
         let target =
-          points[userTurnIndex] ??
-          points.find((p) => {
+          pointsBefore[userTurnIndex] ??
+          pointsBefore.find((p) => {
             const preview = (p.prompt_preview ?? "").trim();
-            return preview && restoredText.trim().startsWith(preview.slice(0, 40));
+            return (
+              preview && restoredText.trim().startsWith(preview.slice(0, 40))
+            );
           }) ??
           null;
-        if (!target && points.length === this.userTurns.length) {
-          target = points[userTurnIndex] ?? null;
+        if (!target && pointsBefore.length === this.userTurns.length) {
+          target = pointsBefore[userTurnIndex] ?? null;
         }
         if (!target && userTurnIndex === this.userTurns.length - 1) {
-          target = points[points.length - 1] ?? null;
+          target = pointsBefore[pointsBefore.length - 1] ?? null;
         }
         if (!target) {
-          // Fall back: map from the end (shared suffix of turns)
-          const offset = points.length - this.userTurns.length;
-          if (offset >= 0 && points[offset + userTurnIndex]) {
-            target = points[offset + userTurnIndex]!;
+          const offset = pointsBefore.length - this.userTurns.length;
+          if (offset >= 0 && pointsBefore[offset + userTurnIndex]) {
+            target = pointsBefore[offset + userTurnIndex]!;
           }
         }
 
         if (!target) {
           note =
-            "UI undid the turn; could not map Grok rewind point — model may still recall later messages";
+            "Could not map Grok rewind point — will rebind provider context";
         } else {
-          const result = (await this.send("_x.ai/rewind/execute", {
-            sessionId: this.providerSessionId,
-            target_prompt_index: target.prompt_index,
-            mode: "conversation_only",
-          })) as {
-            success?: boolean;
-            prompt_text?: string | null;
-            error?: string | null;
-          };
-
-          if (result?.success) {
-            providerOk = true;
-            note = undefined;
-          } else {
-            note =
-              "UI undid the turn; Grok rewind not confirmed — model may still recall later messages";
+          // Prefer `all` — conversation_only often returns success:false on 0.2.101
+          const modes = ["all", "conversation_only"] as const;
+          for (const mode of modes) {
             try {
-              await this.send("_x.ai/rewind/execute", {
+              const result = (await this.send("_x.ai/rewind/execute", {
                 sessionId: this.providerSessionId,
                 target_prompt_index: target.prompt_index,
-                mode: "all",
-              });
-            } catch {
-              /* ignore */
+                mode,
+              })) as {
+                success?: boolean;
+                prompt_text?: string | null;
+                error?: string | null;
+              };
+              const after = await listPoints();
+              // Success if Core reports it OR points actually shrank / dropped target
+              const shrunk = after.length < pointsBefore.length;
+              const droppedTarget = !after.some(
+                (p) => p.prompt_index === target!.prompt_index
+              );
+              if (result?.success || shrunk || droppedTarget) {
+                providerOk = true;
+                note = undefined;
+                break;
+              }
+              note =
+                result?.error ||
+                `Grok rewind mode=${mode} not confirmed`;
+            } catch (e) {
+              note = `Grok rewind mode=${mode} failed: ${
+                e instanceof Error ? e.message : String(e)
+              }`;
             }
+          }
+          if (!providerOk) {
+            note = `${note ?? "Grok rewind failed"} — will rebind provider context`;
           }
         }
       }
     } catch (e) {
-      note = `UI undid the turn; Grok rewind failed: ${
+      note = `Grok rewind failed: ${
         e instanceof Error ? e.message : String(e)
-      }`;
+      } — will rebind provider context`;
     }
 
     this.userTurns = this.userTurns.slice(0, userTurnIndex);
 
-    this.emit({
-      type: "SessionRewound",
-      sessionId: this.domainSessionId,
-      restoredText,
-      userTurnIndex,
-      providerOk,
-      note,
-      at: nowIso(),
-    });
-
+    // Host publishes SessionRewound after optional rebind — do not emit here
+    // (UI must not re-prompt against stale Core context mid-rebind).
     return { restoredText, userTurnIndex, providerOk, note };
+  }
+
+  /**
+   * After a failed Core rewind: open a fresh provider session on the same
+   * transport and attach digest via setContextPrefix (Host). Does NOT emit
+   * SessionEnded — live Pane session stays continuous.
+   */
+  async rebindProviderSession(opts: {
+    cwd: string;
+    model?: string;
+    effort?: string;
+  }): Promise<{ providerSessionId: string }> {
+    // Drop old demux binding (serve); stdio replaces the whole process.
+    if (this.serveView && this.providerSessionId) {
+      try {
+        const { AcpWsHub } = await import("./acp-ws-hub.js");
+        AcpWsHub.shared().unbindProvider(this.providerSessionId);
+      } catch {
+        /* ignore */
+      }
+      this.serveView.providerSessionId = "";
+    }
+
+    if (this.transportMode === "stdio") {
+      try {
+        this.transport?.dispose();
+      } catch {
+        /* ignore */
+      }
+      this.transport = null;
+      this.openStdioTransport({
+        cwd: opts.cwd,
+        model: opts.model ?? this.model,
+        effort: opts.effort ?? this.effort,
+      });
+      await this.send("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: {
+          fs: { readTextFile: true, writeTextFile: true },
+          terminal: true,
+        },
+        clientInfo: { name: "agent-pane", version: "0.1.2" },
+      });
+    } else {
+      // Serve: keep shared WS; only session/new
+      await this.openServeTransport();
+    }
+
+    const result = (await this.send(
+      "session/new",
+      { cwd: opts.cwd || this.cwd, mcpServers: [] },
+      25_000
+    )) as { sessionId?: string };
+
+    this.providerSessionId = result.sessionId ?? randomUUID();
+    if (this.serveView) {
+      this.serveView.attachProviderSession(this.providerSessionId);
+    }
+    this.promptInFlight = false;
+    this.turnCancelled = false;
+    this.closed = false;
+    return { providerSessionId: this.providerSessionId };
   }
 
   /**

@@ -560,8 +560,18 @@ export function App() {
   createFn.current = b.createSession;
 
   const hasMessages = b.messages.length > 0;
-  /** Resume/history must keep Send — not Stop */
-  const showStop = b.busy && hasMessages && !b.resuming && !b.historyOnly;
+  /** Stop whenever a turn looks in-flight — don't require !historyOnly (that hid Stop). */
+  const showStop =
+    hasMessages &&
+    !b.resuming &&
+    (b.busy ||
+      b.activityPhase === "working" ||
+      b.activityPhase === "thinking" ||
+      b.activityPhase === "tool" ||
+      b.activityPhase === "permission" ||
+      b.activityPhase === "compact" ||
+      b.activityPhase === "queue" ||
+      b.activityPhase === "sleeping");
   /** 有消息才进对话布局；空会话/新会话 = Cursor 式居中 Home */
   const showHome = !hasMessages;
   // Home hero: always roomy toolbar row (model bottom-left); follow-up uses auto crowded
@@ -1232,13 +1242,46 @@ export function App() {
   };
 
   const onSubmit = () => {
-    // Stop only when a real turn is in flight (not resume / bare New Agent)
-    if (showStop) {
+    // Stop button (same slot as Send) — always cancel when in-flight
+    if (showStop || b.busy) {
       b.cancel();
       return;
     }
     void ensureSessionAndSend(input);
   };
+
+  /** Terminal-style stop: Escape / bare Ctrl·Cmd+C while a turn is in flight */
+  useEffect(() => {
+    if (!showStop) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setRespMenuOpen(false);
+        setRespMenuTarget(null);
+        b.cancel();
+        return;
+      }
+      // Ctrl/Cmd+C — only when nothing is selected (else let copy work)
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "c"
+      ) {
+        const ta = taRef.current;
+        const taHasSel =
+          !!ta &&
+          document.activeElement === ta &&
+          ta.selectionStart !== ta.selectionEnd;
+        const docSel = (window.getSelection()?.toString() ?? "").length > 0;
+        if (taHasSel || docSel) return;
+        e.preventDefault();
+        b.cancel();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [showStop, b.cancel]);
 
   const pickSlash = (c: SlashCommand) => {
     const rest = c.input ? " " : " ";
@@ -1841,6 +1884,12 @@ export function App() {
                 }
               }
               if (e.key === "Escape" && !ime) {
+                // In-flight turn: Escape = Stop (terminal-style), not only dismiss menus
+                if (showStop) {
+                  e.preventDefault();
+                  b.cancel();
+                  return;
+                }
                 closePlus();
                 setModelMenuOpen(false);
                 setEffortMenuOpen(false);
@@ -1984,10 +2033,18 @@ export function App() {
           className={`send-btn ${showStop ? "stop" : ""}`}
           onClick={onSubmit}
           disabled={
-            !b.connected ||
-            (!showStop && !input.trim() && attachments.length === 0)
+            // Stop must stay clickable even if WS blips; Send still needs connection
+            showStop
+              ? false
+              : !b.connected || (!input.trim() && attachments.length === 0)
           }
-          title={showStop ? "Stop" : showHome ? "Start" : "Send"}
+          title={
+            showStop
+              ? "Stop generating (Esc)"
+              : showHome
+                ? "Start"
+                : "Send"
+          }
         >
           {showStop ? <IconStop size={13} /> : <IconArrowUp size={15} />}
         </button>
@@ -2586,6 +2643,9 @@ export function App() {
               {groupChatIntoTurns(b.messages, { busy: b.busy }).map((turn) => {
                 const flatIndex = (item: ChatItem) =>
                   b.messages.findIndex((x) => x.id === item.id);
+                // ⋯ only after the turn settles (MessageDone / cancel / history).
+                // Avoids live stream layout jump (right → left) and useless menus mid-gen.
+                const showMsgActions = !turn.isLive;
 
                 const openRespMenu = (
                   e: ReactMouseEvent,
@@ -2593,6 +2653,7 @@ export function App() {
                   item: ChatItem
                 ) => {
                   e.stopPropagation();
+                  if (turn.isLive) return;
                   const r = (
                     e.currentTarget as HTMLButtonElement
                   ).getBoundingClientRect();
@@ -2606,9 +2667,15 @@ export function App() {
                   if (y + menuH > window.innerHeight - 8) {
                     y = Math.max(8, r.top - menuH - 4);
                   }
+                  const mi = flatIndex(item);
+                  if (mi < 0) {
+                    // Don't fall back to 0 — that made Retry rewind turn 0 and wipe history
+                    b.setError("Could not locate that message for Retry/Undo");
+                    return;
+                  }
                   setRespMenuTarget({
                     text,
-                    messageIndex: Math.max(0, flatIndex(item)),
+                    messageIndex: mi,
                     canMutate: !b.busy,
                   });
                   setRespMenuPos({ x, y });
@@ -2691,21 +2758,26 @@ export function App() {
                 const renderReply = (
                   m: Extract<ChatItem, { kind: "assistant" }>
                 ) => (
-                  <div className="msg assistant" key={m.id}>
+                  <div
+                    className={`msg assistant${showMsgActions ? "" : " no-actions"}`}
+                    key={m.id}
+                  >
                     <div className="assistant-text">
                       <MemoMarkdown text={m.text} />
                     </div>
-                    <div className="resp-actions">
-                      <button
-                        type="button"
-                        className="resp-more-btn"
-                        title="Message actions"
-                        aria-label="Message actions"
-                        onClick={(e) => openRespMenu(e, m.text, m)}
-                      >
-                        <IconMoreVertical size={16} />
-                      </button>
-                    </div>
+                    {showMsgActions && (
+                      <div className="resp-actions">
+                        <button
+                          type="button"
+                          className="resp-more-btn"
+                          title="Message actions"
+                          aria-label="Message actions"
+                          onClick={(e) => openRespMenu(e, m.text, m)}
+                        >
+                          <IconMoreVertical size={16} />
+                        </button>
+                      </div>
+                    )}
                   </div>
                 );
 
@@ -2713,7 +2785,10 @@ export function App() {
                 return (
                   <div className="chat-turn" key={turn.key}>
                     {user && (
-                      <div className="msg user" key={user.id}>
+                      <div
+                        className={`msg user${showMsgActions ? "" : " no-actions"}`}
+                        key={user.id}
+                      >
                         <div className="label-row">
                           <div className="label">You</div>
                         </div>
@@ -2769,19 +2844,21 @@ export function App() {
                           user.text !== "(attached files)" && (
                             <div className="bubble">{user.text}</div>
                           )}
-                        <div className="resp-actions">
-                          <button
-                            type="button"
-                            className="resp-more-btn"
-                            title="Message actions"
-                            aria-label="Message actions"
-                            onClick={(e) =>
-                              openRespMenu(e, user.text, user)
-                            }
-                          >
-                            <IconMoreVertical size={16} />
-                          </button>
-                        </div>
+                        {showMsgActions && (
+                          <div className="resp-actions">
+                            <button
+                              type="button"
+                              className="resp-more-btn"
+                              title="Message actions"
+                              aria-label="Message actions"
+                              onClick={(e) =>
+                                openRespMenu(e, user.text, user)
+                              }
+                            >
+                              <IconMoreVertical size={16} />
+                            </button>
+                          </div>
+                        )}
                       </div>
                     )}
                     {/* Live: preserve interleaved stream order */}

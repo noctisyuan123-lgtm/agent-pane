@@ -1,10 +1,18 @@
 /**
- * Lifecycle for `grok agent serve` — spawn / adopt / health / shutdown.
- * Secret never logged; URL built as ws://host:port/ws?server-key=…
+ * Lifecycle for `grok agent serve` — spawn / adopt / reclaim orphan / shutdown.
+ *
+ * Why orphans happen (vs Claude Code):
+ * - Claude Code keeps the agent as a **child of the app/CLI** process tree; quit → tree dies.
+ * - `grok agent serve` is a **long-lived daemon** on a fixed port (designed to outlive clients).
+ * - If Bridge is SIGKILL'd (Tauri kill) or crashes, the daemon is reparented to launchd (PPID 1)
+ *   and keeps 2419 — next Bridge cannot adopt without the secret.
+ *
+ * Mitigations: persist secret (0600) for adopt; on failed probe in auto mode, reclaim port; shutdown
+ * kills by child handle **or** recorded pid.
  *
  * @see docs/superpowers/specs/2026-07-16-wave4-grok-agent-serve.md
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { execSync, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
@@ -28,8 +36,10 @@ type DaemonFile = {
   bind: string;
   host: string;
   port: number;
-  /** sha256 hex of secret — not the secret itself */
-  secretHash: string;
+  /** Local-only adopt key (chmod 0600). Not for git / UI. */
+  secret?: string;
+  /** sha256 hex — optional integrity / legacy files */
+  secretHash?: string;
   pid?: number;
   managed: boolean;
   startedAt: string;
@@ -111,6 +121,76 @@ async function probeWs(wsUrl: string, timeoutMs = 4000): Promise<boolean> {
   }
 }
 
+function readDaemonFile(): DaemonFile | null {
+  try {
+    if (!fs.existsSync(daemonFilePath())) return null;
+    return JSON.parse(fs.readFileSync(daemonFilePath(), "utf8")) as DaemonFile;
+  } catch {
+    return null;
+  }
+}
+
+/** SIGTERM then SIGKILL a pid (orphan reclaim). */
+function killPid(pid: number, label: string): void {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    /* already dead */
+  }
+  // brief wait is async elsewhere; sync escalate after short spin
+  const start = Date.now();
+  while (Date.now() - start < 400) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+    console.log(`[daemon] ${label} pid=${pid} (SIGKILL)`);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Free bind port: kill pid from daemon.json and/or anything still listening.
+ * Uses lsof when available (macOS/Linux).
+ */
+function reclaimPort(host: string, port: number): void {
+  const file = readDaemonFile();
+  if (file?.pid && file.managed) {
+    console.warn(
+      `[daemon] reclaiming managed orphan pid=${file.pid} on ${host}:${port}`
+    );
+    killPid(file.pid, "reclaimed");
+  }
+
+  // Anyone still listening (PPID 1 orphans, stale pid file, etc.)
+  try {
+    const out = execSync(
+      `lsof -t -iTCP:${port} -sTCP:LISTEN 2>/dev/null || true`,
+      { encoding: "utf8" }
+    ).trim();
+    for (const line of out.split(/\s+/).filter(Boolean)) {
+      const pid = Number(line);
+      if (Number.isFinite(pid) && pid > 0) {
+        console.warn(`[daemon] killing listener pid=${pid} on :${port}`);
+        killPid(pid, "listener");
+      }
+    }
+  } catch {
+    /* lsof missing — pid file path only */
+  }
+
+  try {
+    if (fs.existsSync(daemonFilePath())) fs.unlinkSync(daemonFilePath());
+  } catch {
+    /* ignore */
+  }
+}
+
 export class DaemonSupervisor {
   private static _shared: DaemonSupervisor | null = null;
 
@@ -154,7 +234,10 @@ export class DaemonSupervisor {
   async ensure(): Promise<DaemonInfo> {
     if (this.info) {
       const ok = await portOpen(this.info.host, this.info.port);
-      if (ok) return this.info;
+      if (ok && this.info.secret) {
+        // quick re-probe optional; port open + cached secret is enough for same process
+        return this.info;
+      }
       this.info = null;
     }
     if (this.ensurePromise) return this.ensurePromise;
@@ -162,6 +245,36 @@ export class DaemonSupervisor {
       this.ensurePromise = null;
     });
     return this.ensurePromise;
+  }
+
+  private async tryAdopt(
+    host: string,
+    port: number,
+    bind: string,
+    secrets: string[]
+  ): Promise<DaemonInfo | null> {
+    for (const secret of secrets) {
+      if (!secret) continue;
+      const wsUrl = buildWsUrl(host, port, secret);
+      if (await probeWs(wsUrl)) {
+        const file = readDaemonFile();
+        const info: DaemonInfo = {
+          bind,
+          host,
+          port,
+          secret,
+          wsUrl,
+          managed: Boolean(file?.managed),
+          pid: file?.pid,
+        };
+        this.info = info;
+        console.log(
+          `[daemon] adopted grok agent serve on ${host}:${port} managed=${info.managed}`
+        );
+        return info;
+      }
+    }
+    return null;
   }
 
   private async ensureInner(): Promise<DaemonInfo> {
@@ -183,39 +296,52 @@ export class DaemonSupervisor {
       }
     }
 
-    const envSecret = process.env.AGENT_PANE_SERVE_SECRET ?? process.env.GROK_AGENT_SECRET;
+    const envSecret =
+      process.env.AGENT_PANE_SERVE_SECRET ?? process.env.GROK_AGENT_SECRET;
+    const file = readDaemonFile();
+    const fileSecret =
+      file &&
+      file.port === port &&
+      (file.host === host || file.bind === bind)
+        ? file.secret
+        : undefined;
+
+    const candidates = [envSecret, fileSecret].filter(
+      (s): s is string => Boolean(s)
+    );
+
     const open = await portOpen(host, port);
 
     if (open) {
-      // Try secrets: env → daemon.json (we only store hash; need env or re-read if we have memory)
-      const candidates: string[] = [];
-      if (envSecret) candidates.push(envSecret);
-      // If we previously managed with in-memory secret after restart we lost it —
-      // external mode requires env secret when adopting.
-      for (const secret of candidates) {
-        const wsUrl = buildWsUrl(host, port, secret);
-        if (await probeWs(wsUrl)) {
-          const info: DaemonInfo = {
-            bind,
-            host,
-            port,
-            secret,
-            wsUrl,
-            managed: false,
-          };
-          this.info = info;
-          console.log(
-            `[daemon] adopted grok agent serve on ${host}:${port} (managed=false)`
-          );
-          return info;
-        }
+      const adopted = await this.tryAdopt(host, port, bind, candidates);
+      if (adopted) return adopted;
+
+      if (manage === "external") {
+        throw new Error(
+          `Port ${host}:${port} is open but ACP probe failed ` +
+            `(wrong secret or not grok agent serve). ` +
+            `Set AGENT_PANE_SERVE_SECRET / GROK_AGENT_SECRET to match.`
+        );
       }
-      throw new Error(
-        `Port ${host}:${port} is open but ACP probe failed ` +
-          `(wrong secret or not grok agent serve). ` +
-          `Set AGENT_PANE_SERVE_SECRET / GROK_AGENT_SECRET to match, ` +
-          `or free the port.`
+
+      // auto: kill orphan / foreign stale listener and spawn fresh
+      console.warn(
+        `[daemon] ${host}:${port} busy but not adoptable — reclaiming for new serve`
       );
+      reclaimPort(host, port);
+      await new Promise((r) => setTimeout(r, 300));
+      if (await portOpen(host, port, 200)) {
+        // second try
+        reclaimPort(host, port);
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      if (await portOpen(host, port, 200)) {
+        throw new Error(
+          `Port ${host}:${port} still busy after reclaim. ` +
+            `Manually: lsof -iTCP:${port} -sTCP:LISTEN  then kill, ` +
+            `or AGENT_PANE_SERVE_FALLBACK_STDIO=1`
+        );
+      }
     }
 
     if (manage === "external") {
@@ -225,7 +351,15 @@ export class DaemonSupervisor {
       );
     }
 
-    // auto: spawn
+    return this.spawnServe(host, port, bind, envSecret);
+  }
+
+  private async spawnServe(
+    host: string,
+    port: number,
+    bind: string,
+    envSecret?: string
+  ): Promise<DaemonInfo> {
     const secret = envSecret ?? randomBytes(24).toString("hex");
     const bin = this.grokBin();
     if (!fs.existsSync(bin)) {
@@ -242,6 +376,8 @@ export class DaemonSupervisor {
           ...withHealthyEnv(process.env),
           GROK_AGENT_SECRET: secret,
         },
+        // Stay in Bridge's process group when possible so shell/job control
+        // can signal us; we still reclaim orphans on next ensure().
         detached: false,
       }
     );
@@ -314,44 +450,64 @@ export class DaemonSupervisor {
         bind: info.bind,
         host: info.host,
         port: info.port,
+        // Local adopt after Bridge restart (file mode 0600). Not logged / not UI.
+        secret: info.secret,
         secretHash: await sha256Hex(info.secret),
         pid: info.pid,
         managed: info.managed,
         startedAt: new Date().toISOString(),
       };
-      fs.writeFileSync(daemonFilePath(), JSON.stringify(body, null, 2));
+      const p = daemonFilePath();
+      fs.writeFileSync(p, JSON.stringify(body, null, 2), { mode: 0o600 });
+      try {
+        fs.chmodSync(p, 0o600);
+      } catch {
+        /* ignore */
+      }
     } catch (e) {
       console.warn("[daemon] write daemon.json failed", e);
     }
   }
 
   /**
-   * Kill serve only if we spawned it.
+   * Stop managed serve (child handle and/or pid file).
    */
   async shutdown(): Promise<void> {
     const info = this.info;
     const child = this.child;
     this.info = null;
     this.child = null;
-    if (info?.managed && child) {
+
+    if (child) {
       try {
         child.kill("SIGTERM");
       } catch {
         /* ignore */
       }
-      // escalate
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 400));
       try {
         if (child.exitCode === null && !child.killed) child.kill("SIGKILL");
       } catch {
         /* ignore */
       }
-      console.log("[daemon] stopped managed serve");
     }
+
+    const file = readDaemonFile();
+    const pid = info?.pid ?? file?.pid;
+    if (pid && (info?.managed || file?.managed)) {
+      try {
+        process.kill(pid, 0);
+        killPid(pid, "shutdown");
+      } catch {
+        /* already gone */
+      }
+    }
+
     try {
       if (fs.existsSync(daemonFilePath())) fs.unlinkSync(daemonFilePath());
     } catch {
       /* ignore */
     }
+    console.log("[daemon] stopped managed serve");
   }
 }

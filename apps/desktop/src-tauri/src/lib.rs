@@ -181,6 +181,16 @@ fn stop_bridge(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<BridgeProcess>() {
         if let Ok(mut guard) = state.0.lock() {
             if let Some(mut child) = guard.take() {
+                // SIGTERM first so Node can run DaemonSupervisor.shutdown()
+                // and kill `grok agent serve` — Child::kill is SIGKILL and leaves orphans on :2419.
+                #[cfg(unix)]
+                {
+                    let pid = child.id();
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .status();
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                }
                 let _ = child.kill();
                 let _ = child.wait();
             }

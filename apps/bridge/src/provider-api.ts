@@ -81,6 +81,16 @@ export interface AgentProvider {
   rewindToUserTurn(userTurnIndex: number): Promise<AgentRewindResult>;
 
   /**
+   * Fresh provider session without ending the Pane session (failed Core rewind).
+   * Host then setContextPrefix(digest of truncated Pane log) before next prompt.
+   */
+  rebindProviderSession?(opts: {
+    cwd: string;
+    model?: string;
+    effort?: string;
+  }): Promise<{ providerSessionId: string }>;
+
+  /**
    * Host pushes UserMessageAppended texts so provider turn indices match Pane log
    * (required after resume when adapter state is empty).
    */

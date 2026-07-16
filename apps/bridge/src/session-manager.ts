@@ -280,8 +280,25 @@ export class SessionManager {
       await this.enqueueGlobal(() => this.handleCommandInner(cmd));
       return;
     }
-    // prompt/cancel/diff/permission: per-session queue so session A sleeping
-    // does not block session B from sending
+    // CRITICAL: cancel must NOT wait behind in-flight session.prompt.
+    // enqueueSession is FIFO — if prompt awaits sleep/tools for 30s, cancel
+    // only ran after the turn ended → UI looked stopped (turnDoneRef) while
+    // Core + scripts kept running (false interrupt).
+    if (cmd.type === "session.cancel") {
+      const live = this.live.get(cmd.sessionId);
+      if (live) {
+        // Fire immediately; do not await other session work
+        void live.adapter.cancel(cmd.sessionId).catch((e) => {
+          console.warn(
+            `[session] cancel failed:`,
+            e instanceof Error ? e.message : e
+          );
+        });
+      }
+      return;
+    }
+    // prompt/diff/permission/rewind: per-session queue so A sleeping
+    // does not block B from sending
     const sid =
       "sessionId" in cmd && typeof cmd.sessionId === "string"
         ? cmd.sessionId
@@ -327,14 +344,22 @@ export class SessionManager {
       case "session.undoLast": {
         const live = this.live.get(cmd.sessionId);
         if (!live) {
-          // Offline / history: still truncate disk + notify UI
           this.rewindOffline(cmd.sessionId, -1);
           break;
         }
         try {
-          // Host owns turn index from EventStore; provider gets synced list first
           this.hydrateProviderTurns(live.adapter, cmd.sessionId);
-          await live.adapter.undoLastTurn();
+          const r = await live.adapter.undoLastTurn();
+          // undoLastTurn is last-turn only; index = length-1 before rewind slice
+          const texts = this.store
+            .list(cmd.sessionId, 0)
+            .filter((e) => e.type === "UserMessageAppended");
+          await this.finishRewind(cmd.sessionId, live, {
+            restoredText: r.restoredText,
+            userTurnIndex: Math.max(0, texts.length - 1),
+            providerOk: r.providerOk,
+            note: r.note,
+          });
         } catch (e) {
           this.broadcast({
             type: "error",
@@ -351,7 +376,8 @@ export class SessionManager {
         }
         try {
           this.hydrateProviderTurns(live.adapter, cmd.sessionId);
-          await live.adapter.rewindToUserTurn(cmd.userTurnIndex);
+          const r = await live.adapter.rewindToUserTurn(cmd.userTurnIndex);
+          await this.finishRewind(cmd.sessionId, live, r);
         } catch (e) {
           this.broadcast({
             type: "error",
@@ -415,6 +441,108 @@ export class SessionManager {
       .map((e) => (e as { text?: string }).text ?? "");
     adapter.hydrateUserTurns(texts);
     return texts;
+  }
+
+  /**
+   * Truncate disk → optional Core rebind → notify UI (SessionRewound once).
+   * Order matters: UI re-prompts only after provider context is clean.
+   */
+  private async finishRewind(
+    sessionId: string,
+    live: LiveSession,
+    r: {
+      restoredText: string;
+      userTurnIndex: number;
+      providerOk: boolean;
+      note?: string;
+    }
+  ): Promise<void> {
+    try {
+      this.store.truncateBeforeUserTurn(sessionId, r.userTurnIndex);
+      invalidateSessionEventsCache(sessionId);
+      const kept = this.store.list(sessionId, 0);
+      const msgCount = kept.filter((e) => e.type === "UserMessageAppended")
+        .length;
+      const prev = readMeta(sessionId);
+      if (prev) {
+        writeMeta({
+          ...prev,
+          cwd: live.cwd || prev.cwd,
+          messageCount: msgCount,
+          updatedAt: new Date().toISOString(),
+        });
+        invalidateHistoryListCache();
+      }
+    } catch {
+      /* still rebind / notify */
+    }
+
+    let providerOk = r.providerOk;
+    let note = r.note;
+    if (!providerOk) {
+      await this.rebindProviderAfterRewind(sessionId, live);
+      // Rebind is the recovery path — context matches truncated Pane log
+      providerOk = true;
+      note = undefined;
+    }
+
+    this.broadcast({
+      type: "event",
+      event: {
+        type: "SessionRewound",
+        sessionId,
+        restoredText: r.restoredText,
+        userTurnIndex: r.userTurnIndex,
+        providerOk,
+        note,
+        at: nowIso(),
+        seq: 0,
+      },
+    });
+  }
+
+  /**
+   * Core rewind failed / no points — start a clean provider session and inject
+   * a digest of the *already truncated* Pane log so Retry/Undo context matches UI.
+   */
+  private async rebindProviderAfterRewind(
+    sessionId: string,
+    live: LiveSession
+  ): Promise<void> {
+    const rebind = live.adapter.rebindProviderSession;
+    if (!rebind) {
+      console.warn(
+        `[session] rebind not supported for provider ${live.adapter.id}`
+      );
+      return;
+    }
+    try {
+      const { providerSessionId } = await rebind.call(live.adapter, {
+        cwd: live.cwd,
+        model: live.model,
+        effort: live.effort,
+      });
+      live.providerSessionId = providerSessionId;
+      // Digest from disk (SessionRewound already truncated events.jsonl)
+      const digest = buildHistoryDigest(sessionId, 40);
+      live.adapter.setContextPrefix(digest || null);
+      this.hydrateProviderTurns(live.adapter, sessionId);
+      console.log(
+        `[session] rebind after rewind session=${sessionId.slice(0, 8)} ` +
+          `provider=${providerSessionId.slice(0, 8)} digestChars=${digest.length}`
+      );
+    } catch (e) {
+      console.warn(
+        `[session] rebind after rewind failed:`,
+        e instanceof Error ? e.message : e
+      );
+      this.broadcast({
+        type: "error",
+        message: `Provider rebind after undo failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      });
+    }
   }
 
   /**

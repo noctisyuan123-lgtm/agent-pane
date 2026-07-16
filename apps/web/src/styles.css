@@ -3315,6 +3315,11 @@ html.is-tauri {
   padding-bottom: 22px;
 }
 
+/* Live streaming: no ⋯ — drop reserved pad so layout doesn't jump */
+.msg.no-actions {
+  padding-bottom: 0;
+}
+
 .msg .label {
   font-size: 11px;
   color: var(--text-dim);
@@ -3328,7 +3333,8 @@ html.is-tauri {
   gap: 10px;
 }
 
-/* ⋯ sits in the msg padding-bottom — reserves space without a fat permanent row */
+/* ⋯ sits in the msg padding-bottom — reserves space without a fat permanent row.
+   Always bottom-left for assistant, bottom-right for user (no mid-stream flip). */
 .resp-actions {
   display: flex;
   align-items: center;
@@ -3354,6 +3360,13 @@ html.is-tauri {
   left: auto;
   right: 0;
   justify-content: flex-end;
+}
+
+/* Assistant ⋯ stays left — matches post-complete layout (was jumping right→left) */
+.msg.assistant .resp-actions {
+  left: 0;
+  right: auto;
+  justify-content: flex-start;
 }
 
 .resp-more-btn {

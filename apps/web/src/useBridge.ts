@@ -222,8 +222,38 @@ export function useBridge() {
     const msgs = messagesRef.current;
     if (!msgs.length) return;
     const cache = sessionChatCacheRef.current;
-    // Shallow-copy the array so later setState cannot alias the cache entry
-    cache.set(id, { messages: msgs.slice(), at: Date.now() });
+    const existing = cache.get(id)?.messages;
+    // Never overwrite a longer full timeline with a windowed paint slice —
+    // that corrupted userTurnIndex and made Retry wipe early history.
+    let next = msgs.slice();
+    if (existing && existing.length > msgs.length) {
+      const firstId = msgs[0]?.id;
+      const start = firstId
+        ? existing.findIndex((m) => m.id === firstId)
+        : -1;
+      if (start > 0) {
+        next = [...existing.slice(0, start), ...msgs];
+      } else if (start === 0) {
+        next = msgs.slice();
+      } else {
+        // Can't align — keep the longer cache, only bump mtime
+        cache.set(id, { messages: existing.slice(), at: Date.now() });
+        while (cache.size > 4) {
+          let oldestId: string | null = null;
+          let oldestAt = Infinity;
+          for (const [k, v] of cache) {
+            if (v.at < oldestAt) {
+              oldestAt = v.at;
+              oldestId = k;
+            }
+          }
+          if (oldestId) cache.delete(oldestId);
+          else break;
+        }
+        return;
+      }
+    }
+    cache.set(id, { messages: next, at: Date.now() });
     while (cache.size > 4) {
       let oldestId: string | null = null;
       let oldestAt = Infinity;
@@ -450,6 +480,8 @@ export function useBridge() {
 
     // Drop paint for non-active sessions (bridge fans out all live sessions).
     // Replay path is exempt — it intentionally rebuilds one session's timeline.
+    // SessionRewound must still run when we initiated undo/retry/edit — otherwise
+    // afterRewindRef never fires and Retry looks like a bare re-send (or does nothing).
     if (!replayingRef.current) {
       if (suppressPaintRef.current === event.sessionId) return;
 
@@ -466,7 +498,11 @@ export function useBridge() {
       } else if (active) {
         allow = event.sessionId === active;
       }
-      if (!allow) return;
+      const forceRewind =
+        event.type === "SessionRewound" &&
+        afterRewindRef.current != null &&
+        event.sessionId === active;
+      if (!allow && !forceRewind) return;
     }
 
     // 去重：永远带上 at+type。旧 resume 会重复 seq=1..N，只按 seq 去重会把后半段
@@ -568,7 +604,39 @@ export function useBridge() {
         break;
       }
 
-      case "UserMessageAppended":
+      case "UserMessageAppended": {
+        // Global 0-based turn index for Retry/Undo (must match EventStore order)
+        const sidU = event.sessionId;
+        const cacheU = sessionChatCacheRef.current.get(sidU)?.messages;
+        let nextTurn = 0;
+        const countUsers = (list: ChatItem[]) => {
+          let maxStamp = -1;
+          let n = 0;
+          for (const x of list) {
+            if (x.kind === "user") {
+              n++;
+              if (typeof x.userTurnIndex === "number" && x.userTurnIndex >= 0) {
+                maxStamp = Math.max(maxStamp, x.userTurnIndex);
+              }
+            }
+          }
+          // Prefer max stamp+1 so windowed arrays don't renumber from 0
+          return maxStamp >= 0 ? maxStamp + 1 : n;
+        };
+        if (cacheU?.length) {
+          nextTurn = countUsers(cacheU);
+        } else {
+          nextTurn = countUsers(messagesRef.current);
+        }
+        const userItem: ChatItem = {
+          kind: "user",
+          text: event.text,
+          id: `u-${event.sessionId}-${turnTag}`,
+          attachments: event.attachments?.length
+            ? event.attachments
+            : undefined,
+          userTurnIndex: nextTurn,
+        };
         setMessages((m) => {
           // Drop optimistic bubble with same text (resume/create queue)
           const withoutOpt = m.filter(
@@ -579,18 +647,28 @@ export function useBridge() {
                 x.text === event.text
               )
           );
-          return [
-            ...withoutOpt,
-            {
-              kind: "user",
-              text: event.text,
-              id: `u-${event.sessionId}-${turnTag}`,
-              attachments: event.attachments?.length
-                ? event.attachments
-                : undefined,
-            },
-          ];
+          return [...withoutOpt, userItem];
         });
+        // Keep full-timeline cache in sync (windowed paint must not be SoT)
+        if (cacheU) {
+          sessionChatCacheRef.current.set(sidU, {
+            messages: [...cacheU, userItem],
+            at: Date.now(),
+          });
+        } else if (sidU === sessionIdRef.current) {
+          const base = messagesRef.current.filter(
+            (x) =>
+              !(
+                x.kind === "user" &&
+                x.id.startsWith("u-optimistic-") &&
+                x.text === event.text
+              )
+          );
+          sessionChatCacheRef.current.set(sidU, {
+            messages: [...base, userItem],
+            at: Date.now(),
+          });
+        }
         if (!replayingRef.current) setBusy(true);
         assistantBuf.current = "";
         thoughtBufMap.current.clear();
@@ -605,8 +683,11 @@ export function useBridge() {
         thoughtLiveId.current = `t-${event.sessionId}-${turnTag}`;
         toolsGroupId.current = `tools-${event.sessionId}-${turnTag}`;
         break;
+      }
 
       case "MessageChunk": {
+        // Stop / cancel seals the turn — drop residual stream (was "can't stop")
+        if (turnDoneRef.current) break;
         // 重要：assistantBuf += 必须在 setState 外；StrictMode 会双跑 updater。
         sealThoughtLogLine();
         const wasEmpty = assistantBuf.current === "";
@@ -986,52 +1067,105 @@ export function useBridge() {
       case "SessionRewound": {
         const turnIdx =
           typeof event.userTurnIndex === "number" ? event.userTurnIndex : -1;
-        setMessages((m) => {
-          if (turnIdx >= 0) return sliceMessagesBeforeUserTurn(m, turnIdx);
-          let lastUser = -1;
-          for (let i = m.length - 1; i >= 0; i--) {
-            if (m[i]!.kind === "user") {
-              lastUser = i;
-              break;
-            }
-          }
-          if (lastUser < 0) return m;
-          return m.slice(0, lastUser);
-        });
+        const action = afterRewindRef.current;
+        // Claim the pending action once (retry/edit/undo follow-up)
+        if (
+          action &&
+          (action.userTurnIndex === turnIdx || turnIdx < 0)
+        ) {
+          afterRewindRef.current = null;
+        }
+
+        const sid = sessionIdRef.current;
         setTasks([]);
         setPermissions([]);
-        setBusy(false);
         assistantBuf.current = "";
         thoughtBufMap.current.clear();
         postToolsAssistantId.current = null;
-        const action = afterRewindRef.current;
-        afterRewindRef.current = null;
+        turnDoneRef.current = true;
+        turnStartedAtRef.current = null;
+        seenSeq.current.clear();
+
         const text = (action?.text || event.restoredText || "").trim();
-        if (action?.kind === "retry" && text && sessionIdRef.current) {
-          setRestoredDraft(null);
-          setError(null);
-          const sid = sessionIdRef.current;
-          window.setTimeout(() => {
-            setBusy(true);
-            send({ type: "session.prompt", sessionId: sid, text });
-          }, 40);
-        } else if (action?.kind === "edit" && text) {
-          setRestoredDraft(text);
-          setError(null);
-        } else {
-          setRestoredDraft(event.restoredText);
-          if (event.note && !event.providerOk) {
-            setError(event.note);
-          } else {
-            setError(null);
+        const finishUi = (built: ChatItem[] | null) => {
+          if (built) {
+            if (sid) {
+              sessionChatCacheRef.current.set(sid, {
+                messages: built.slice(),
+                at: Date.now(),
+              });
+            }
+            paintWindowed(built);
+            messagesRef.current = built;
           }
+          if (action?.kind === "retry" && text && sid) {
+            setRestoredDraft(null);
+            setError(null);
+            setBusy(true);
+            busyBySessionRef.current[sid] = true;
+            syncBusyFromMap();
+            send({
+              type: "session.prompt",
+              sessionId: sid,
+              text,
+            });
+          } else if (action?.kind === "edit" && text) {
+            setBusy(false);
+            setRestoredDraft(text);
+            setError(null);
+          } else if (action?.kind === "undo") {
+            setBusy(false);
+            setRestoredDraft(null);
+            if (event.note && !event.providerOk) setError(event.note);
+            else setError(null);
+          } else {
+            setBusy(false);
+            if (!action) setRestoredDraft(event.restoredText);
+            if (event.note && !event.providerOk) setError(event.note);
+            else setError(null);
+          }
+        };
+
+        // Ground truth: rebuild from truncated disk events so we never wipe
+        // earlier assistant turns via a bad client-side slice index.
+        if (sid) {
+          void (async () => {
+            try {
+              const {
+                fetchSessionEvents,
+                invalidateHistoryClientCache,
+              } = await import("./api");
+              invalidateHistoryClientCache(sid);
+              const events = (await fetchSessionEvents(
+                sid,
+                true
+              )) as DomainEvent[];
+              if (sessionIdRef.current !== sid) return;
+              const built = eventsToChatItems(events);
+              finishUi(built);
+            } catch {
+              // Fallback: keep optimistic cache if disk fetch fails
+              const cached = sessionChatCacheRef.current.get(sid)?.messages;
+              finishUi(cached?.length ? cached : null);
+            }
+          })();
+        } else {
+          finishUi(null);
         }
         break;
       }
       default:
         break;
     }
-  }, [flushPendingPrompt, send, sealThoughtLogLine, pushTurnLog, noteSessionBusy, syncBusyFromMap]);
+  }, [
+    flushPendingPrompt,
+    send,
+    sealThoughtLogLine,
+    pushTurnLog,
+    noteSessionBusy,
+    syncBusyFromMap,
+    paintWindowed,
+  ]);
 
   useEffect(() => {
     let closed = false;
@@ -1569,13 +1703,20 @@ export function useBridge() {
   );
 
   const cancel = useCallback(() => {
-    if (sessionId) {
-      send({ type: "session.cancel", sessionId });
-      busyBySessionRef.current[sessionId] = false;
-      syncBusyFromMap();
-    } else {
-      setBusy(false);
+    // Prefer ref — React state can lag one frame behind the live session
+    const sid = sessionIdRef.current ?? sessionId;
+    if (sid) {
+      send({ type: "session.cancel", sessionId: sid });
+      busyBySessionRef.current[sid] = false;
     }
+    // Always drop local "in flight" UI even if bridge is slow / missing live entry
+    setBusy(false);
+    setActivityPhase(null);
+    setActivitySubagentModel(null);
+    setStatusMsg(null);
+    turnDoneRef.current = true; // drop residual chunks as late noise
+    turnStartedAtRef.current = null;
+    syncBusyFromMap();
   }, [send, sessionId, syncBusyFromMap]);
 
   const lastUserText = useCallback((): string | null => {
@@ -1599,6 +1740,62 @@ export function useBridge() {
     return text;
   }, [messages]);
 
+  /**
+   * Resolve 0-based user-turn index in the **full** Pane timeline.
+   * Prefer `user.userTurnIndex` stamped on the bubble; never trust a bare
+   * windowed array offset (that made Retry re-send without a real rewind).
+   */
+  const resolveGlobalUserTurn = useCallback(
+    (messageIndex: number): number => {
+      const visible = messagesRef.current;
+      const item =
+        messageIndex >= 0 && messageIndex < visible.length
+          ? visible[messageIndex]
+          : null;
+
+      // Walk back to owning user bubble
+      let userItem: ChatItem | null = null;
+      if (item?.kind === "user") userItem = item;
+      else if (item) {
+        for (let i = Math.min(messageIndex, visible.length - 1); i >= 0; i--) {
+          if (visible[i]?.kind === "user") {
+            userItem = visible[i]!;
+            break;
+          }
+        }
+      }
+      if (
+        userItem &&
+        userItem.kind === "user" &&
+        typeof userItem.userTurnIndex === "number" &&
+        userItem.userTurnIndex >= 0
+      ) {
+        return userItem.userTurnIndex;
+      }
+
+      const sid = sessionIdRef.current;
+      const full =
+        (sid && sessionChatCacheRef.current.get(sid)?.messages) || visible;
+      if (userItem) {
+        const fi = full.findIndex((m) => m.id === userItem!.id);
+        if (fi >= 0) return userTurnIndexAt(full, fi);
+      }
+      if (full.length > visible.length && visible[0]) {
+        const start = full.findIndex((m) => m.id === visible[0]!.id);
+        if (start > 0) {
+          let usersBefore = 0;
+          for (let i = 0; i < start; i++) {
+            if (full[i]?.kind === "user") usersBefore++;
+          }
+          const local = userTurnIndexAt(visible, messageIndex);
+          if (local >= 0) return usersBefore + local;
+        }
+      }
+      return userTurnIndexAt(visible, messageIndex);
+    },
+    []
+  );
+
   const rewindToTurn = useCallback(
     (
       userTurnIndex: number,
@@ -1608,18 +1805,38 @@ export function useBridge() {
         setError("Nothing to undo");
         return;
       }
-      const text = userTextAtTurn(messages, userTurnIndex);
+      // Prefer full cache for text so windowed paint doesn't miss the bubble
+      const sid = sessionId;
+      const full =
+        sessionChatCacheRef.current.get(sid)?.messages ?? messagesRef.current;
+      const text = userTextAtTurn(full, userTurnIndex);
       if (!text?.trim() && kind !== "undo") {
         setError("No user message at that turn");
         return;
       }
+
+      // Optimistic UI truncate (Claude-style) — don't wait for SessionRewound
+      // or Retry looks like a plain re-send when the event is delayed/gated.
+      const nextFull = sliceMessagesBeforeUserTurn(full, userTurnIndex);
+      sessionChatCacheRef.current.set(sid, {
+        messages: nextFull.slice(),
+        at: Date.now(),
+      });
+      paintWindowed(nextFull);
+      messagesRef.current = nextFull;
+      setTasks([]);
+      setPermissions([]);
+      assistantBuf.current = "";
+      thoughtBufMap.current.clear();
+      postToolsAssistantId.current = null;
+      turnDoneRef.current = true;
+      turnStartedAtRef.current = null;
+
       if (historyOnly) {
         if (kind === "retry") {
-          // Persist truncate, then resume + re-send (agent not attached)
           afterRewindRef.current = null;
-          const restored = text || rewindUiToUserTurn(userTurnIndex);
+          const restored = (text || "").trim();
           send({ type: "session.rewindTo", sessionId, userTurnIndex });
-          setMessages((m) => sliceMessagesBeforeUserTurn(m, userTurnIndex));
           setError(null);
           pendingPromptRef.current = { text: restored };
           setBusy(true);
@@ -1642,87 +1859,112 @@ export function useBridge() {
         }
         return;
       }
+      // Live agent path — ALWAYS wait for SessionRewound before retry prompt.
+      // Bridge truncates + (if needed) rebinds Core, then emits SessionRewound.
+      // Fire-and-forget re-prompt was the "duplicate message + interrupt tip" bug.
       afterRewindRef.current = {
         kind,
         text: text || "",
         userTurnIndex,
       };
       send({ type: "session.rewindTo", sessionId, userTurnIndex });
+
+      // Safety: if SessionRewound never arrives, surface error (don't blind re-send)
+      if (kind === "retry") {
+        const promptSid = sessionId;
+        const expectedTurn = userTurnIndex;
+        window.setTimeout(() => {
+          const pending = afterRewindRef.current;
+          if (
+            pending?.kind === "retry" &&
+            pending.userTurnIndex === expectedTurn &&
+            sessionIdRef.current === promptSid
+          ) {
+            afterRewindRef.current = null;
+            setError(
+              "Retry timed out waiting for rewind — message was not re-sent. Try again."
+            );
+            setBusy(false);
+            busyBySessionRef.current[promptSid] = false;
+            syncBusyFromMap();
+          }
+        }, 45_000);
+      }
     },
     [
       send,
       sessionId,
       historyOnly,
-      messages,
-      rewindUiToUserTurn,
+      paintWindowed,
       cwd,
       model,
       effectiveEffort,
       agentMode,
+      syncBusyFromMap,
     ]
   );
 
   const undoLast = useCallback(() => {
-    const idx = userTurnIndexAt(messages, messages.length - 1);
+    const idx = resolveGlobalUserTurn(messagesRef.current.length - 1);
     if (idx < 0) {
       setError("Nothing to undo");
       return;
     }
     rewindToTurn(idx, "undo");
-  }, [messages, rewindToTurn]);
+  }, [resolveGlobalUserTurn, rewindToTurn]);
 
   const retryLast = useCallback(() => {
-    const idx = userTurnIndexAt(messages, messages.length - 1);
+    const idx = resolveGlobalUserTurn(messagesRef.current.length - 1);
     if (idx < 0) {
       setError("Nothing to retry");
       return;
     }
     rewindToTurn(idx, "retry");
-  }, [messages, rewindToTurn]);
+  }, [resolveGlobalUserTurn, rewindToTurn]);
 
   const editLast = useCallback(() => {
-    const idx = userTurnIndexAt(messages, messages.length - 1);
+    const idx = resolveGlobalUserTurn(messagesRef.current.length - 1);
     if (idx < 0) {
       setError("Nothing to edit");
       return;
     }
     rewindToTurn(idx, "edit");
-  }, [messages, rewindToTurn]);
+  }, [resolveGlobalUserTurn, rewindToTurn]);
 
   const undoAt = useCallback(
     (messageIndex: number) => {
-      const idx = userTurnIndexAt(messages, messageIndex);
+      const idx = resolveGlobalUserTurn(messageIndex);
       if (idx < 0) {
         setError("Nothing to undo");
         return;
       }
       rewindToTurn(idx, "undo");
     },
-    [messages, rewindToTurn]
+    [resolveGlobalUserTurn, rewindToTurn]
   );
 
   const retryAt = useCallback(
     (messageIndex: number) => {
-      const idx = userTurnIndexAt(messages, messageIndex);
+      const idx = resolveGlobalUserTurn(messageIndex);
       if (idx < 0) {
         setError("Nothing to retry");
         return;
       }
       rewindToTurn(idx, "retry");
     },
-    [messages, rewindToTurn]
+    [resolveGlobalUserTurn, rewindToTurn]
   );
 
   const editAt = useCallback(
     (messageIndex: number) => {
-      const idx = userTurnIndexAt(messages, messageIndex);
+      const idx = resolveGlobalUserTurn(messageIndex);
       if (idx < 0) {
         setError("Nothing to edit");
         return;
       }
       rewindToTurn(idx, "edit");
     },
-    [messages, rewindToTurn]
+    [resolveGlobalUserTurn, rewindToTurn]
   );
 
   const clearRestoredDraft = useCallback(() => setRestoredDraft(null), []);
