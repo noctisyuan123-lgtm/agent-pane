@@ -81,11 +81,11 @@ export class GrokAcpAdapter implements AgentProvider {
   /** Called when the child process dies unexpectedly (not after stop()). */
   private deadHandlers: Array<(domainSessionId: string) => void> = [];
   /**
-   * While true, drop session/update notifications (session/load replays history
-   * as updates — must not re-append into our event log / UI).
+   * While true, drop session/update notifications (legacy load-replay path;
+   * resume now uses session/new + digest so absorb stays false in practice).
    */
   private absorbUpdates = false;
-  /** If session/load fails, first prompt gets a short history preamble. */
+  /** Resume digest preamble for first prompt after session/new. */
   private contextPrefix: string | null = null;
   /** ACP terminal/create sessions */
   private terminals = new Map<string, AcpTerminal>();
@@ -807,7 +807,7 @@ export class GrokAcpAdapter implements AgentProvider {
     const sid = this.domainSessionId;
     const at = nowIso();
 
-    // session/load (and residual history) must not pollute domain events / UI
+    // Absorb path: drop residual history updates so they do not pollute domain events / UI
     if (this.absorbUpdates) {
       return;
     }
@@ -981,7 +981,7 @@ export class GrokAcpAdapter implements AgentProvider {
     permissionMode?: string;
     /** Reuse Agent Pane domain id so history appends to the same session */
     domainSessionId?: string;
-    /** Grok ACP session id for session/load */
+    /** Previous Grok ACP id for bookkeeping only (resume still session/new). */
     providerSessionId?: string;
     resumed?: boolean;
   }): Promise<{

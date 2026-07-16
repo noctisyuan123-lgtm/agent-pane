@@ -249,7 +249,10 @@ export function importGrokSession(
     createdAt,
     updatedAt,
     messageCount: userCount,
+    /** Current handle (initially same as Grok); resume will rewrite this. */
     providerSessionId: id,
+    /** Stable import lineage — keep original Grok id after resume. */
+    sourceProviderSessionId: id,
   };
   writeMeta(meta);
   // Extra bookkeeping fields (ignored by typed readers, useful on disk)
@@ -260,6 +263,7 @@ export function importGrokSession(
     >;
     raw.importedFrom = "grok";
     raw.sourceKind = summary.session_kind || "grok";
+    raw.sourceProviderSessionId = id;
     fs.writeFileSync(
       path.join(PANE_ROOT, id, "meta.json"),
       JSON.stringify(raw, null, 2) + "\n",

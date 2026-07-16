@@ -3906,6 +3906,8 @@ function upsertMeta(patch) {
     updatedAt: now,
     messageCount: (prev?.messageCount ?? 0) + (patch.bumpMessage ? 1 : 0),
     providerSessionId: patch.providerSessionId ?? prev?.providerSessionId,
+    // Import lineage: set once, never clobber with empty
+    sourceProviderSessionId: patch.sourceProviderSessionId ?? prev?.sourceProviderSessionId,
     // Pin from dedicated store (never lost on upsert)
     pinned: isPinned(patch.sessionId) || !!prev?.pinned,
     unread: prev?.unread,
@@ -4403,13 +4405,17 @@ function importGrokSession(sessionId, opts) {
     createdAt,
     updatedAt,
     messageCount: userCount,
-    providerSessionId: id
+    /** Current handle (initially same as Grok); resume will rewrite this. */
+    providerSessionId: id,
+    /** Stable import lineage — keep original Grok id after resume. */
+    sourceProviderSessionId: id
   };
   writeMeta(meta);
   try {
     const raw = JSON.parse(import_node_fs11.default.readFileSync(import_node_path11.default.join(PANE_ROOT, id, "meta.json"), "utf8"));
     raw.importedFrom = "grok";
     raw.sourceKind = summary.session_kind || "grok";
+    raw.sourceProviderSessionId = id;
     import_node_fs11.default.writeFileSync(
       import_node_path11.default.join(PANE_ROOT, id, "meta.json"),
       JSON.stringify(raw, null, 2) + "\n",
@@ -5166,11 +5172,11 @@ var GrokAcpAdapter = class {
   /** Called when the child process dies unexpectedly (not after stop()). */
   deadHandlers = [];
   /**
-   * While true, drop session/update notifications (session/load replays history
-   * as updates — must not re-append into our event log / UI).
+   * While true, drop session/update notifications (legacy load-replay path;
+   * resume now uses session/new + digest so absorb stays false in practice).
    */
   absorbUpdates = false;
-  /** If session/load fails, first prompt gets a short history preamble. */
+  /** Resume digest preamble for first prompt after session/new. */
   contextPrefix = null;
   /** ACP terminal/create sessions */
   terminals = /* @__PURE__ */ new Map();
@@ -6782,6 +6788,19 @@ var SessionManager = class {
   listLiveSessionIds() {
     return [...this.live.keys()];
   }
+  /**
+   * Resolve live agent handle for a Pane sessionId.
+   * Used by HTTP context-usage: prefer live provider id over meta / event archaeology.
+   */
+  getLiveSessionInfo(sessionId) {
+    const live = this.live.get(sessionId);
+    if (!live) return null;
+    return {
+      cwd: live.cwd || "",
+      providerSessionId: live.providerSessionId,
+      alive: live.adapter.isAlive()
+    };
+  }
   enqueueGlobal(fn) {
     const run = this.globalQueue.then(fn);
     this.globalQueue = run.then(
@@ -7213,7 +7232,7 @@ var SessionManager = class {
         effort: resumeEffort,
         permissionMode: modeUsesAlwaysApprove(mode) ? "auto" : "ask",
         domainSessionId: sessionId,
-        // Keep id for bookkeeping; start() no longer session/load (prompt hang).
+        // Bookkeeping only — start() always session/new + digest (session/load hangs).
         providerSessionId,
         resumed: true
       });
@@ -8194,14 +8213,25 @@ async function handleHttp(req, res, hooks = {}) {
   }
   if (url.pathname === "/api/context-usage" && req.method === "GET") {
     let cwd = url.searchParams.get("cwd") || "";
-    let providerSessionId = url.searchParams.get("providerSessionId") || "";
+    const queryProviderId = url.searchParams.get("providerSessionId") || "";
+    let providerSessionId = "";
     const sessionId = url.searchParams.get("sessionId") || "";
-    if ((!cwd || !providerSessionId) && sessionId) {
+    if (sessionId) {
+      const live = hooks.getLiveSessionInfo?.(sessionId) ?? null;
+      if (live?.alive && live.providerSessionId) {
+        providerSessionId = live.providerSessionId;
+        cwd = cwd || live.cwd || "";
+      }
       const meta = readMeta(sessionId);
       if (meta) {
         cwd = cwd || meta.cwd || "";
-        providerSessionId = providerSessionId || meta.providerSessionId || "";
+        if (!providerSessionId) {
+          providerSessionId = meta.providerSessionId || "";
+        }
       }
+    }
+    if (!providerSessionId) {
+      providerSessionId = queryProviderId;
     }
     if (!providerSessionId) {
       json(res, 200, { ok: false, usage: null });
@@ -9064,7 +9094,8 @@ var server = import_node_http.default.createServer(async (req, res) => {
   try {
     const handled = await handleHttp(req, res, {
       stopSession: (id) => sessions.stopSession(id),
-      purgeSession: (id) => sessions.purgeSession(id)
+      purgeSession: (id) => sessions.purgeSession(id),
+      getLiveSessionInfo: (id) => sessions.getLiveSessionInfo(id)
     });
     if (!handled) {
       res.writeHead(404, { "Content-Type": "application/json" });

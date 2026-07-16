@@ -129,6 +129,22 @@ export class SessionManager {
     return [...this.live.keys()];
   }
 
+  /**
+   * Resolve live agent handle for a Pane sessionId.
+   * Used by HTTP context-usage: prefer live provider id over meta / event archaeology.
+   */
+  getLiveSessionInfo(
+    sessionId: string
+  ): { cwd: string; providerSessionId?: string; alive: boolean } | null {
+    const live = this.live.get(sessionId);
+    if (!live) return null;
+    return {
+      cwd: live.cwd || "",
+      providerSessionId: live.providerSessionId,
+      alive: live.adapter.isAlive(),
+    };
+  }
+
   private enqueueGlobal(fn: () => Promise<void>): Promise<void> {
     const run = this.globalQueue.then(fn);
     this.globalQueue = run.then(
@@ -662,7 +678,7 @@ export class SessionManager {
         effort: resumeEffort,
         permissionMode: modeUsesAlwaysApprove(mode) ? "auto" : "ask",
         domainSessionId: sessionId,
-        // Keep id for bookkeeping; start() no longer session/load (prompt hang).
+        // Bookkeeping only — start() always session/new + digest (session/load hangs).
         providerSessionId,
         resumed: true,
       });

@@ -343,6 +343,13 @@ export type HttpApiHooks = {
   stopSession?: (sessionId: string) => void | Promise<void>;
   /** Clear in-memory event store for a deleted session. */
   purgeSession?: (sessionId: string) => void;
+  /**
+   * Live agent map for Pane sessionId → current provider handle.
+   * context-usage: live → meta → query (never event archaeology alone).
+   */
+  getLiveSessionInfo?: (
+    sessionId: string
+  ) => { cwd: string; providerSessionId?: string; alive: boolean } | null;
 };
 
 export async function handleHttp(
@@ -382,16 +389,29 @@ export async function handleHttp(
   }
 
   // Live context fill from Grok ~/.grok/sessions/.../signals.json
+  // Resolve providerSessionId: live map → meta.providerSessionId → query hint.
+  // Never trust client-only event archaeology over live/meta.
   if (url.pathname === "/api/context-usage" && req.method === "GET") {
     let cwd = url.searchParams.get("cwd") || "";
-    let providerSessionId = url.searchParams.get("providerSessionId") || "";
+    const queryProviderId = url.searchParams.get("providerSessionId") || "";
+    let providerSessionId = "";
     const sessionId = url.searchParams.get("sessionId") || "";
-    if ((!cwd || !providerSessionId) && sessionId) {
+    if (sessionId) {
+      const live = hooks.getLiveSessionInfo?.(sessionId) ?? null;
+      if (live?.alive && live.providerSessionId) {
+        providerSessionId = live.providerSessionId;
+        cwd = cwd || live.cwd || "";
+      }
       const meta = readMeta(sessionId);
       if (meta) {
         cwd = cwd || meta.cwd || "";
-        providerSessionId = providerSessionId || meta.providerSessionId || "";
+        if (!providerSessionId) {
+          providerSessionId = meta.providerSessionId || "";
+        }
       }
+    }
+    if (!providerSessionId) {
+      providerSessionId = queryProviderId;
     }
     if (!providerSessionId) {
       json(res, 200, { ok: false, usage: null });

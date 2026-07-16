@@ -14,8 +14,17 @@ export type SessionMeta = {
   pinned?: boolean;
   unread?: boolean;
   archived?: boolean;
-  /** Grok ACP provider session id — used for session/load resume */
+  /**
+   * Last known live Grok ACP session id (ephemeral process handle).
+   * Resume always mints a new provider id via session/new + history digest —
+   * this field is rewritten; it is NOT "session/load" continuity.
+   */
   providerSessionId?: string;
+  /**
+   * Original Grok session id at import time (stable lineage).
+   * Survives resume when providerSessionId is replaced.
+   */
+  sourceProviderSessionId?: string;
 };
 
 export type HistoryGroup = {
@@ -146,6 +155,7 @@ export function upsertMeta(patch: {
   title?: string;
   bumpMessage?: boolean;
   providerSessionId?: string;
+  sourceProviderSessionId?: string;
 }): SessionMeta {
   const prev = readMeta(patch.sessionId);
   const now = new Date().toISOString();
@@ -171,6 +181,9 @@ export function upsertMeta(patch: {
     messageCount: (prev?.messageCount ?? 0) + (patch.bumpMessage ? 1 : 0),
     providerSessionId:
       patch.providerSessionId ?? prev?.providerSessionId,
+    // Import lineage: set once, never clobber with empty
+    sourceProviderSessionId:
+      patch.sourceProviderSessionId ?? prev?.sourceProviderSessionId,
     // Pin from dedicated store (never lost on upsert)
     pinned: isPinned(patch.sessionId) || !!prev?.pinned,
     unread: prev?.unread,

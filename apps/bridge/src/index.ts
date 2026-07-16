@@ -35,6 +35,7 @@ const server = http.createServer(async (req, res) => {
     const handled = await handleHttp(req, res, {
       stopSession: (id) => sessions.stopSession(id),
       purgeSession: (id) => sessions.purgeSession(id),
+      getLiveSessionInfo: (id) => sessions.getLiveSessionInfo(id),
     });
     if (!handled) {
       res.writeHead(404, { "Content-Type": "application/json" });

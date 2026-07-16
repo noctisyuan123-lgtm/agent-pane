@@ -13,6 +13,10 @@ export type SessionMeta = {
   pinned?: boolean;
   unread?: boolean;
   archived?: boolean;
+  /** Last known live Grok ACP handle (ephemeral; may change on resume). */
+  providerSessionId?: string;
+  /** Import lineage: original Grok id (stable). */
+  sourceProviderSessionId?: string;
 };
 
 export type HistoryGroup = {

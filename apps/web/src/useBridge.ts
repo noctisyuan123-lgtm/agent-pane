@@ -1441,16 +1441,10 @@ export function useBridge() {
         seenSeq.current.clear();
         setCwd(histCwd);
         localStorage.setItem("agent-pane-cwd", histCwd);
-        // Fill seenSeq sync, grab provider id — then drop `events` for GC
-        let infoProviderId: string | undefined;
+        // Fill seenSeq only — provider id for usage comes from bridge live→meta
+        // (do not key off last ContextUsage event alone; that is archaeology).
         for (let i = 0; i < events.length; i++) {
           const e = events[i]!;
-          if (
-            e.type === "ContextUsage" &&
-            typeof e.providerSessionId === "string"
-          ) {
-            infoProviderId = e.providerSessionId;
-          }
           const th =
             typeof (e as { text?: string }).text === "string"
               ? (e as { text: string }).text.slice(0, 24)
@@ -1495,10 +1489,10 @@ export function useBridge() {
           } | null = null;
           try {
             const { fetchContextUsage } = await import("./api");
+            // Server resolves: live provider → meta.providerSessionId
             const u = await fetchContextUsage({
               sessionId: histSessionId,
               cwd: histCwd,
-              providerSessionId: infoProviderId,
             });
             if (!stillCurrent()) return;
             if (u) {

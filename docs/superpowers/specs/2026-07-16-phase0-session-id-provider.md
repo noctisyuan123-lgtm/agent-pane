@@ -128,16 +128,16 @@ Event-embedded **B** is archaeology only.
 
 Do **not** mix glass UI polish into these PRs.
 
-| PR | Title | Scope |
-|----|--------|--------|
-| **PR-A** | docs: session ID single-truth map | This file + link from architecture rev 2; comment fixes on `session/load` |
-| **PR-B** | fix: providerSessionId resolution for context usage | live → meta; stop stale event-only path |
-| **PR-C** | feat: sourceProviderSessionId on import meta | Preserve Grok origin after resume mutates B |
-| **PR-D** | refactor: AgentProvider Host contract | Add `isAlive`/`onDead`/…; retype LiveSession; factory for Grok |
-| **PR-E** | refactor: Host-owned user turns | hydrate from events; narrow adapter undo |
+| PR | Title | Scope | Status |
+|----|--------|--------|--------|
+| **PR-A** | docs: session ID single-truth map | This file + architecture link; comment fixes on `session/load` | **done** (2026-07-16) |
+| **PR-B** | fix: providerSessionId resolution for context usage | live → meta → query; UI no longer keys off last ContextUsage event | **done** |
+| **PR-C** | feat: sourceProviderSessionId on import meta | Typed field + import write + upsert preserve | **done** |
+| **PR-D** | refactor: AgentProvider Host contract | Add `isAlive`/`onDead`/…; retype LiveSession; factory for Grok | pending |
+| **PR-E** | refactor: Host-owned user turns | hydrate from events; narrow adapter undo | pending |
 
-**Stop line for “large project wave 1”:** PR-A…C (identity truth).  
-PR-D…E start wave 2 (thin adapter) after A–C land.
+**Stop line for “large project wave 1”:** PR-A…C (identity truth) — **landed**.  
+PR-D…E start wave 2 (thin adapter).
 
 ---
 
