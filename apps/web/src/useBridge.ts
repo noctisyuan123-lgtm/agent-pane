@@ -268,37 +268,10 @@ export function useBridge() {
     }
   }, []);
   const [tasks, setTasks] = useState<Task[]>([]);
-  /** Auto-dismiss fully-done plan cards so they don't stick forever. */
-  const tasksDoneClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null
-  );
-  const clearTasksDoneTimer = useCallback(() => {
-    if (tasksDoneClearTimerRef.current != null) {
-      clearTimeout(tasksDoneClearTimerRef.current);
-      tasksDoneClearTimerRef.current = null;
-    }
-  }, []);
+  /** completed | cancelled — fully done items in a plan card */
   const isTaskSettled = useCallback((t: Task) => {
     return t.status === "completed" || t.status === "cancelled";
   }, []);
-  /** Show completed list briefly, then remove (empty / all-done plans). */
-  const scheduleClearTasksIfAllDone = useCallback(
-    (list: Task[], delayMs = 1600) => {
-      clearTasksDoneTimer();
-      if (list.length === 0) {
-        setTasks([]);
-        return;
-      }
-      if (!list.every(isTaskSettled)) return;
-      tasksDoneClearTimerRef.current = setTimeout(() => {
-        tasksDoneClearTimerRef.current = null;
-        setTasks((cur) =>
-          cur.length > 0 && cur.every(isTaskSettled) ? [] : cur
-        );
-      }, delayMs);
-    },
-    [clearTasksDoneTimer, isTaskSettled]
-  );
   const [diffs, setDiffs] = useState<DiffFileMeta[]>([]);
   const [permissions, setPermissions] = useState<PermissionReq[]>([]);
   const [busy, setBusy] = useState(false);
@@ -701,6 +674,10 @@ export function useBridge() {
           });
         }
         if (!replayingRef.current) setBusy(true);
+        // Next user turn: drop previous fully-done plan (keep incomplete multi-turn plans)
+        setTasks((ts) =>
+          ts.length > 0 && ts.every(isTaskSettled) ? [] : ts
+        );
         assistantBuf.current = "";
         thoughtBufMap.current.clear();
         postToolsAssistantId.current = null;
@@ -805,16 +782,7 @@ export function useBridge() {
         turnDoneRef.current = true;
         setActivityPhase(null);
         setActivitySubagentModel(null);
-        // Plan card: if every item is done when the turn ends, dismiss it.
-        // Incomplete items stay (multi-turn plans). All-done leftover was sticky forever.
-        setTasks((ts) => {
-          if (ts.length === 0) return ts;
-          if (ts.every(isTaskSettled)) {
-            clearTasksDoneTimer();
-            return [];
-          }
-          return ts;
-        });
+        // Keep fully-done To-dos visible with ✅ until the *next* user turn.
         // noteSessionBusy already cleared the map — sync, don't blanket setBusy(false)
         // (that used to clear busy while viewing another live session after a gate miss).
         syncBusyFromMap();
@@ -1031,45 +999,21 @@ export function useBridge() {
         break;
 
       case "TasksReplaced": {
-        // Empty plan = Core dismissed it. All settled = flash then clear
-        // (otherwise completed To-dos stick for the whole session).
-        clearTasksDoneTimer();
-        const next = event.tasks ?? [];
-        setTasks(next);
-        if (next.length === 0) break;
-        if (next.every(isTaskSettled)) {
-          scheduleClearTasksIfAllDone(next, 1600);
-        }
+        // Empty plan = Core dismissed it. All-done list stays until next user turn.
+        setTasks(event.tasks ?? []);
         break;
       }
       case "TaskUpserted":
         setTasks((ts) => {
           const i = ts.findIndex((t) => t.id === event.task.id);
-          const next =
-            i < 0
-              ? [...ts, event.task]
-              : (() => {
-                  const copy = [...ts];
-                  copy[i] = event.task;
-                  return copy;
-                })();
-          if (next.length > 0 && next.every(isTaskSettled)) {
-            scheduleClearTasksIfAllDone(next, 1600);
-          } else {
-            clearTasksDoneTimer();
-          }
+          if (i < 0) return [...ts, event.task];
+          const next = [...ts];
+          next[i] = event.task;
           return next;
         });
         break;
       case "TaskRemoved":
-        setTasks((ts) => {
-          const next = ts.filter((t) => t.id !== event.taskId);
-          if (next.length === 0) clearTasksDoneTimer();
-          else if (next.every(isTaskSettled)) {
-            scheduleClearTasksIfAllDone(next, 1200);
-          }
-          return next;
-        });
+        setTasks((ts) => ts.filter((t) => t.id !== event.taskId));
         break;
       case "PermissionRequested":
         setPermissions((p) => [
@@ -1232,9 +1176,7 @@ export function useBridge() {
     noteSessionBusy,
     syncBusyFromMap,
     paintWindowed,
-    clearTasksDoneTimer,
     isTaskSettled,
-    scheduleClearTasksIfAllDone,
   ]);
 
   useEffect(() => {
