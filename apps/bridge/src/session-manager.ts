@@ -1,7 +1,10 @@
 import type { ClientCommand, DomainEvent } from "@agent-pane/shared";
 import { nowIso } from "@agent-pane/shared";
 import { EventStore, type StoredEvent } from "./event-store.js";
-import { GrokAcpAdapter } from "./grok-acp-adapter.js";
+import {
+  createGrokAcpProvider,
+  type AgentProvider,
+} from "./provider-api.js";
 import { WorkspaceSnapshotService } from "./workspace-snapshot.js";
 import { DiffEngine, fileFingerprint } from "./diff-engine.js";
 import {
@@ -24,7 +27,8 @@ type LiveSession = {
   /** agent | auto | plan | ask | default … */
   permissionMode: string;
   providerSessionId?: string;
-  adapter: GrokAcpAdapter;
+  /** Runtime behind AgentProvider — never concrete Grok type at Host layer. */
+  adapter: AgentProvider;
   /**
    * Accept 过的文件指纹。内容没变则不再展示 Diff。
    * 文件再被改动后指纹变化，会重新出现在 Diff 里。
@@ -328,6 +332,8 @@ export class SessionManager {
           break;
         }
         try {
+          // Host owns turn index from EventStore; provider gets synced list first
+          this.hydrateProviderTurns(live.adapter, cmd.sessionId);
           await live.adapter.undoLastTurn();
         } catch (e) {
           this.broadcast({
@@ -344,8 +350,7 @@ export class SessionManager {
           break;
         }
         try {
-          // Ensure turn list matches disk (resume may have empty local turns)
-          this.hydrateAdapterTurns(live.adapter, cmd.sessionId);
+          this.hydrateProviderTurns(live.adapter, cmd.sessionId);
           await live.adapter.rewindToUserTurn(cmd.userTurnIndex);
         } catch (e) {
           this.broadcast({
@@ -396,15 +401,20 @@ export class SessionManager {
     }
   }
 
-  private hydrateAdapterTurns(
-    adapter: GrokAcpAdapter,
+  /**
+   * Host-owned turn list: rebuild from Pane EventStore before any undo/rewind
+   * so provider indices match disk (resume leaves adapter turns empty).
+   */
+  private hydrateProviderTurns(
+    adapter: AgentProvider,
     sessionId: string
-  ): void {
+  ): string[] {
     const texts = this.store
       .list(sessionId, 0)
       .filter((e) => e.type === "UserMessageAppended")
       .map((e) => (e as { text?: string }).text ?? "");
     adapter.hydrateUserTurns(texts);
+    return texts;
   }
 
   /**
@@ -455,7 +465,7 @@ export class SessionManager {
     this.broadcastLive();
   }
 
-  private wireAdapter(adapter: GrokAcpAdapter): void {
+  private wireAdapter(adapter: AgentProvider): void {
     adapter.onEvent((e) => {
       this.publish(e);
       if (e.type === "ContextUsage" && e.providerSessionId) {
@@ -508,7 +518,7 @@ export class SessionManager {
       clientRequestId,
     });
 
-    const adapter = new GrokAcpAdapter({
+    const adapter = await createGrokAcpProvider({
       autoApprove: modeUsesAlwaysApprove(mode),
     });
     this.wireAdapter(adapter);
@@ -566,7 +576,7 @@ export class SessionManager {
 
     // Immediate context fill from Grok signals.json (watcher also keeps it fresh)
     try {
-      (adapter as { publishSignalsUsageOnce?: () => boolean }).publishSignalsUsageOnce?.();
+      adapter.publishSignalsUsageOnce?.();
     } catch {
       /* non-fatal */
     }
@@ -658,7 +668,7 @@ export class SessionManager {
       sessionId,
     });
 
-    const adapter = new GrokAcpAdapter({
+    const adapter = await createGrokAcpProvider({
       autoApprove: modeUsesAlwaysApprove(mode),
     });
     this.wireAdapter(adapter);
@@ -714,7 +724,8 @@ export class SessionManager {
       acceptedFp: new Map(),
     });
     this.broadcastLive();
-    this.hydrateAdapterTurns(adapter, sessionId);
+    // Host EventStore → provider turn indices (resume leaves adapter turns empty)
+    this.hydrateProviderTurns(adapter, sessionId);
 
     this.publish({
       type: "SessionStarted",
@@ -727,7 +738,7 @@ export class SessionManager {
     });
 
     try {
-      (adapter as { publishSignalsUsageOnce?: () => boolean }).publishSignalsUsageOnce?.();
+      adapter.publishSignalsUsageOnce?.();
     } catch {
       /* non-fatal */
     }
@@ -792,6 +803,13 @@ export class SessionManager {
     if (slashName === "usage" || slashName === "billing") {
       try {
         this.broadcast({ type: "status", message: "Fetching usage…" });
+        if (!live.adapter.fetchBillingUsage) {
+          this.broadcast({
+            type: "error",
+            message: "Usage not available for this provider",
+          });
+          return;
+        }
         const u = await live.adapter.fetchBillingUsage();
         const pct =
           u.creditUsagePercent != null

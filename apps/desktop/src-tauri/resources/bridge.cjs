@@ -3711,6 +3711,454 @@ var require_websocket_server = __commonJS({
   }
 });
 
+// ../../packages/shared/dist/index.js
+function nowIso() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+var init_dist = __esm({
+  "../../packages/shared/dist/index.js"() {
+    "use strict";
+  }
+});
+
+// ../bridge/src/grok-signals-watcher.ts
+function resolveGrokSignalsPaths(cwd, providerSessionId) {
+  if (!cwd?.trim() || !providerSessionId?.trim()) return [];
+  const home = import_node_os2.default.homedir();
+  const sessionsRoot = import_node_path2.default.join(home, ".grok", "sessions");
+  const roots = /* @__PURE__ */ new Set();
+  const abs = import_node_path2.default.resolve(cwd.trim());
+  roots.add(abs);
+  try {
+    roots.add(import_node_fs2.default.realpathSync(abs));
+  } catch {
+  }
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  const push = (p) => {
+    if (seen.has(p)) return;
+    seen.add(p);
+    out.push(p);
+  };
+  for (const root of roots) {
+    push(
+      import_node_path2.default.join(
+        sessionsRoot,
+        encodeURIComponent(root),
+        providerSessionId,
+        "signals.json"
+      )
+    );
+  }
+  try {
+    if (import_node_fs2.default.existsSync(sessionsRoot)) {
+      for (const ent of import_node_fs2.default.readdirSync(sessionsRoot, { withFileTypes: true })) {
+        if (!ent.isDirectory() || !ent.name.startsWith("%")) continue;
+        push(
+          import_node_path2.default.join(sessionsRoot, ent.name, providerSessionId, "signals.json")
+        );
+      }
+    }
+  } catch {
+  }
+  return out;
+}
+function readGrokSignalsUsage(paths) {
+  for (const p of paths) {
+    try {
+      if (!import_node_fs2.default.existsSync(p)) continue;
+      const raw = import_node_fs2.default.readFileSync(p, "utf8");
+      const j = JSON.parse(raw);
+      const used = Number(j.contextTokensUsed);
+      const size = Number(j.contextWindowTokens);
+      if (!Number.isFinite(used) || !Number.isFinite(size) || size <= 0) {
+        continue;
+      }
+      const pctRaw = Number(j.contextWindowUsage);
+      return {
+        used: Math.max(0, Math.round(used)),
+        size: Math.max(1, Math.round(size)),
+        pct: Number.isFinite(pctRaw) ? pctRaw : void 0
+      };
+    } catch {
+    }
+  }
+  return null;
+}
+var import_node_fs2, import_node_os2, import_node_path2, GrokSignalsWatcher;
+var init_grok_signals_watcher = __esm({
+  "../bridge/src/grok-signals-watcher.ts"() {
+    "use strict";
+    import_node_fs2 = __toESM(require("node:fs"), 1);
+    import_node_os2 = __toESM(require("node:os"), 1);
+    import_node_path2 = __toESM(require("node:path"), 1);
+    GrokSignalsWatcher = class {
+      constructor(paths, onUsage, intervalMs = 1200) {
+        this.onUsage = onUsage;
+        this.intervalMs = intervalMs;
+        this.paths = paths;
+      }
+      timer = null;
+      watchers = [];
+      lastKey = "";
+      stopped = false;
+      paths;
+      start() {
+        this.stopped = false;
+        this.tick();
+        this.timer = setInterval(() => this.tick(), this.intervalMs);
+        for (const p of this.paths) {
+          try {
+            const dir = import_node_path2.default.dirname(p);
+            if (!import_node_fs2.default.existsSync(dir)) continue;
+            const w = import_node_fs2.default.watch(dir, { persistent: false }, (_evt, filename) => {
+              if (this.stopped) return;
+              if (!filename || filename === "signals.json" || String(filename).endsWith("signals.json")) {
+                this.tick();
+              }
+            });
+            this.watchers.push(w);
+          } catch {
+          }
+        }
+      }
+      /** Force a read (e.g. after prompt completes). */
+      refresh() {
+        this.tick();
+      }
+      stop() {
+        this.stopped = true;
+        if (this.timer) {
+          clearInterval(this.timer);
+          this.timer = null;
+        }
+        for (const w of this.watchers) {
+          try {
+            w.close();
+          } catch {
+          }
+        }
+        this.watchers = [];
+      }
+      tick() {
+        if (this.stopped) return;
+        const u = readGrokSignalsUsage(this.paths);
+        if (!u) return;
+        const key = `${u.used}:${u.size}`;
+        if (key === this.lastKey) return;
+        this.lastKey = key;
+        this.onUsage(u);
+      }
+    };
+  }
+});
+
+// ../bridge/src/attachment-persist.ts
+function guessMime(filePath) {
+  const ext = import_node_path3.default.extname(filePath).toLowerCase();
+  return MIME_BY_EXT[ext] || "application/octet-stream";
+}
+function isImagePath(filePath) {
+  const ext = import_node_path3.default.extname(filePath).toLowerCase();
+  return [
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".heic",
+    ".avif"
+  ].includes(ext);
+}
+function isEphemeralPath(filePath) {
+  const p = filePath.replace(/\\/g, "/");
+  return /\/TemporaryItems\//i.test(p) || /\/screencaptureui_/i.test(p) || /\/var\/folders\/[^/]+\/[^/]+\/T\//i.test(p) || /NSIRD_screencapture/i.test(p);
+}
+function persistLocalFile(absPath) {
+  const src = import_node_path3.default.resolve(absPath);
+  if (!import_node_fs3.default.existsSync(src) || !import_node_fs3.default.statSync(src).isFile()) return absPath;
+  if (src.startsWith(UPLOADS + import_node_path3.default.sep) || src === UPLOADS) return src;
+  import_node_fs3.default.mkdirSync(UPLOADS, { recursive: true });
+  const base = import_node_path3.default.basename(src).replace(/[^\w.\-()+ ]+/g, "_").slice(0, 120) || "file.bin";
+  const dest = import_node_path3.default.join(UPLOADS, `${Date.now().toString(36)}-${base}`);
+  import_node_fs3.default.copyFileSync(src, dest);
+  return dest;
+}
+function stabilizeAttachment(ref) {
+  if (ref.kind === "folder") return ref;
+  const p = ref.path;
+  if (!p) return ref;
+  if (isImagePath(p) || isEphemeralPath(p)) {
+    return { ...ref, path: persistLocalFile(p) };
+  }
+  return ref;
+}
+function stabilizeAttachments(refs) {
+  if (!refs?.length) return refs;
+  return refs.map(stabilizeAttachment);
+}
+var import_node_fs3, import_node_os3, import_node_path3, UPLOADS, MIME_BY_EXT;
+var init_attachment_persist = __esm({
+  "../bridge/src/attachment-persist.ts"() {
+    "use strict";
+    import_node_fs3 = __toESM(require("node:fs"), 1);
+    import_node_os3 = __toESM(require("node:os"), 1);
+    import_node_path3 = __toESM(require("node:path"), 1);
+    UPLOADS = import_node_path3.default.join(import_node_os3.default.homedir(), ".agent-pane", "uploads");
+    MIME_BY_EXT = {
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".gif": "image/gif",
+      ".webp": "image/webp",
+      ".bmp": "image/bmp",
+      ".svg": "image/svg+xml",
+      ".heic": "image/heic",
+      ".avif": "image/avif",
+      ".pdf": "application/pdf",
+      ".txt": "text/plain; charset=utf-8",
+      ".md": "text/markdown; charset=utf-8",
+      ".json": "application/json",
+      ".html": "text/html; charset=utf-8",
+      ".css": "text/css; charset=utf-8",
+      ".js": "text/javascript; charset=utf-8",
+      ".ts": "text/plain; charset=utf-8",
+      ".tsx": "text/plain; charset=utf-8"
+    };
+  }
+});
+
+// ../bridge/src/path-env.ts
+function nvmDefaultBin(home) {
+  const nvmDir = process.env.NVM_DIR || import_node_path4.default.join(home, ".nvm");
+  const alias = import_node_path4.default.join(nvmDir, "alias", "default");
+  try {
+    if (import_node_fs4.default.existsSync(alias)) {
+      const ver = import_node_fs4.default.readFileSync(alias, "utf8").trim();
+      if (ver) {
+        const bin = import_node_path4.default.join(nvmDir, "versions", "node", ver, "bin");
+        if (import_node_fs4.default.existsSync(bin)) return bin;
+      }
+    }
+  } catch {
+  }
+  try {
+    const versions = import_node_path4.default.join(nvmDir, "versions", "node");
+    if (!import_node_fs4.default.existsSync(versions)) return null;
+    const names = import_node_fs4.default.readdirSync(versions).filter((n) => n.startsWith("v")).sort();
+    for (let i = names.length - 1; i >= 0; i--) {
+      const bin = import_node_path4.default.join(versions, names[i], "bin");
+      if (import_node_fs4.default.existsSync(bin)) return bin;
+    }
+  } catch {
+  }
+  return null;
+}
+function userExtraDirs(home) {
+  const extras = [
+    import_node_path4.default.join(home, ".grok", "bin"),
+    import_node_path4.default.join(home, ".local", "bin"),
+    import_node_path4.default.join(home, ".cargo", "bin")
+  ];
+  const nvm = nvmDefaultBin(home);
+  if (nvm) extras.push(nvm);
+  return extras.filter((d) => {
+    try {
+      return import_node_fs4.default.existsSync(d);
+    } catch {
+      return false;
+    }
+  });
+}
+function cleanPathParts(raw) {
+  if (!raw) return [];
+  return raw.split(import_node_path4.default.delimiter).map((p) => p.trim()).filter((p) => p.length > 0 && p !== "$" && !/^\$+$/.test(p));
+}
+function buildAugmentedPath(existing) {
+  const home = import_node_os4.default.homedir();
+  const parts = [
+    ...SYSTEM_DIRS,
+    ...userExtraDirs(home),
+    ...cleanPathParts(existing)
+  ];
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const p of parts) {
+    if (seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out.join(import_node_path4.default.delimiter);
+}
+function applyHealthyPathToProcess() {
+  process.env.PATH = buildAugmentedPath(process.env.PATH);
+}
+function withHealthyEnv(base = process.env) {
+  const env = { ...base };
+  env.PATH = buildAugmentedPath(base.PATH ?? process.env.PATH);
+  env.BASH_ENV = "";
+  env.ENV = "";
+  return env;
+}
+function unwrapOuterQuotes(s) {
+  const t = s.trim();
+  if (t.length < 2) return t;
+  const a = t[0];
+  const b = t[t.length - 1];
+  if (a === "'" && b === "'") {
+    return t.slice(1, -1);
+  }
+  if (a === '"' && b === '"') {
+    return t.slice(1, -1).replace(/\\([\\"`$])/g, "$1");
+  }
+  return t;
+}
+function stripLeadingPathExports(script) {
+  let s = script.trimStart();
+  for (let i = 0; i < 3; i++) {
+    const m = s.match(
+      /^export\s+PATH=(?:"[^"]*"|'[^']*'|[^\s;]+)\s*;?\s*/
+    );
+    if (!m) break;
+    s = s.slice(m[0].length);
+  }
+  return s;
+}
+function stripBashCWrapper(script) {
+  const t = script.trim();
+  const m = t.match(/^(?:\/bin\/)?bash\s+-(l)?c\s+([\s\S]+)$/i);
+  if (!m) return script;
+  return unwrapOuterQuotes(m[2]);
+}
+function looksLikeGrokQuoteNest(s) {
+  return s.includes(`'"`) || s.includes(`"'`);
+}
+function repairGrokBrokenShellEscapes(script) {
+  let t = script.trim();
+  if (!looksLikeGrokQuoteNest(t)) return t;
+  if (t.startsWith("'")) {
+    if (t.endsWith("'") && t.length >= 2) {
+      const inner = t.slice(1, -1);
+      if (looksLikeGrokQuoteNest(inner) || /[|]/.test(inner)) {
+        t = inner;
+      }
+    } else {
+      t = t.slice(1);
+    }
+  }
+  t = t.replace(/'"'(.)'/g, "'$1'");
+  t = t.replace(/"'"\\+n\\?"/g, '"\\n"');
+  t = t.replace(/"'"\\+n"/g, '"\\n"');
+  t = t.replace(/'\\+n'/g, "'\\n'");
+  t = t.replace(/"\\+n"/g, '"\\n"');
+  t = t.replace(/'"'"'/g, "'");
+  t = t.replace(/'\"'\"'/g, "'");
+  return t;
+}
+function demangleGrokShellWord(script) {
+  const t = script.trim();
+  if (!looksLikeGrokQuoteNest(t)) return t;
+  const r = (0, import_node_child_process.spawnSync)("/bin/bash", ["--noprofile", "--norc"], {
+    input: `set -- ${t}
+printf '%s' "$1"
+`,
+    encoding: "utf8",
+    env: withHealthyEnv(process.env)
+  });
+  if (r.status === 0 && typeof r.stdout === "string" && r.stdout.length > 0) {
+    return r.stdout;
+  }
+  return repairGrokBrokenShellEscapes(t);
+}
+function bashHardenedArgs(script) {
+  let body = demangleGrokShellWord(script.trim());
+  body = stripLeadingPathExports(unwrapOuterQuotes(body));
+  body = stripBashCWrapper(body);
+  body = demangleGrokShellWord(body);
+  body = stripLeadingPathExports(unwrapOuterQuotes(body));
+  body = stripBashCWrapper(body);
+  body = body.replace(/'(\r?\n)'/g, "'\\n'").replace(/"(\r?\n)"/g, '"\\n"');
+  return {
+    // -s: read script from stdin — no -c argv quoting battlefield
+    args: ["--noprofile", "--norc", "-s"],
+    stdinScript: body.endsWith("\n") ? body : `${body}
+`,
+    labelBody: body
+  };
+}
+function bashSpec(script, healthyPath) {
+  void healthyPath;
+  const h = bashHardenedArgs(script);
+  return {
+    file: "/bin/bash",
+    args: h.args,
+    shell: false,
+    label: `bash -s ${h.labelBody.slice(0, 40)}`,
+    stdinScript: h.stdinScript
+  };
+}
+function resolveToolSpawn(command, args, healthyPath) {
+  const cmd = (command ?? "").trim();
+  const a = args.map(String);
+  if (/^(?:\/bin\/)?bash$/.test(cmd) && a.length >= 1 && /^-l?c$/.test(a[0])) {
+    const script = a[1] ?? "";
+    return bashSpec(script, healthyPath);
+  }
+  if (/^(?:\/bin\/)?bash$/.test(cmd) && a.length >= 1 && !/^-/.test(a[0])) {
+    const script = a.length === 1 ? a[0] : a.join(" ");
+    if (a.length > 1 || /[\s'"|&;<>$`]/.test(script)) {
+      return bashSpec(script, healthyPath);
+    }
+  }
+  const line = a.length === 0 ? cmd : "";
+  if (line) {
+    const m = line.match(/^(?:\/bin\/)?bash\s+-(l)?c\s+([\s\S]+)$/i);
+    if (m) {
+      return bashSpec(m[2], healthyPath);
+    }
+    if (/[\s'"|&;<>$`]/.test(line)) {
+      return bashSpec(line, healthyPath);
+    }
+  }
+  const file = cmd || "/bin/bash";
+  const argv = a.length ? a : [];
+  if (/[\s'"|&;<>$`]/.test(file)) {
+    const script = argv.length ? `${file} ${argv.join(" ")}` : file;
+    return bashSpec(script, healthyPath);
+  }
+  if (argv.some((x) => /[|&;<>]/.test(x) || x.includes("\n"))) {
+    const script = [file, ...argv].join(" ");
+    return bashSpec(script, healthyPath);
+  }
+  return {
+    file,
+    args: argv,
+    shell: false,
+    label: `${file} ${argv.join(" ")}`.trim().slice(0, 60)
+  };
+}
+var import_node_fs4, import_node_os4, import_node_path4, import_node_child_process, SYSTEM_DIRS;
+var init_path_env = __esm({
+  "../bridge/src/path-env.ts"() {
+    "use strict";
+    import_node_fs4 = __toESM(require("node:fs"), 1);
+    import_node_os4 = __toESM(require("node:os"), 1);
+    import_node_path4 = __toESM(require("node:path"), 1);
+    import_node_child_process = require("node:child_process");
+    SYSTEM_DIRS = [
+      "/usr/bin",
+      "/bin",
+      "/usr/sbin",
+      "/sbin",
+      "/opt/homebrew/bin",
+      "/opt/homebrew/sbin",
+      "/usr/local/bin"
+    ];
+  }
+});
+
 // ../bridge/src/browser-mcp-config.ts
 var browser_mcp_config_exports = {};
 __export(browser_mcp_config_exports, {
@@ -3805,6 +4253,1301 @@ var init_browser_mcp_config = __esm({
     import_node_module = require("node:module");
     import_node_url = require("node:url");
     import_meta = {};
+  }
+});
+
+// ../bridge/src/grok-acp-adapter.ts
+var grok_acp_adapter_exports = {};
+__export(grok_acp_adapter_exports, {
+  GrokAcpAdapter: () => GrokAcpAdapter
+});
+function summarize(v) {
+  if (v == null) return "";
+  if (typeof v === "string") return v.slice(0, 12e3);
+  const unwrapped = unwrapAcpText(v);
+  if (unwrapped) return unwrapped.slice(0, 12e3);
+  try {
+    return JSON.stringify(v).slice(0, 12e3);
+  } catch {
+    return String(v).slice(0, 12e3);
+  }
+}
+function unwrapAcpText(v) {
+  if (typeof v === "string") return v;
+  if (!v || typeof v !== "object") return "";
+  if (Array.isArray(v)) {
+    const parts = [];
+    for (const item of v) {
+      const t = unwrapAcpText(item);
+      if (t) parts.push(t);
+    }
+    return parts.join("\n").trim();
+  }
+  const o = v;
+  if (typeof o.text === "string" && o.text.trim()) return o.text;
+  if (o.content != null) {
+    const inner = unwrapAcpText(o.content);
+    if (inner) return inner;
+  }
+  for (const key of ["message", "error", "output", "rawOutput"]) {
+    const x = o[key];
+    if (typeof x === "string" && x.trim()) return x;
+    if (x && typeof x === "object") {
+      const inner = unwrapAcpText(x);
+      if (inner) return inner;
+    }
+  }
+  return "";
+}
+function mapTaskStatus(s) {
+  const x = (s ?? "pending").toLowerCase();
+  if (x.includes("progress") || x === "active") return "in_progress";
+  if (x.includes("complete") || x === "done") return "completed";
+  if (x.includes("cancel")) return "cancelled";
+  return "pending";
+}
+var import_node_child_process2, readline, import_node_fs6, import_node_path6, import_node_crypto, import_node_child_process3, GrokAcpAdapter;
+var init_grok_acp_adapter = __esm({
+  "../bridge/src/grok-acp-adapter.ts"() {
+    "use strict";
+    import_node_child_process2 = require("node:child_process");
+    readline = __toESM(require("node:readline"), 1);
+    import_node_fs6 = __toESM(require("node:fs"), 1);
+    import_node_path6 = __toESM(require("node:path"), 1);
+    import_node_crypto = require("node:crypto");
+    import_node_child_process3 = require("node:child_process");
+    init_dist();
+    init_grok_signals_watcher();
+    init_attachment_persist();
+    init_path_env();
+    GrokAcpAdapter = class {
+      id = "grok-acp";
+      proc = null;
+      rl = null;
+      nextId = 1;
+      pending = /* @__PURE__ */ new Map();
+      handlers = [];
+      domainSessionId = "";
+      providerSessionId = "";
+      cwd = ".";
+      model;
+      effort;
+      grokBin;
+      closed = false;
+      autoApprove;
+      pendingPermissions = /* @__PURE__ */ new Map();
+      /** 本会话用户消息，用于撤回 */
+      userTurns = [];
+      /** 当前 turn 是否已被用户取消（忽略后续 stream，直到下次 prompt） */
+      turnCancelled = false;
+      promptInFlight = false;
+      /** Called when the child process dies unexpectedly (not after stop()). */
+      deadHandlers = [];
+      /**
+       * While true, drop session/update notifications (legacy load-replay path;
+       * resume now uses session/new + digest so absorb stays false in practice).
+       */
+      absorbUpdates = false;
+      /** Resume digest preamble for first prompt after session/new. */
+      contextPrefix = null;
+      /** ACP terminal/create sessions */
+      terminals = /* @__PURE__ */ new Map();
+      constructor(opts) {
+        this.grokBin = opts?.grokBin ?? process.env.GROK_BIN ?? `${process.env.HOME}/.grok/bin/grok`;
+        this.autoApprove = opts?.autoApprove ?? process.env.AGENT_PANE_PERMISSION !== "ask";
+      }
+      onEvent(handler) {
+        this.handlers.push(handler);
+      }
+      onDead(handler) {
+        this.deadHandlers.push(handler);
+      }
+      /** Child still running and stdin open. */
+      isAlive() {
+        return Boolean(
+          this.proc && !this.closed && this.proc.exitCode === null && this.proc.killed !== true && this.proc.stdin && !this.proc.stdin.destroyed
+        );
+      }
+      emit(event) {
+        for (const h of this.handlers) {
+          try {
+            h(event);
+          } catch (e) {
+            console.error("[adapter] handler error", e);
+          }
+        }
+      }
+      write(obj) {
+        if (!this.proc?.stdin) return;
+        this.proc.stdin.write(JSON.stringify(obj) + "\n");
+      }
+      send(method, params, timeoutMs = 12e4) {
+        if (!this.proc?.stdin || this.closed) {
+          return Promise.reject(new Error("Agent not started"));
+        }
+        const id = this.nextId++;
+        this.write({ jsonrpc: "2.0", id, method, params });
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            if (!this.pending.has(id)) return;
+            this.pending.delete(id);
+            reject(new Error(`${method} timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+          this.pending.set(id, {
+            resolve: (v) => {
+              clearTimeout(timer);
+              resolve(v);
+            },
+            reject: (e) => {
+              clearTimeout(timer);
+              reject(e);
+            }
+          });
+        });
+      }
+      reply(id, result) {
+        this.write({ jsonrpc: "2.0", id, result });
+      }
+      replyError(id, message, code = -32e3) {
+        this.write({
+          jsonrpc: "2.0",
+          id,
+          error: { code, message }
+        });
+      }
+      handleLine(line) {
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (msg.id != null && msg.method == null) {
+          const p = this.pending.get(msg.id);
+          if (p) {
+            this.pending.delete(msg.id);
+            if (msg.error) p.reject(new Error(JSON.stringify(msg.error)));
+            else p.resolve(msg.result);
+          }
+          return;
+        }
+        if (msg.method) {
+          if (msg.id != null) {
+            void this.handleServerRequest(msg.id, msg.method, msg.params);
+          } else {
+            this.handleNotification(msg.method, msg.params);
+          }
+        }
+      }
+      async handleServerRequest(id, method, params) {
+        const p = params ?? {};
+        try {
+          if (method === "fs/read_text_file") {
+            const filePath = String(p.path ?? "");
+            const content = this.readTextFile(
+              filePath,
+              p.line,
+              p.limit
+            );
+            this.reply(id, { content });
+            return;
+          }
+          if (method === "fs/write_text_file") {
+            const filePath = String(p.path ?? "");
+            const content = String(p.content ?? "");
+            this.writeTextFile(filePath, content);
+            this.reply(id, null);
+            this.emit({
+              type: "ToolProgress",
+              sessionId: this.domainSessionId,
+              toolId: "fs-write",
+              detail: `wrote ${filePath}`,
+              at: nowIso()
+            });
+            return;
+          }
+          if (method === "session/request_permission" || method.endsWith("/request_permission")) {
+            const options = p.options ?? [];
+            const toolCall = p.toolCall ?? {};
+            const tool = String(
+              toolCall.title ?? toolCall.kind ?? p.tool ?? "tool"
+            );
+            const requestId = String(
+              toolCall.toolCallId ?? p.requestId ?? id ?? (0, import_node_crypto.randomUUID)()
+            );
+            this.emit({
+              type: "PermissionRequested",
+              sessionId: this.domainSessionId,
+              requestId,
+              tool,
+              summary: JSON.stringify(p).slice(0, 500),
+              at: nowIso()
+            });
+            this.emitActivity(`Permission: ${tool}`, "permission");
+            if (this.autoApprove) {
+              const optionId = options.find((o) => o.kind === "allow_always")?.optionId ?? options.find((o) => o.kind === "allow_once")?.optionId ?? options[0]?.optionId ?? "allow-once";
+              this.reply(id, {
+                outcome: { outcome: "selected", optionId }
+              });
+              this.emit({
+                type: "PermissionResolved",
+                sessionId: this.domainSessionId,
+                requestId,
+                allow: true,
+                at: nowIso()
+              });
+              this.emitActivity(null);
+            } else {
+              this.pendingPermissions.set(requestId, { rpcId: id, options });
+            }
+            return;
+          }
+          if (method === "terminal/create") {
+            const termId = this.createTerminal(p);
+            this.reply(id, { terminalId: termId });
+            return;
+          }
+          if (method === "terminal/output") {
+            const term = this.terminals.get(String(p.terminalId ?? ""));
+            if (!term) {
+              this.replyError(id, `Unknown terminal: ${p.terminalId}`);
+              return;
+            }
+            this.reply(id, {
+              output: term.output,
+              truncated: term.truncated,
+              exitStatus: term.exited ? { exitCode: term.exitCode, signal: term.signal } : null
+            });
+            return;
+          }
+          if (method === "terminal/wait_for_exit") {
+            const term = this.terminals.get(String(p.terminalId ?? ""));
+            if (!term) {
+              this.replyError(id, `Unknown terminal: ${p.terminalId}`);
+              return;
+            }
+            if (term.exited) {
+              this.reply(id, { exitCode: term.exitCode, signal: term.signal });
+              return;
+            }
+            await new Promise((resolve) => {
+              term.waiters.push(resolve);
+            });
+            this.reply(id, { exitCode: term.exitCode, signal: term.signal });
+            return;
+          }
+          if (method === "terminal/kill") {
+            const term = this.terminals.get(String(p.terminalId ?? ""));
+            if (term && !term.exited) {
+              try {
+                term.proc.kill("SIGTERM");
+              } catch {
+              }
+            }
+            this.reply(id, {});
+            return;
+          }
+          if (method === "terminal/release") {
+            const tid = String(p.terminalId ?? "");
+            const term = this.terminals.get(tid);
+            if (term) {
+              if (!term.exited) {
+                try {
+                  term.proc.kill("SIGTERM");
+                } catch {
+                }
+              }
+              this.terminals.delete(tid);
+            }
+            this.reply(id, {});
+            return;
+          }
+          if (method === "_x.ai/auth/get_url" || method === "x.ai/auth/get_url") {
+            const url = String(
+              p.url ?? p.authUrl ?? ""
+            );
+            if (url) {
+              this.emitActivity("Grok login \u2014 browser opened\u2026", "working");
+              try {
+                (0, import_node_child_process3.execFile)("open", [url], () => void 0);
+              } catch (e) {
+                console.warn("[adapter] open auth url failed", e);
+              }
+            }
+            this.reply(id, { ok: true });
+            return;
+          }
+          if (method === "_x.ai/auth/submit_code" || method === "x.ai/auth/submit_code") {
+            this.reply(id, { ok: true });
+            return;
+          }
+          console.warn("[adapter] unhandled server request", method);
+          this.replyError(id, `Unsupported method: ${method}`, -32601);
+        } catch (e) {
+          this.replyError(
+            id,
+            e instanceof Error ? e.message : String(e)
+          );
+        }
+      }
+      readTextFile(filePath, line, limit) {
+        if (!filePath) throw new Error("path required");
+        const base = this.cwd && this.cwd !== "." ? this.cwd : process.cwd();
+        const resolved = import_node_path6.default.isAbsolute(filePath) ? import_node_path6.default.normalize(filePath) : import_node_path6.default.resolve(base, filePath);
+        if (!import_node_fs6.default.existsSync(resolved)) {
+          throw new Error(`File not found: ${resolved}`);
+        }
+        if (isImagePath(resolved)) {
+          const st = import_node_fs6.default.statSync(resolved);
+          return `[Image file \u2014 not text]
+path: ${resolved}
+mime: ${guessMime(resolved)}
+size: ${st.size} bytes
+Do not use Read/read_file on images. If this image was attached by the user, it is already available as vision content in the conversation \u2014 describe it from that.`;
+        }
+        let text = import_node_fs6.default.readFileSync(resolved, "utf8");
+        if (line != null || limit != null) {
+          const lines = text.split("\n");
+          const start = Math.max(0, (line ?? 1) - 1);
+          const end = limit != null ? start + limit : lines.length;
+          text = lines.slice(start, end).join("\n");
+        }
+        if (text.length > 2e6) {
+          text = text.slice(0, 2e6) + "\n/* truncated */";
+        }
+        return text;
+      }
+      writeTextFile(filePath, content) {
+        if (!filePath) throw new Error("path required");
+        const base = this.cwd && this.cwd !== "." ? this.cwd : process.cwd();
+        const resolved = import_node_path6.default.isAbsolute(filePath) ? import_node_path6.default.normalize(filePath) : import_node_path6.default.resolve(base, filePath);
+        import_node_fs6.default.mkdirSync(import_node_path6.default.dirname(resolved), { recursive: true });
+        import_node_fs6.default.writeFileSync(resolved, content, "utf8");
+      }
+      emitActivity(text, phase) {
+        if (!this.domainSessionId) return;
+        this.emit({
+          type: "AgentActivity",
+          sessionId: this.domainSessionId,
+          text,
+          phase,
+          at: nowIso()
+        });
+      }
+      /** Last context window size from agent (for compact_completed which only sends after). */
+      lastContextSize = 0;
+      /** Monotonic guard — signals can briefly point at the wrong session after resume. */
+      lastContextUsed = 0;
+      lastContextProviderId = "";
+      turnAssistantText = "";
+      signalsWatcher = null;
+      stopSignalsWatcher() {
+        this.signalsWatcher?.stop();
+        this.signalsWatcher = null;
+      }
+      startSignalsWatcher() {
+        this.stopSignalsWatcher();
+        if (!this.providerSessionId || !this.cwd?.trim()) return;
+        const paths = resolveGrokSignalsPaths(this.cwd, this.providerSessionId);
+        if (paths.length === 0) return;
+        this.signalsWatcher = new GrokSignalsWatcher(paths, (u) => {
+          this.emitContextUsage(u.used, u.size, "signals", u.pct);
+        });
+        this.signalsWatcher.start();
+      }
+      /** Point watcher at a different Grok session id (e.g. from /session-info). */
+      retargetProviderSession(nextId) {
+        const id = nextId.trim();
+        if (!id || id === this.providerSessionId) return;
+        this.providerSessionId = id;
+        this.lastContextUsed = 0;
+        this.lastContextProviderId = id;
+        this.startSignalsWatcher();
+        this.publishSignalsUsageOnce();
+      }
+      /** One-shot read for SessionManager / HTTP (no watcher required). */
+      publishSignalsUsageOnce() {
+        if (!this.providerSessionId || !this.cwd?.trim()) return false;
+        const u = readGrokSignalsUsage(
+          resolveGrokSignalsPaths(this.cwd, this.providerSessionId)
+        );
+        if (!u) return false;
+        this.emitContextUsage(u.used, u.size, "signals", u.pct);
+        return true;
+      }
+      emitContextUsage(used, size, source, pct) {
+        if (!this.domainSessionId) return;
+        if (!Number.isFinite(used) || !Number.isFinite(size) || size <= 0) return;
+        const usedN = Math.max(0, Math.round(used));
+        const sizeN = Math.max(1, Math.round(size));
+        if (source === "signals" && this.lastContextProviderId === this.providerSessionId && this.lastContextUsed > 0 && usedN + 500 < this.lastContextUsed) {
+          return;
+        }
+        this.lastContextSize = sizeN;
+        this.lastContextUsed = usedN;
+        this.lastContextProviderId = this.providerSessionId;
+        this.emit({
+          type: "ContextUsage",
+          sessionId: this.domainSessionId,
+          used: usedN,
+          size: sizeN,
+          source,
+          pct: typeof pct === "number" && Number.isFinite(pct) ? Math.max(0, Math.min(100, Math.round(pct))) : Math.min(100, Math.round(usedN / sizeN * 100)),
+          providerSessionId: this.providerSessionId || void 0,
+          at: nowIso()
+        });
+      }
+      /** Pull usage (+ optional session id) out of /session-info style replies. */
+      ingestSessionInfoText(text) {
+        if (!text || !/session\s*id|context\s*:/i.test(text)) return;
+        const idMatch = text.match(
+          /Session\s*ID\s*[:：]\s*\**\s*[`"]?(019f[0-9a-fA-F-]{20,}|[0-9a-f]{8}-[0-9a-f-]{27,})[`"]?/i
+        );
+        if (idMatch?.[1]) {
+          this.retargetProviderSession(idMatch[1]);
+        }
+        const ctxMatch = text.match(
+          /Context[\s\S]{0,48}?([\d,]+)\s*\/\s*([\d,]+)\s*tokens(?:\s*\((\d+)\s*%\))?/i
+        );
+        if (ctxMatch) {
+          const used = Number(String(ctxMatch[1]).replace(/,/g, ""));
+          const size = Number(String(ctxMatch[2]).replace(/,/g, ""));
+          const pct = ctxMatch[3] != null ? Number(ctxMatch[3]) : void 0;
+          if (Number.isFinite(used) && Number.isFinite(size) && size > 0) {
+            this.emitContextUsage(used, size, "session_info", pct);
+          }
+        }
+      }
+      numField(v) {
+        if (typeof v === "number" && Number.isFinite(v)) return v;
+        if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) {
+          return Number(v);
+        }
+        return void 0;
+      }
+      createTerminal(p) {
+        const id = `term-${(0, import_node_crypto.randomUUID)()}`;
+        const command = String(p.command ?? "");
+        const args = Array.isArray(p.args) ? p.args.map(String) : [];
+        const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : this.cwd || process.cwd();
+        const byteLimit = typeof p.outputByteLimit === "number" && p.outputByteLimit > 0 ? p.outputByteLimit : 1048576;
+        const envList = Array.isArray(p.env) ? p.env : [];
+        const env = withHealthyEnv(process.env);
+        for (const e of envList) {
+          if (e?.name) env[e.name] = String(e.value ?? "");
+        }
+        env.PATH = buildAugmentedPath(env.PATH);
+        const spec = resolveToolSpawn(command, args, env.PATH);
+        const proc = (0, import_node_child_process2.spawn)(spec.file, spec.args, {
+          cwd,
+          env: spec.env ? { ...env, ...spec.env } : env,
+          shell: false,
+          stdio: [
+            spec.stdinScript != null ? "pipe" : "ignore",
+            "pipe",
+            "pipe"
+          ]
+        });
+        if (spec.stdinScript != null && proc.stdin) {
+          proc.stdin.write(spec.stdinScript);
+          proc.stdin.end();
+        }
+        const term = {
+          id,
+          proc,
+          output: "",
+          truncated: false,
+          exitCode: null,
+          signal: null,
+          exited: false,
+          waiters: [],
+          byteLimit
+        };
+        const append = (chunk) => {
+          const s = chunk.toString("utf8");
+          term.output += s;
+          if (term.output.length > term.byteLimit) {
+            term.output = term.output.slice(term.output.length - term.byteLimit);
+            term.truncated = true;
+          }
+          const last = s.trim().split("\n").filter(Boolean).pop();
+          if (last) {
+            if (/command not found|bash_profile|zshrc|conda initialize/i.test(last)) {
+              return;
+            }
+            this.emitActivity(
+              last.length > 80 ? `${last.slice(0, 80)}\u2026` : last,
+              "sleeping"
+            );
+          }
+        };
+        proc.stdout?.on("data", append);
+        proc.stderr?.on("data", append);
+        proc.on("error", (err) => {
+          term.output += `
+[spawn error] ${err.message}`;
+          term.exitCode = 1;
+          term.exited = true;
+          for (const w of term.waiters.splice(0)) w();
+        });
+        proc.on("close", (code, signal) => {
+          term.exitCode = code;
+          term.signal = signal;
+          term.exited = true;
+          for (const w of term.waiters.splice(0)) w();
+          this.emitActivity(null);
+        });
+        this.terminals.set(id, term);
+        const label = spec.label;
+        this.emitActivity(`Running ${label}${label.length >= 60 ? "\u2026" : ""}`, "tool");
+        return id;
+      }
+      handleNotification(method, params) {
+        const p = params ?? {};
+        if (method === "session/update") {
+          const update = p.update ?? p;
+          this.mapSessionUpdate(update);
+          return;
+        }
+        if (method === "_x.ai/sessions/changed" || method === "x.ai/sessions/changed") {
+          const upserted = p.upserted ?? [];
+          for (const u of upserted) {
+            if (String(u.sessionId ?? "") !== this.providerSessionId) continue;
+            const activity = String(u.activity ?? "");
+            if (activity === "working") {
+              this.emitActivity("Working\u2026", "working");
+            } else if (activity === "idle") {
+              this.emitActivity(null, "idle");
+            }
+          }
+          return;
+        }
+        if (method === "_x.ai/queue/changed" || method === "x.ai/queue/changed") {
+          if (String(p.sessionId ?? "") && String(p.sessionId) !== this.providerSessionId) {
+            return;
+          }
+          const entries = p.entries ?? [];
+          const running = p.runningPromptId ? String(p.runningPromptId) : "";
+          const head = entries[0];
+          if (head?.text?.trim().startsWith("/compact")) {
+            this.emitActivity("Compacting conversation\u2026", "compact");
+          } else if (running && head?.text) {
+            this.emitActivity(
+              `Queued: ${String(head.text).slice(0, 60)}`,
+              "queue"
+            );
+          } else if (running) {
+            this.emitActivity("Waiting for model\u2026", "working");
+          }
+          return;
+        }
+        if (method === "_x.ai/session_notification" || method === "x.ai/session_notification") {
+          const update = p.update ?? p;
+          const kind = String(update.sessionUpdate ?? "");
+          if (kind === "tool_call_delta_chunk") {
+            const toolId = String(update.tool_call_id ?? update.toolCallId ?? "delta");
+            const name = String(update.name ?? "");
+            const argDelta = update.arguments_delta;
+            if (name && !name.startsWith("pending")) {
+              this.emit({
+                type: "ToolProgress",
+                sessionId: this.domainSessionId,
+                toolId,
+                detail: name + (argDelta ? ` ${String(argDelta).slice(0, 120)}` : ""),
+                at: nowIso()
+              });
+              this.emitActivity(`Calling ${name}\u2026`, "tool");
+            }
+          } else if (kind === "pending_interaction") {
+            const ik = String(update.kind ?? "interaction");
+            if (ik === "permission") {
+              this.emitActivity("Waiting for permission\u2026", "permission");
+            } else {
+              this.emitActivity(`Waiting: ${ik}\u2026`, "working");
+            }
+          } else if (kind === "interaction_resolved") {
+            this.emitActivity(null);
+          } else if (kind === "auto_compact_started" || kind === "compact_started" || kind === "compacting") {
+            this.emitActivity("Compacting conversation\u2026", "compact");
+            const used = this.numField(update.tokens_used ?? update.tokensUsed);
+            const size = this.numField(
+              update.context_window ?? update.contextWindow
+            );
+            if (used != null && size != null) {
+              this.emitContextUsage(used, size, "compact");
+            }
+          } else if (kind === "auto_compact_completed" || kind === "compact_completed") {
+            const before = update.tokens_before ?? update.tokensBefore;
+            const after = update.tokens_after ?? update.tokensAfter;
+            const msg = before != null && after != null ? `Compacted \xB7 ${before} \u2192 ${after} tokens` : "Compact complete";
+            this.emitActivity(msg, "compact");
+            const afterN = this.numField(after);
+            const size = this.numField(update.context_window ?? update.contextWindow) ?? (this.lastContextSize > 0 ? this.lastContextSize : void 0);
+            if (afterN != null && size != null) {
+              this.emitContextUsage(afterN, size, "compact_done");
+            }
+            setTimeout(() => this.emitActivity(null), 8e3);
+          } else if (kind === "turn_completed") {
+          } else if (kind === "session_summary_generated") {
+          }
+        }
+      }
+      mapSessionUpdate(update) {
+        const kind = String(update.sessionUpdate ?? update.type ?? "");
+        const sid = this.domainSessionId;
+        const at = nowIso();
+        if (this.absorbUpdates) {
+          return;
+        }
+        if (this.turnCancelled && (kind === "agent_message_chunk" || kind === "agent_thought_chunk" || kind === "tool_call" || kind === "tool_call_update" || kind === "plan")) {
+          return;
+        }
+        switch (kind) {
+          case "agent_message_chunk": {
+            const content = update.content;
+            const text = content?.text ?? update.text ?? "";
+            if (text) {
+              this.turnAssistantText += text;
+              if (/Session\s*ID|Context\s*:/i.test(this.turnAssistantText) && this.turnAssistantText.length < 2e4) {
+                this.ingestSessionInfoText(this.turnAssistantText);
+              }
+              this.emit({
+                type: "MessageChunk",
+                sessionId: sid,
+                role: "assistant",
+                text,
+                at
+              });
+            }
+            break;
+          }
+          case "agent_thought_chunk": {
+            const content = update.content;
+            const text = content?.text ?? update.text ?? "";
+            if (text) {
+              this.emit({ type: "ThoughtChunk", sessionId: sid, text, at });
+              this.emitActivity("Thinking\u2026", "thinking");
+            }
+            break;
+          }
+          case "tool_call": {
+            const toolId = String(update.toolCallId ?? update.id ?? (0, import_node_crypto.randomUUID)());
+            const title = String(update.title ?? update.kind ?? "tool");
+            const toolKind = String(update.kind ?? "other");
+            this.emit({
+              type: "ToolStarted",
+              sessionId: sid,
+              toolId,
+              title,
+              kind: toolKind,
+              inputSummary: summarize(update.rawInput ?? update.input ?? update.arguments),
+              at
+            });
+            this.emitActivity(
+              title.startsWith("Execute") || toolKind === "execute" ? `${title.slice(0, 72)}${title.length > 72 ? "\u2026" : ""}` : `Using ${title.slice(0, 60)}\u2026`,
+              "tool"
+            );
+            break;
+          }
+          case "tool_call_update": {
+            const toolId = String(update.toolCallId ?? update.id ?? "unknown");
+            const status = String(update.status ?? "").toLowerCase();
+            const title = update.title != null ? String(update.title) : void 0;
+            const detail = summarize(update.content ?? update.rawOutput ?? update.output) || title || summarize(update);
+            if (status === "failed" || status === "error") {
+              this.emit({
+                type: "ToolFailed",
+                sessionId: sid,
+                toolId,
+                error: detail || "failed",
+                at
+              });
+            } else if (status === "completed" || status === "success") {
+              this.emit({
+                type: "ToolFinished",
+                sessionId: sid,
+                toolId,
+                outputSummary: detail,
+                at
+              });
+            } else {
+              this.emit({
+                type: "ToolProgress",
+                sessionId: sid,
+                toolId,
+                detail: detail || title,
+                at
+              });
+              if (title && !status) {
+              }
+            }
+            break;
+          }
+          case "plan": {
+            const entries = update.entries ?? update.tasks ?? update.plan ?? [];
+            const tasks = entries.map((e, i) => ({
+              id: e.id ?? `task-${i}`,
+              content: e.content ?? String(e),
+              status: mapTaskStatus(e.status),
+              source: "plan"
+            }));
+            this.emit({ type: "TasksReplaced", sessionId: sid, tasks, at });
+            break;
+          }
+          case "usage_update": {
+            const used = this.numField(update.used);
+            const size = this.numField(update.size);
+            if (used != null && size != null) {
+              this.emitContextUsage(used, size, "acp");
+            }
+            break;
+          }
+          case "auto_compact_started":
+          case "compact_started": {
+            const used = this.numField(update.tokens_used ?? update.tokensUsed);
+            const size = this.numField(
+              update.context_window ?? update.contextWindow
+            );
+            if (used != null && size != null) {
+              this.emitContextUsage(used, size, "compact");
+            }
+            this.emitActivity("Compacting conversation\u2026", "compact");
+            break;
+          }
+          case "auto_compact_completed":
+          case "compact_completed": {
+            const after = this.numField(
+              update.tokens_after ?? update.tokensAfter
+            );
+            const size = this.numField(update.context_window ?? update.contextWindow) ?? (this.lastContextSize > 0 ? this.lastContextSize : void 0);
+            if (after != null && size != null) {
+              this.emitContextUsage(after, size, "compact_done");
+            }
+            break;
+          }
+          default:
+            break;
+        }
+      }
+      async start(opts) {
+        this.cwd = opts.cwd;
+        this.model = opts.model;
+        this.effort = opts.effort;
+        this.closed = false;
+        this.lastContextSize = 0;
+        this.lastContextUsed = 0;
+        this.lastContextProviderId = "";
+        this.turnAssistantText = "";
+        this.domainSessionId = opts.domainSessionId ?? (0, import_node_crypto.randomUUID)();
+        if (opts.permissionMode === "default" || opts.permissionMode === "ask") {
+          this.autoApprove = false;
+        } else {
+          this.autoApprove = true;
+        }
+        const agentArgs = ["agent"];
+        if (opts.model) agentArgs.push("--model", opts.model);
+        if (opts.effort) agentArgs.push("--effort", opts.effort);
+        if (this.autoApprove) agentArgs.push("--always-approve");
+        agentArgs.push("stdio");
+        this.proc = (0, import_node_child_process2.spawn)(this.grokBin, agentArgs, {
+          cwd: opts.cwd,
+          stdio: ["pipe", "pipe", "pipe"],
+          // Inherit bridge PATH (already augmented at boot); re-apply in case env was stripped.
+          env: withHealthyEnv(process.env)
+        });
+        this.proc.stderr?.on("data", (buf) => {
+          const line = buf.toString();
+          try {
+            const logDir = import_node_path6.default.join(
+              process.env.HOME || "/tmp",
+              ".agent-pane"
+            );
+            import_node_fs6.default.mkdirSync(logDir, { recursive: true });
+            import_node_fs6.default.appendFileSync(
+              import_node_path6.default.join(logDir, "grok-stderr.log"),
+              `[${(/* @__PURE__ */ new Date()).toISOString()}] ${line.slice(0, 2e3)}`
+            );
+          } catch {
+          }
+          if (process.env.AGENT_PANE_DEBUG) {
+            console.error("[grok stderr]", line.slice(0, 500));
+          }
+        });
+        this.rl = readline.createInterface({ input: this.proc.stdout });
+        this.rl.on("line", (line) => this.handleLine(line));
+        this.proc.on("exit", (code) => {
+          const unexpected = !this.closed;
+          this.proc = null;
+          this.stopSignalsWatcher();
+          if (unexpected) {
+            this.emit({
+              type: "SessionError",
+              sessionId: this.domainSessionId,
+              message: `grok agent exited (${code}) \u2014 send again to resume`,
+              at: nowIso()
+            });
+            this.emit({
+              type: "SessionEnded",
+              sessionId: this.domainSessionId,
+              stopReason: `exited:${code ?? "?"}`,
+              at: nowIso()
+            });
+            for (const h of this.deadHandlers) {
+              try {
+                h(this.domainSessionId);
+              } catch (e) {
+                console.error("[adapter] onDead error", e);
+              }
+            }
+          }
+        });
+        const init = await this.send("initialize", {
+          protocolVersion: 1,
+          clientCapabilities: {
+            fs: { readTextFile: true, writeTextFile: true },
+            // Implemented: terminal/create|output|wait_for_exit|kill|release
+            terminal: true
+          },
+          clientInfo: { name: "agent-pane", version: "0.1.2" }
+        });
+        const methods = Array.isArray(init?.authMethods) ? init.authMethods : [];
+        const methodId = typeof init?._meta?.defaultAuthMethodId === "string" && init._meta.defaultAuthMethodId || methods.find((m) => typeof m?.id === "string" && m.id)?.id || (methods.length > 0 ? "grok.com" : null);
+        this.absorbUpdates = false;
+        const { browserMcpServers: browserMcpServers2 } = await Promise.resolve().then(() => (init_browser_mcp_config(), browser_mcp_config_exports));
+        const wantMcp = process.env.AGENT_PANE_BROWSER_MCP !== "0" && !opts.resumed;
+        const mcpServers = wantMcp ? browserMcpServers2() : [];
+        const isAuthRequired = (err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          return /Authentication required|auth_required|no auth method/i.test(msg);
+        };
+        const sessionNew = async (servers, timeoutMs) => await this.send(
+          "session/new",
+          { cwd: opts.cwd, mcpServers: servers },
+          timeoutMs
+        );
+        const t0 = Date.now();
+        let result;
+        try {
+          const firstTimeout = mcpServers.length > 0 ? 2e4 : 25e3;
+          this.emitActivity("Connecting\u2026", "working");
+          result = await sessionNew(mcpServers, firstTimeout);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (methodId && isAuthRequired(e)) {
+            console.warn(
+              `[adapter] session/new needs auth after ${Date.now() - t0}ms \u2014 authenticate once`
+            );
+            try {
+              this.emitActivity("Grok login required\u2026", "working");
+              await this.send("authenticate", { methodId }, 45e3);
+            } catch (authErr) {
+              this.emitActivity(null);
+              const am = authErr instanceof Error ? authErr.message : String(authErr);
+              throw new Error(
+                `\u9700\u8981\u767B\u5F55 Grok\uFF08${am}\uFF09\u3002\u7EC8\u7AEF\u8DD1\uFF1Agrok login  \u7136\u540E\u56DE\u5230\u8FD9\u91CC\u518D Send\u3002`
+              );
+            }
+            this.emitActivity("Connecting\u2026", "working");
+            result = await sessionNew([], 25e3);
+          } else if (mcpServers.length > 0 && /timed out/i.test(msg)) {
+            console.warn(
+              `[adapter] session/new with MCP timed out after ${Date.now() - t0}ms \u2014 retry without MCP`
+            );
+            this.emitActivity("Connecting\u2026", "working");
+            result = await sessionNew([], 25e3);
+          } else if (isAuthRequired(e)) {
+            this.emitActivity(null);
+            throw new Error(
+              `\u9700\u8981\u767B\u5F55 Grok\u3002\u7EC8\u7AEF\u8DD1\uFF1Agrok login  \u7136\u540E\u56DE\u5230\u8FD9\u91CC\u518D Send\u3002\uFF08${msg}\uFF09`
+            );
+          } else {
+            this.emitActivity(null);
+            throw e;
+          }
+        }
+        this.emitActivity(null);
+        this.providerSessionId = result.sessionId ?? (0, import_node_crypto.randomUUID)();
+        this.startSignalsWatcher();
+        return {
+          providerSessionId: this.providerSessionId,
+          domainSessionId: this.domainSessionId,
+          resumed: Boolean(opts.resumed),
+          cwd: opts.cwd,
+          model: opts.model,
+          effort: opts.effort,
+          /** Always need digest when resumed (we no longer session/load). */
+          needsHistoryDigest: Boolean(opts.resumed)
+        };
+      }
+      /** Optional preamble for first prompt after resume-without-load. */
+      setContextPrefix(text) {
+        this.contextPrefix = text && text.trim() ? text.trim() : null;
+      }
+      getSessionId() {
+        return this.domainSessionId;
+      }
+      getProviderSessionId() {
+        return this.providerSessionId;
+      }
+      async sendPrompt(input) {
+        if (!this.isAlive()) {
+          this.emit({
+            type: "SessionError",
+            sessionId: this.domainSessionId,
+            message: "grok agent not running \u2014 send again to resume",
+            at: nowIso()
+          });
+          throw new Error("agent not alive");
+        }
+        this.absorbUpdates = false;
+        let promptText = input.text;
+        if (this.contextPrefix) {
+          promptText = `${this.contextPrefix}
+
+---
+
+${input.text}`;
+          this.contextPrefix = null;
+        }
+        const blocks = [
+          { type: "text", text: promptText }
+        ];
+        const attachments = stabilizeAttachments(input.attachments);
+        const imageNames = [];
+        if (attachments?.length) {
+          for (const a of attachments) {
+            const abs = a.path;
+            const name = import_node_path6.default.basename(abs);
+            if (a.kind !== "folder" && isImagePath(abs) && import_node_fs6.default.existsSync(abs)) {
+              try {
+                const buf = import_node_fs6.default.readFileSync(abs);
+                if (buf.length <= 12 * 1024 * 1024) {
+                  blocks.push({
+                    type: "image",
+                    mimeType: guessMime(abs),
+                    data: buf.toString("base64")
+                  });
+                  imageNames.push(name);
+                }
+              } catch {
+              }
+            }
+            blocks.push({
+              type: "resource_link",
+              uri: `file://${abs}`,
+              name
+            });
+          }
+        }
+        if (imageNames.length) {
+          blocks.push({
+            type: "text",
+            text: `[Attached image${imageNames.length > 1 ? "s" : ""}: ${imageNames.join(", ")}. Vision content is already included above \u2014 look at the image(s) directly. Do NOT call Read/read_file on these image paths (binary files).]`
+          });
+        }
+        const shown = input.displayText ?? input.text;
+        this.turnCancelled = false;
+        this.promptInFlight = true;
+        this.turnAssistantText = "";
+        if (!input.skipUserEvent) {
+          this.userTurns.push(shown);
+          this.emit({
+            type: "UserMessageAppended",
+            sessionId: this.domainSessionId,
+            text: shown,
+            attachments,
+            at: nowIso()
+          });
+        }
+        if (shown.trim().startsWith("/compact")) {
+          this.emitActivity("Compacting conversation\u2026", "compact");
+        } else if (shown.trim().startsWith("/")) {
+          this.emitActivity(`Running ${shown.trim().split(/\s+/)[0]}\u2026`, "working");
+        } else {
+          this.emitActivity("Waiting for model\u2026", "working");
+        }
+        try {
+          const result = await this.send("session/prompt", {
+            sessionId: this.providerSessionId,
+            prompt: blocks
+          });
+          this.promptInFlight = false;
+          this.emitActivity(null);
+          const stop = result?.stopReason ?? "end_turn";
+          if (stop === "cancelled" || this.turnCancelled) {
+            this.emit({
+              type: "MessageDone",
+              sessionId: this.domainSessionId,
+              role: "assistant",
+              at: nowIso()
+            });
+            return;
+          }
+          this.emit({
+            type: "MessageDone",
+            sessionId: this.domainSessionId,
+            role: "assistant",
+            at: nowIso()
+          });
+          this.ingestSessionInfoText(this.turnAssistantText);
+          this.turnAssistantText = "";
+          this.signalsWatcher?.refresh();
+          setTimeout(() => this.signalsWatcher?.refresh(), 400);
+          setTimeout(() => this.signalsWatcher?.refresh(), 1200);
+        } catch (e) {
+          this.promptInFlight = false;
+          if (this.turnCancelled) {
+            this.emit({
+              type: "MessageDone",
+              sessionId: this.domainSessionId,
+              role: "assistant",
+              at: nowIso()
+            });
+            this.signalsWatcher?.refresh();
+            return;
+          }
+          this.emit({
+            type: "SessionError",
+            sessionId: this.domainSessionId,
+            message: e instanceof Error ? e.message : String(e),
+            at: nowIso()
+          });
+        }
+      }
+      /**
+       * 取消当前 turn。
+       * ACP 规定 session/cancel 是 **notification（无 id）**，
+       * 若带 id 当 request 发，Grok 会回 Method not found，生成不会停。
+       */
+      async cancel(_sessionId) {
+        this.turnCancelled = true;
+        for (const [requestId, pending] of this.pendingPermissions) {
+          this.reply(pending.rpcId, { outcome: { outcome: "cancelled" } });
+          this.emit({
+            type: "PermissionResolved",
+            sessionId: this.domainSessionId,
+            requestId,
+            allow: false,
+            at: nowIso()
+          });
+        }
+        this.pendingPermissions.clear();
+        if (this.providerSessionId) {
+          this.write({
+            jsonrpc: "2.0",
+            method: "session/cancel",
+            params: { sessionId: this.providerSessionId }
+          });
+        }
+        if (this.promptInFlight) {
+          this.emit({
+            type: "MessageDone",
+            sessionId: this.domainSessionId,
+            role: "assistant",
+            at: nowIso()
+          });
+        }
+      }
+      /**
+       * Discard user turn `userTurnIndex` and everything after (Claude Code Undo).
+       * 1) cancel in-flight turn
+       * 2) best-effort Grok `_x.ai/rewind/*` to that prompt index
+       * 3) always emit SessionRewound so UI + event store can truncate
+       */
+      async rewindToUserTurn(userTurnIndex) {
+        if (this.userTurns.length === 0) {
+          throw new Error("Nothing to undo");
+        }
+        if (!Number.isFinite(userTurnIndex) || userTurnIndex < 0 || userTurnIndex >= this.userTurns.length) {
+          throw new Error("Invalid turn to undo");
+        }
+        await this.cancel(this.domainSessionId);
+        const restoredText = this.userTurns[userTurnIndex];
+        let providerOk = false;
+        let note;
+        try {
+          const pts = await this.send("_x.ai/rewind/points", {
+            sessionId: this.providerSessionId
+          });
+          const points = pts?.rewind_points ?? [];
+          if (points.length === 0) {
+            note = "UI undid the turn; Grok had no rewind point";
+          } else {
+            let target = points[userTurnIndex] ?? points.find((p) => {
+              const preview = (p.prompt_preview ?? "").trim();
+              return preview && restoredText.trim().startsWith(preview.slice(0, 40));
+            }) ?? null;
+            if (!target && points.length === this.userTurns.length) {
+              target = points[userTurnIndex] ?? null;
+            }
+            if (!target && userTurnIndex === this.userTurns.length - 1) {
+              target = points[points.length - 1] ?? null;
+            }
+            if (!target) {
+              const offset = points.length - this.userTurns.length;
+              if (offset >= 0 && points[offset + userTurnIndex]) {
+                target = points[offset + userTurnIndex];
+              }
+            }
+            if (!target) {
+              note = "UI undid the turn; could not map Grok rewind point \u2014 model may still recall later messages";
+            } else {
+              const result = await this.send("_x.ai/rewind/execute", {
+                sessionId: this.providerSessionId,
+                target_prompt_index: target.prompt_index,
+                mode: "conversation_only"
+              });
+              if (result?.success) {
+                providerOk = true;
+                note = void 0;
+              } else {
+                note = "UI undid the turn; Grok rewind not confirmed \u2014 model may still recall later messages";
+                try {
+                  await this.send("_x.ai/rewind/execute", {
+                    sessionId: this.providerSessionId,
+                    target_prompt_index: target.prompt_index,
+                    mode: "all"
+                  });
+                } catch {
+                }
+              }
+            }
+          }
+        } catch (e) {
+          note = `UI undid the turn; Grok rewind failed: ${e instanceof Error ? e.message : String(e)}`;
+        }
+        this.userTurns = this.userTurns.slice(0, userTurnIndex);
+        this.emit({
+          type: "SessionRewound",
+          sessionId: this.domainSessionId,
+          restoredText,
+          userTurnIndex,
+          providerOk,
+          note,
+          at: nowIso()
+        });
+        return { restoredText, userTurnIndex, providerOk, note };
+      }
+      /**
+       * 撤回上一条用户消息 — thin wrapper around rewindToUserTurn.
+       */
+      async undoLastTurn() {
+        if (this.userTurns.length === 0) {
+          throw new Error("Nothing to undo");
+        }
+        const r = await this.rewindToUserTurn(this.userTurns.length - 1);
+        return {
+          restoredText: r.restoredText,
+          providerOk: r.providerOk,
+          note: r.note
+        };
+      }
+      /** Rebuild turn list after resume / history hydrate. */
+      hydrateUserTurns(texts) {
+        this.userTurns = texts.filter((t) => typeof t === "string");
+      }
+      /**
+       * Weekly credit usage / billing snapshot (Grok TUI `/usage`).
+       * Not advertised in available_commands under ACP — pager-only there;
+       * exposed via extension `_x.ai/billing`.
+       */
+      async fetchBillingUsage() {
+        if (!this.isAlive() || !this.providerSessionId) {
+          throw new Error("agent not alive");
+        }
+        const result = await this.send("_x.ai/billing", {
+          sessionId: this.providerSessionId
+        });
+        const cfg = result?.config ?? {};
+        const period = cfg.currentPeriod ?? {};
+        const numVal = (v) => {
+          if (typeof v === "number") return v;
+          if (v && typeof v === "object" && "val" in v) {
+            const n = Number(v.val);
+            return Number.isFinite(n) ? n : void 0;
+          }
+          return void 0;
+        };
+        return {
+          creditUsagePercent: typeof cfg.creditUsagePercent === "number" ? cfg.creditUsagePercent : void 0,
+          periodType: typeof period.type === "string" ? period.type : void 0,
+          periodStart: (typeof period.start === "string" ? period.start : void 0) ?? (typeof cfg.billingPeriodStart === "string" ? cfg.billingPeriodStart : void 0),
+          periodEnd: (typeof period.end === "string" ? period.end : void 0) ?? (typeof cfg.billingPeriodEnd === "string" ? cfg.billingPeriodEnd : void 0),
+          subscriptionTier: result?.subscription_tier,
+          onDemandCap: numVal(cfg.onDemandCap),
+          onDemandUsed: numVal(cfg.onDemandUsed),
+          prepaidBalance: numVal(cfg.prepaidBalance),
+          raw: result
+        };
+      }
+      /** Show a local system-style reply without hitting the model. */
+      emitLocalReply(userText, assistantText) {
+        const at = nowIso();
+        this.userTurns.push(userText);
+        this.emit({
+          type: "UserMessageAppended",
+          sessionId: this.domainSessionId,
+          text: userText,
+          at
+        });
+        this.emit({
+          type: "MessageChunk",
+          sessionId: this.domainSessionId,
+          role: "assistant",
+          text: assistantText,
+          at
+        });
+        this.emit({
+          type: "MessageDone",
+          sessionId: this.domainSessionId,
+          role: "assistant",
+          at: nowIso()
+        });
+      }
+      hasPendingPermission(requestId) {
+        return this.pendingPermissions.has(requestId);
+      }
+      async respondPermission(requestId, allow) {
+        const pending = this.pendingPermissions.get(requestId);
+        this.emit({
+          type: "PermissionResolved",
+          sessionId: this.domainSessionId,
+          requestId,
+          allow,
+          at: nowIso()
+        });
+        if (!pending) return;
+        this.pendingPermissions.delete(requestId);
+        const optionId = allow ? pending.options.find((o) => o.kind === "allow_once")?.optionId ?? pending.options.find((o) => o.kind?.startsWith("allow"))?.optionId ?? "allow-once" : pending.options.find((o) => o.kind === "reject_once")?.optionId ?? pending.options.find((o) => o.kind?.startsWith("reject"))?.optionId ?? "reject-once";
+        this.reply(pending.rpcId, {
+          outcome: allow ? { outcome: "selected", optionId } : { outcome: "selected", optionId }
+        });
+      }
+      async stop() {
+        this.closed = true;
+        this.stopSignalsWatcher();
+        for (const term of this.terminals.values()) {
+          if (!term.exited) {
+            try {
+              term.proc.kill("SIGTERM");
+            } catch {
+            }
+          }
+        }
+        this.terminals.clear();
+        this.rl?.close();
+        this.proc?.kill();
+        this.proc = null;
+        if (this.domainSessionId) {
+          this.emit({
+            type: "SessionEnded",
+            sessionId: this.domainSessionId,
+            stopReason: "client_stop",
+            at: nowIso()
+          });
+        }
+      }
+    };
   }
 });
 
@@ -4573,10 +6316,8 @@ var import_subprotocol = __toESM(require_subprotocol(), 1);
 var import_websocket = __toESM(require_websocket(), 1);
 var import_websocket_server = __toESM(require_websocket_server(), 1);
 
-// ../../packages/shared/dist/index.js
-function nowIso() {
-  return (/* @__PURE__ */ new Date()).toISOString();
-}
+// ../bridge/src/session-manager.ts
+init_dist();
 
 // ../bridge/src/event-store.ts
 var import_node_fs = __toESM(require("node:fs"), 1);
@@ -4719,1707 +6460,10 @@ var EventStore = class {
   }
 };
 
-// ../bridge/src/grok-acp-adapter.ts
-var import_node_child_process2 = require("node:child_process");
-var readline = __toESM(require("node:readline"), 1);
-var import_node_fs6 = __toESM(require("node:fs"), 1);
-var import_node_path6 = __toESM(require("node:path"), 1);
-var import_node_crypto = require("node:crypto");
-var import_node_child_process3 = require("node:child_process");
-
-// ../bridge/src/grok-signals-watcher.ts
-var import_node_fs2 = __toESM(require("node:fs"), 1);
-var import_node_os2 = __toESM(require("node:os"), 1);
-var import_node_path2 = __toESM(require("node:path"), 1);
-function resolveGrokSignalsPaths(cwd, providerSessionId) {
-  if (!cwd?.trim() || !providerSessionId?.trim()) return [];
-  const home = import_node_os2.default.homedir();
-  const sessionsRoot = import_node_path2.default.join(home, ".grok", "sessions");
-  const roots = /* @__PURE__ */ new Set();
-  const abs = import_node_path2.default.resolve(cwd.trim());
-  roots.add(abs);
-  try {
-    roots.add(import_node_fs2.default.realpathSync(abs));
-  } catch {
-  }
-  const out = [];
-  const seen = /* @__PURE__ */ new Set();
-  const push = (p) => {
-    if (seen.has(p)) return;
-    seen.add(p);
-    out.push(p);
-  };
-  for (const root of roots) {
-    push(
-      import_node_path2.default.join(
-        sessionsRoot,
-        encodeURIComponent(root),
-        providerSessionId,
-        "signals.json"
-      )
-    );
-  }
-  try {
-    if (import_node_fs2.default.existsSync(sessionsRoot)) {
-      for (const ent of import_node_fs2.default.readdirSync(sessionsRoot, { withFileTypes: true })) {
-        if (!ent.isDirectory() || !ent.name.startsWith("%")) continue;
-        push(
-          import_node_path2.default.join(sessionsRoot, ent.name, providerSessionId, "signals.json")
-        );
-      }
-    }
-  } catch {
-  }
-  return out;
-}
-function readGrokSignalsUsage(paths) {
-  for (const p of paths) {
-    try {
-      if (!import_node_fs2.default.existsSync(p)) continue;
-      const raw = import_node_fs2.default.readFileSync(p, "utf8");
-      const j = JSON.parse(raw);
-      const used = Number(j.contextTokensUsed);
-      const size = Number(j.contextWindowTokens);
-      if (!Number.isFinite(used) || !Number.isFinite(size) || size <= 0) {
-        continue;
-      }
-      const pctRaw = Number(j.contextWindowUsage);
-      return {
-        used: Math.max(0, Math.round(used)),
-        size: Math.max(1, Math.round(size)),
-        pct: Number.isFinite(pctRaw) ? pctRaw : void 0
-      };
-    } catch {
-    }
-  }
-  return null;
-}
-var GrokSignalsWatcher = class {
-  constructor(paths, onUsage, intervalMs = 1200) {
-    this.onUsage = onUsage;
-    this.intervalMs = intervalMs;
-    this.paths = paths;
-  }
-  timer = null;
-  watchers = [];
-  lastKey = "";
-  stopped = false;
-  paths;
-  start() {
-    this.stopped = false;
-    this.tick();
-    this.timer = setInterval(() => this.tick(), this.intervalMs);
-    for (const p of this.paths) {
-      try {
-        const dir = import_node_path2.default.dirname(p);
-        if (!import_node_fs2.default.existsSync(dir)) continue;
-        const w = import_node_fs2.default.watch(dir, { persistent: false }, (_evt, filename) => {
-          if (this.stopped) return;
-          if (!filename || filename === "signals.json" || String(filename).endsWith("signals.json")) {
-            this.tick();
-          }
-        });
-        this.watchers.push(w);
-      } catch {
-      }
-    }
-  }
-  /** Force a read (e.g. after prompt completes). */
-  refresh() {
-    this.tick();
-  }
-  stop() {
-    this.stopped = true;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    for (const w of this.watchers) {
-      try {
-        w.close();
-      } catch {
-      }
-    }
-    this.watchers = [];
-  }
-  tick() {
-    if (this.stopped) return;
-    const u = readGrokSignalsUsage(this.paths);
-    if (!u) return;
-    const key = `${u.used}:${u.size}`;
-    if (key === this.lastKey) return;
-    this.lastKey = key;
-    this.onUsage(u);
-  }
-};
-
-// ../bridge/src/attachment-persist.ts
-var import_node_fs3 = __toESM(require("node:fs"), 1);
-var import_node_os3 = __toESM(require("node:os"), 1);
-var import_node_path3 = __toESM(require("node:path"), 1);
-var UPLOADS = import_node_path3.default.join(import_node_os3.default.homedir(), ".agent-pane", "uploads");
-var MIME_BY_EXT = {
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-  ".bmp": "image/bmp",
-  ".svg": "image/svg+xml",
-  ".heic": "image/heic",
-  ".avif": "image/avif",
-  ".pdf": "application/pdf",
-  ".txt": "text/plain; charset=utf-8",
-  ".md": "text/markdown; charset=utf-8",
-  ".json": "application/json",
-  ".html": "text/html; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".ts": "text/plain; charset=utf-8",
-  ".tsx": "text/plain; charset=utf-8"
-};
-function guessMime(filePath) {
-  const ext = import_node_path3.default.extname(filePath).toLowerCase();
-  return MIME_BY_EXT[ext] || "application/octet-stream";
-}
-function isImagePath(filePath) {
-  const ext = import_node_path3.default.extname(filePath).toLowerCase();
-  return [
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".bmp",
-    ".svg",
-    ".heic",
-    ".avif"
-  ].includes(ext);
-}
-function isEphemeralPath(filePath) {
-  const p = filePath.replace(/\\/g, "/");
-  return /\/TemporaryItems\//i.test(p) || /\/screencaptureui_/i.test(p) || /\/var\/folders\/[^/]+\/[^/]+\/T\//i.test(p) || /NSIRD_screencapture/i.test(p);
-}
-function persistLocalFile(absPath) {
-  const src = import_node_path3.default.resolve(absPath);
-  if (!import_node_fs3.default.existsSync(src) || !import_node_fs3.default.statSync(src).isFile()) return absPath;
-  if (src.startsWith(UPLOADS + import_node_path3.default.sep) || src === UPLOADS) return src;
-  import_node_fs3.default.mkdirSync(UPLOADS, { recursive: true });
-  const base = import_node_path3.default.basename(src).replace(/[^\w.\-()+ ]+/g, "_").slice(0, 120) || "file.bin";
-  const dest = import_node_path3.default.join(UPLOADS, `${Date.now().toString(36)}-${base}`);
-  import_node_fs3.default.copyFileSync(src, dest);
-  return dest;
-}
-function stabilizeAttachment(ref) {
-  if (ref.kind === "folder") return ref;
-  const p = ref.path;
-  if (!p) return ref;
-  if (isImagePath(p) || isEphemeralPath(p)) {
-    return { ...ref, path: persistLocalFile(p) };
-  }
-  return ref;
-}
-function stabilizeAttachments(refs) {
-  if (!refs?.length) return refs;
-  return refs.map(stabilizeAttachment);
-}
-
-// ../bridge/src/path-env.ts
-var import_node_fs4 = __toESM(require("node:fs"), 1);
-var import_node_os4 = __toESM(require("node:os"), 1);
-var import_node_path4 = __toESM(require("node:path"), 1);
-var import_node_child_process = require("node:child_process");
-var SYSTEM_DIRS = [
-  "/usr/bin",
-  "/bin",
-  "/usr/sbin",
-  "/sbin",
-  "/opt/homebrew/bin",
-  "/opt/homebrew/sbin",
-  "/usr/local/bin"
-];
-function nvmDefaultBin(home) {
-  const nvmDir = process.env.NVM_DIR || import_node_path4.default.join(home, ".nvm");
-  const alias = import_node_path4.default.join(nvmDir, "alias", "default");
-  try {
-    if (import_node_fs4.default.existsSync(alias)) {
-      const ver = import_node_fs4.default.readFileSync(alias, "utf8").trim();
-      if (ver) {
-        const bin = import_node_path4.default.join(nvmDir, "versions", "node", ver, "bin");
-        if (import_node_fs4.default.existsSync(bin)) return bin;
-      }
-    }
-  } catch {
-  }
-  try {
-    const versions = import_node_path4.default.join(nvmDir, "versions", "node");
-    if (!import_node_fs4.default.existsSync(versions)) return null;
-    const names = import_node_fs4.default.readdirSync(versions).filter((n) => n.startsWith("v")).sort();
-    for (let i = names.length - 1; i >= 0; i--) {
-      const bin = import_node_path4.default.join(versions, names[i], "bin");
-      if (import_node_fs4.default.existsSync(bin)) return bin;
-    }
-  } catch {
-  }
-  return null;
-}
-function userExtraDirs(home) {
-  const extras = [
-    import_node_path4.default.join(home, ".grok", "bin"),
-    import_node_path4.default.join(home, ".local", "bin"),
-    import_node_path4.default.join(home, ".cargo", "bin")
-  ];
-  const nvm = nvmDefaultBin(home);
-  if (nvm) extras.push(nvm);
-  return extras.filter((d) => {
-    try {
-      return import_node_fs4.default.existsSync(d);
-    } catch {
-      return false;
-    }
-  });
-}
-function cleanPathParts(raw) {
-  if (!raw) return [];
-  return raw.split(import_node_path4.default.delimiter).map((p) => p.trim()).filter((p) => p.length > 0 && p !== "$" && !/^\$+$/.test(p));
-}
-function buildAugmentedPath(existing) {
-  const home = import_node_os4.default.homedir();
-  const parts = [
-    ...SYSTEM_DIRS,
-    ...userExtraDirs(home),
-    ...cleanPathParts(existing)
-  ];
-  const seen = /* @__PURE__ */ new Set();
-  const out = [];
-  for (const p of parts) {
-    if (seen.has(p)) continue;
-    seen.add(p);
-    out.push(p);
-  }
-  return out.join(import_node_path4.default.delimiter);
-}
-function applyHealthyPathToProcess() {
-  process.env.PATH = buildAugmentedPath(process.env.PATH);
-}
-function withHealthyEnv(base = process.env) {
-  const env = { ...base };
-  env.PATH = buildAugmentedPath(base.PATH ?? process.env.PATH);
-  env.BASH_ENV = "";
-  env.ENV = "";
-  return env;
-}
-function unwrapOuterQuotes(s) {
-  const t = s.trim();
-  if (t.length < 2) return t;
-  const a = t[0];
-  const b = t[t.length - 1];
-  if (a === "'" && b === "'") {
-    return t.slice(1, -1);
-  }
-  if (a === '"' && b === '"') {
-    return t.slice(1, -1).replace(/\\([\\"`$])/g, "$1");
-  }
-  return t;
-}
-function stripLeadingPathExports(script) {
-  let s = script.trimStart();
-  for (let i = 0; i < 3; i++) {
-    const m = s.match(
-      /^export\s+PATH=(?:"[^"]*"|'[^']*'|[^\s;]+)\s*;?\s*/
-    );
-    if (!m) break;
-    s = s.slice(m[0].length);
-  }
-  return s;
-}
-function stripBashCWrapper(script) {
-  const t = script.trim();
-  const m = t.match(/^(?:\/bin\/)?bash\s+-(l)?c\s+([\s\S]+)$/i);
-  if (!m) return script;
-  return unwrapOuterQuotes(m[2]);
-}
-function looksLikeGrokQuoteNest(s) {
-  return s.includes(`'"`) || s.includes(`"'`);
-}
-function repairGrokBrokenShellEscapes(script) {
-  let t = script.trim();
-  if (!looksLikeGrokQuoteNest(t)) return t;
-  if (t.startsWith("'")) {
-    if (t.endsWith("'") && t.length >= 2) {
-      const inner = t.slice(1, -1);
-      if (looksLikeGrokQuoteNest(inner) || /[|]/.test(inner)) {
-        t = inner;
-      }
-    } else {
-      t = t.slice(1);
-    }
-  }
-  t = t.replace(/'"'(.)'/g, "'$1'");
-  t = t.replace(/"'"\\+n\\?"/g, '"\\n"');
-  t = t.replace(/"'"\\+n"/g, '"\\n"');
-  t = t.replace(/'\\+n'/g, "'\\n'");
-  t = t.replace(/"\\+n"/g, '"\\n"');
-  t = t.replace(/'"'"'/g, "'");
-  t = t.replace(/'\"'\"'/g, "'");
-  return t;
-}
-function demangleGrokShellWord(script) {
-  const t = script.trim();
-  if (!looksLikeGrokQuoteNest(t)) return t;
-  const r = (0, import_node_child_process.spawnSync)("/bin/bash", ["--noprofile", "--norc"], {
-    input: `set -- ${t}
-printf '%s' "$1"
-`,
-    encoding: "utf8",
-    env: withHealthyEnv(process.env)
-  });
-  if (r.status === 0 && typeof r.stdout === "string" && r.stdout.length > 0) {
-    return r.stdout;
-  }
-  return repairGrokBrokenShellEscapes(t);
-}
-function bashHardenedArgs(script) {
-  let body = demangleGrokShellWord(script.trim());
-  body = stripLeadingPathExports(unwrapOuterQuotes(body));
-  body = stripBashCWrapper(body);
-  body = demangleGrokShellWord(body);
-  body = stripLeadingPathExports(unwrapOuterQuotes(body));
-  body = stripBashCWrapper(body);
-  body = body.replace(/'(\r?\n)'/g, "'\\n'").replace(/"(\r?\n)"/g, '"\\n"');
-  return {
-    // -s: read script from stdin — no -c argv quoting battlefield
-    args: ["--noprofile", "--norc", "-s"],
-    stdinScript: body.endsWith("\n") ? body : `${body}
-`,
-    labelBody: body
-  };
-}
-function bashSpec(script, healthyPath) {
-  void healthyPath;
-  const h = bashHardenedArgs(script);
-  return {
-    file: "/bin/bash",
-    args: h.args,
-    shell: false,
-    label: `bash -s ${h.labelBody.slice(0, 40)}`,
-    stdinScript: h.stdinScript
-  };
-}
-function resolveToolSpawn(command, args, healthyPath) {
-  const cmd = (command ?? "").trim();
-  const a = args.map(String);
-  if (/^(?:\/bin\/)?bash$/.test(cmd) && a.length >= 1 && /^-l?c$/.test(a[0])) {
-    const script = a[1] ?? "";
-    return bashSpec(script, healthyPath);
-  }
-  if (/^(?:\/bin\/)?bash$/.test(cmd) && a.length >= 1 && !/^-/.test(a[0])) {
-    const script = a.length === 1 ? a[0] : a.join(" ");
-    if (a.length > 1 || /[\s'"|&;<>$`]/.test(script)) {
-      return bashSpec(script, healthyPath);
-    }
-  }
-  const line = a.length === 0 ? cmd : "";
-  if (line) {
-    const m = line.match(/^(?:\/bin\/)?bash\s+-(l)?c\s+([\s\S]+)$/i);
-    if (m) {
-      return bashSpec(m[2], healthyPath);
-    }
-    if (/[\s'"|&;<>$`]/.test(line)) {
-      return bashSpec(line, healthyPath);
-    }
-  }
-  const file = cmd || "/bin/bash";
-  const argv = a.length ? a : [];
-  if (/[\s'"|&;<>$`]/.test(file)) {
-    const script = argv.length ? `${file} ${argv.join(" ")}` : file;
-    return bashSpec(script, healthyPath);
-  }
-  if (argv.some((x) => /[|&;<>]/.test(x) || x.includes("\n"))) {
-    const script = [file, ...argv].join(" ");
-    return bashSpec(script, healthyPath);
-  }
-  return {
-    file,
-    args: argv,
-    shell: false,
-    label: `${file} ${argv.join(" ")}`.trim().slice(0, 60)
-  };
-}
-
-// ../bridge/src/grok-acp-adapter.ts
-var GrokAcpAdapter = class {
-  id = "grok-acp";
-  proc = null;
-  rl = null;
-  nextId = 1;
-  pending = /* @__PURE__ */ new Map();
-  handlers = [];
-  domainSessionId = "";
-  providerSessionId = "";
-  cwd = ".";
-  model;
-  effort;
-  grokBin;
-  closed = false;
-  autoApprove;
-  pendingPermissions = /* @__PURE__ */ new Map();
-  /** 本会话用户消息，用于撤回 */
-  userTurns = [];
-  /** 当前 turn 是否已被用户取消（忽略后续 stream，直到下次 prompt） */
-  turnCancelled = false;
-  promptInFlight = false;
-  /** Called when the child process dies unexpectedly (not after stop()). */
-  deadHandlers = [];
-  /**
-   * While true, drop session/update notifications (legacy load-replay path;
-   * resume now uses session/new + digest so absorb stays false in practice).
-   */
-  absorbUpdates = false;
-  /** Resume digest preamble for first prompt after session/new. */
-  contextPrefix = null;
-  /** ACP terminal/create sessions */
-  terminals = /* @__PURE__ */ new Map();
-  constructor(opts) {
-    this.grokBin = opts?.grokBin ?? process.env.GROK_BIN ?? `${process.env.HOME}/.grok/bin/grok`;
-    this.autoApprove = opts?.autoApprove ?? process.env.AGENT_PANE_PERMISSION !== "ask";
-  }
-  onEvent(handler) {
-    this.handlers.push(handler);
-  }
-  onDead(handler) {
-    this.deadHandlers.push(handler);
-  }
-  /** Child still running and stdin open. */
-  isAlive() {
-    return Boolean(
-      this.proc && !this.closed && this.proc.exitCode === null && this.proc.killed !== true && this.proc.stdin && !this.proc.stdin.destroyed
-    );
-  }
-  emit(event) {
-    for (const h of this.handlers) {
-      try {
-        h(event);
-      } catch (e) {
-        console.error("[adapter] handler error", e);
-      }
-    }
-  }
-  write(obj) {
-    if (!this.proc?.stdin) return;
-    this.proc.stdin.write(JSON.stringify(obj) + "\n");
-  }
-  send(method, params, timeoutMs = 12e4) {
-    if (!this.proc?.stdin || this.closed) {
-      return Promise.reject(new Error("Agent not started"));
-    }
-    const id = this.nextId++;
-    this.write({ jsonrpc: "2.0", id, method, params });
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (!this.pending.has(id)) return;
-        this.pending.delete(id);
-        reject(new Error(`${method} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      this.pending.set(id, {
-        resolve: (v) => {
-          clearTimeout(timer);
-          resolve(v);
-        },
-        reject: (e) => {
-          clearTimeout(timer);
-          reject(e);
-        }
-      });
-    });
-  }
-  reply(id, result) {
-    this.write({ jsonrpc: "2.0", id, result });
-  }
-  replyError(id, message, code = -32e3) {
-    this.write({
-      jsonrpc: "2.0",
-      id,
-      error: { code, message }
-    });
-  }
-  handleLine(line) {
-    let msg;
-    try {
-      msg = JSON.parse(line);
-    } catch {
-      return;
-    }
-    if (msg.id != null && msg.method == null) {
-      const p = this.pending.get(msg.id);
-      if (p) {
-        this.pending.delete(msg.id);
-        if (msg.error) p.reject(new Error(JSON.stringify(msg.error)));
-        else p.resolve(msg.result);
-      }
-      return;
-    }
-    if (msg.method) {
-      if (msg.id != null) {
-        void this.handleServerRequest(msg.id, msg.method, msg.params);
-      } else {
-        this.handleNotification(msg.method, msg.params);
-      }
-    }
-  }
-  async handleServerRequest(id, method, params) {
-    const p = params ?? {};
-    try {
-      if (method === "fs/read_text_file") {
-        const filePath = String(p.path ?? "");
-        const content = this.readTextFile(
-          filePath,
-          p.line,
-          p.limit
-        );
-        this.reply(id, { content });
-        return;
-      }
-      if (method === "fs/write_text_file") {
-        const filePath = String(p.path ?? "");
-        const content = String(p.content ?? "");
-        this.writeTextFile(filePath, content);
-        this.reply(id, null);
-        this.emit({
-          type: "ToolProgress",
-          sessionId: this.domainSessionId,
-          toolId: "fs-write",
-          detail: `wrote ${filePath}`,
-          at: nowIso()
-        });
-        return;
-      }
-      if (method === "session/request_permission" || method.endsWith("/request_permission")) {
-        const options = p.options ?? [];
-        const toolCall = p.toolCall ?? {};
-        const tool = String(
-          toolCall.title ?? toolCall.kind ?? p.tool ?? "tool"
-        );
-        const requestId = String(
-          toolCall.toolCallId ?? p.requestId ?? id ?? (0, import_node_crypto.randomUUID)()
-        );
-        this.emit({
-          type: "PermissionRequested",
-          sessionId: this.domainSessionId,
-          requestId,
-          tool,
-          summary: JSON.stringify(p).slice(0, 500),
-          at: nowIso()
-        });
-        this.emitActivity(`Permission: ${tool}`, "permission");
-        if (this.autoApprove) {
-          const optionId = options.find((o) => o.kind === "allow_always")?.optionId ?? options.find((o) => o.kind === "allow_once")?.optionId ?? options[0]?.optionId ?? "allow-once";
-          this.reply(id, {
-            outcome: { outcome: "selected", optionId }
-          });
-          this.emit({
-            type: "PermissionResolved",
-            sessionId: this.domainSessionId,
-            requestId,
-            allow: true,
-            at: nowIso()
-          });
-          this.emitActivity(null);
-        } else {
-          this.pendingPermissions.set(requestId, { rpcId: id, options });
-        }
-        return;
-      }
-      if (method === "terminal/create") {
-        const termId = this.createTerminal(p);
-        this.reply(id, { terminalId: termId });
-        return;
-      }
-      if (method === "terminal/output") {
-        const term = this.terminals.get(String(p.terminalId ?? ""));
-        if (!term) {
-          this.replyError(id, `Unknown terminal: ${p.terminalId}`);
-          return;
-        }
-        this.reply(id, {
-          output: term.output,
-          truncated: term.truncated,
-          exitStatus: term.exited ? { exitCode: term.exitCode, signal: term.signal } : null
-        });
-        return;
-      }
-      if (method === "terminal/wait_for_exit") {
-        const term = this.terminals.get(String(p.terminalId ?? ""));
-        if (!term) {
-          this.replyError(id, `Unknown terminal: ${p.terminalId}`);
-          return;
-        }
-        if (term.exited) {
-          this.reply(id, { exitCode: term.exitCode, signal: term.signal });
-          return;
-        }
-        await new Promise((resolve) => {
-          term.waiters.push(resolve);
-        });
-        this.reply(id, { exitCode: term.exitCode, signal: term.signal });
-        return;
-      }
-      if (method === "terminal/kill") {
-        const term = this.terminals.get(String(p.terminalId ?? ""));
-        if (term && !term.exited) {
-          try {
-            term.proc.kill("SIGTERM");
-          } catch {
-          }
-        }
-        this.reply(id, {});
-        return;
-      }
-      if (method === "terminal/release") {
-        const tid = String(p.terminalId ?? "");
-        const term = this.terminals.get(tid);
-        if (term) {
-          if (!term.exited) {
-            try {
-              term.proc.kill("SIGTERM");
-            } catch {
-            }
-          }
-          this.terminals.delete(tid);
-        }
-        this.reply(id, {});
-        return;
-      }
-      if (method === "_x.ai/auth/get_url" || method === "x.ai/auth/get_url") {
-        const url = String(
-          p.url ?? p.authUrl ?? ""
-        );
-        if (url) {
-          this.emitActivity("Grok login \u2014 browser opened\u2026", "working");
-          try {
-            (0, import_node_child_process3.execFile)("open", [url], () => void 0);
-          } catch (e) {
-            console.warn("[adapter] open auth url failed", e);
-          }
-        }
-        this.reply(id, { ok: true });
-        return;
-      }
-      if (method === "_x.ai/auth/submit_code" || method === "x.ai/auth/submit_code") {
-        this.reply(id, { ok: true });
-        return;
-      }
-      console.warn("[adapter] unhandled server request", method);
-      this.replyError(id, `Unsupported method: ${method}`, -32601);
-    } catch (e) {
-      this.replyError(
-        id,
-        e instanceof Error ? e.message : String(e)
-      );
-    }
-  }
-  readTextFile(filePath, line, limit) {
-    if (!filePath) throw new Error("path required");
-    const base = this.cwd && this.cwd !== "." ? this.cwd : process.cwd();
-    const resolved = import_node_path6.default.isAbsolute(filePath) ? import_node_path6.default.normalize(filePath) : import_node_path6.default.resolve(base, filePath);
-    if (!import_node_fs6.default.existsSync(resolved)) {
-      throw new Error(`File not found: ${resolved}`);
-    }
-    if (isImagePath(resolved)) {
-      const st = import_node_fs6.default.statSync(resolved);
-      return `[Image file \u2014 not text]
-path: ${resolved}
-mime: ${guessMime(resolved)}
-size: ${st.size} bytes
-Do not use Read/read_file on images. If this image was attached by the user, it is already available as vision content in the conversation \u2014 describe it from that.`;
-    }
-    let text = import_node_fs6.default.readFileSync(resolved, "utf8");
-    if (line != null || limit != null) {
-      const lines = text.split("\n");
-      const start = Math.max(0, (line ?? 1) - 1);
-      const end = limit != null ? start + limit : lines.length;
-      text = lines.slice(start, end).join("\n");
-    }
-    if (text.length > 2e6) {
-      text = text.slice(0, 2e6) + "\n/* truncated */";
-    }
-    return text;
-  }
-  writeTextFile(filePath, content) {
-    if (!filePath) throw new Error("path required");
-    const base = this.cwd && this.cwd !== "." ? this.cwd : process.cwd();
-    const resolved = import_node_path6.default.isAbsolute(filePath) ? import_node_path6.default.normalize(filePath) : import_node_path6.default.resolve(base, filePath);
-    import_node_fs6.default.mkdirSync(import_node_path6.default.dirname(resolved), { recursive: true });
-    import_node_fs6.default.writeFileSync(resolved, content, "utf8");
-  }
-  emitActivity(text, phase) {
-    if (!this.domainSessionId) return;
-    this.emit({
-      type: "AgentActivity",
-      sessionId: this.domainSessionId,
-      text,
-      phase,
-      at: nowIso()
-    });
-  }
-  /** Last context window size from agent (for compact_completed which only sends after). */
-  lastContextSize = 0;
-  /** Monotonic guard — signals can briefly point at the wrong session after resume. */
-  lastContextUsed = 0;
-  lastContextProviderId = "";
-  turnAssistantText = "";
-  signalsWatcher = null;
-  stopSignalsWatcher() {
-    this.signalsWatcher?.stop();
-    this.signalsWatcher = null;
-  }
-  startSignalsWatcher() {
-    this.stopSignalsWatcher();
-    if (!this.providerSessionId || !this.cwd?.trim()) return;
-    const paths = resolveGrokSignalsPaths(this.cwd, this.providerSessionId);
-    if (paths.length === 0) return;
-    this.signalsWatcher = new GrokSignalsWatcher(paths, (u) => {
-      this.emitContextUsage(u.used, u.size, "signals", u.pct);
-    });
-    this.signalsWatcher.start();
-  }
-  /** Point watcher at a different Grok session id (e.g. from /session-info). */
-  retargetProviderSession(nextId) {
-    const id = nextId.trim();
-    if (!id || id === this.providerSessionId) return;
-    this.providerSessionId = id;
-    this.lastContextUsed = 0;
-    this.lastContextProviderId = id;
-    this.startSignalsWatcher();
-    this.publishSignalsUsageOnce();
-  }
-  /** One-shot read for SessionManager / HTTP (no watcher required). */
-  publishSignalsUsageOnce() {
-    if (!this.providerSessionId || !this.cwd?.trim()) return false;
-    const u = readGrokSignalsUsage(
-      resolveGrokSignalsPaths(this.cwd, this.providerSessionId)
-    );
-    if (!u) return false;
-    this.emitContextUsage(u.used, u.size, "signals", u.pct);
-    return true;
-  }
-  emitContextUsage(used, size, source, pct) {
-    if (!this.domainSessionId) return;
-    if (!Number.isFinite(used) || !Number.isFinite(size) || size <= 0) return;
-    const usedN = Math.max(0, Math.round(used));
-    const sizeN = Math.max(1, Math.round(size));
-    if (source === "signals" && this.lastContextProviderId === this.providerSessionId && this.lastContextUsed > 0 && usedN + 500 < this.lastContextUsed) {
-      return;
-    }
-    this.lastContextSize = sizeN;
-    this.lastContextUsed = usedN;
-    this.lastContextProviderId = this.providerSessionId;
-    this.emit({
-      type: "ContextUsage",
-      sessionId: this.domainSessionId,
-      used: usedN,
-      size: sizeN,
-      source,
-      pct: typeof pct === "number" && Number.isFinite(pct) ? Math.max(0, Math.min(100, Math.round(pct))) : Math.min(100, Math.round(usedN / sizeN * 100)),
-      providerSessionId: this.providerSessionId || void 0,
-      at: nowIso()
-    });
-  }
-  /** Pull usage (+ optional session id) out of /session-info style replies. */
-  ingestSessionInfoText(text) {
-    if (!text || !/session\s*id|context\s*:/i.test(text)) return;
-    const idMatch = text.match(
-      /Session\s*ID\s*[:：]\s*\**\s*[`"]?(019f[0-9a-fA-F-]{20,}|[0-9a-f]{8}-[0-9a-f-]{27,})[`"]?/i
-    );
-    if (idMatch?.[1]) {
-      this.retargetProviderSession(idMatch[1]);
-    }
-    const ctxMatch = text.match(
-      /Context[\s\S]{0,48}?([\d,]+)\s*\/\s*([\d,]+)\s*tokens(?:\s*\((\d+)\s*%\))?/i
-    );
-    if (ctxMatch) {
-      const used = Number(String(ctxMatch[1]).replace(/,/g, ""));
-      const size = Number(String(ctxMatch[2]).replace(/,/g, ""));
-      const pct = ctxMatch[3] != null ? Number(ctxMatch[3]) : void 0;
-      if (Number.isFinite(used) && Number.isFinite(size) && size > 0) {
-        this.emitContextUsage(used, size, "session_info", pct);
-      }
-    }
-  }
-  numField(v) {
-    if (typeof v === "number" && Number.isFinite(v)) return v;
-    if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) {
-      return Number(v);
-    }
-    return void 0;
-  }
-  createTerminal(p) {
-    const id = `term-${(0, import_node_crypto.randomUUID)()}`;
-    const command = String(p.command ?? "");
-    const args = Array.isArray(p.args) ? p.args.map(String) : [];
-    const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : this.cwd || process.cwd();
-    const byteLimit = typeof p.outputByteLimit === "number" && p.outputByteLimit > 0 ? p.outputByteLimit : 1048576;
-    const envList = Array.isArray(p.env) ? p.env : [];
-    const env = withHealthyEnv(process.env);
-    for (const e of envList) {
-      if (e?.name) env[e.name] = String(e.value ?? "");
-    }
-    env.PATH = buildAugmentedPath(env.PATH);
-    const spec = resolveToolSpawn(command, args, env.PATH);
-    const proc = (0, import_node_child_process2.spawn)(spec.file, spec.args, {
-      cwd,
-      env: spec.env ? { ...env, ...spec.env } : env,
-      shell: false,
-      stdio: [
-        spec.stdinScript != null ? "pipe" : "ignore",
-        "pipe",
-        "pipe"
-      ]
-    });
-    if (spec.stdinScript != null && proc.stdin) {
-      proc.stdin.write(spec.stdinScript);
-      proc.stdin.end();
-    }
-    const term = {
-      id,
-      proc,
-      output: "",
-      truncated: false,
-      exitCode: null,
-      signal: null,
-      exited: false,
-      waiters: [],
-      byteLimit
-    };
-    const append = (chunk) => {
-      const s = chunk.toString("utf8");
-      term.output += s;
-      if (term.output.length > term.byteLimit) {
-        term.output = term.output.slice(term.output.length - term.byteLimit);
-        term.truncated = true;
-      }
-      const last = s.trim().split("\n").filter(Boolean).pop();
-      if (last) {
-        if (/command not found|bash_profile|zshrc|conda initialize/i.test(last)) {
-          return;
-        }
-        this.emitActivity(
-          last.length > 80 ? `${last.slice(0, 80)}\u2026` : last,
-          "sleeping"
-        );
-      }
-    };
-    proc.stdout?.on("data", append);
-    proc.stderr?.on("data", append);
-    proc.on("error", (err) => {
-      term.output += `
-[spawn error] ${err.message}`;
-      term.exitCode = 1;
-      term.exited = true;
-      for (const w of term.waiters.splice(0)) w();
-    });
-    proc.on("close", (code, signal) => {
-      term.exitCode = code;
-      term.signal = signal;
-      term.exited = true;
-      for (const w of term.waiters.splice(0)) w();
-      this.emitActivity(null);
-    });
-    this.terminals.set(id, term);
-    const label = spec.label;
-    this.emitActivity(`Running ${label}${label.length >= 60 ? "\u2026" : ""}`, "tool");
-    return id;
-  }
-  handleNotification(method, params) {
-    const p = params ?? {};
-    if (method === "session/update") {
-      const update = p.update ?? p;
-      this.mapSessionUpdate(update);
-      return;
-    }
-    if (method === "_x.ai/sessions/changed" || method === "x.ai/sessions/changed") {
-      const upserted = p.upserted ?? [];
-      for (const u of upserted) {
-        if (String(u.sessionId ?? "") !== this.providerSessionId) continue;
-        const activity = String(u.activity ?? "");
-        if (activity === "working") {
-          this.emitActivity("Working\u2026", "working");
-        } else if (activity === "idle") {
-          this.emitActivity(null, "idle");
-        }
-      }
-      return;
-    }
-    if (method === "_x.ai/queue/changed" || method === "x.ai/queue/changed") {
-      if (String(p.sessionId ?? "") && String(p.sessionId) !== this.providerSessionId) {
-        return;
-      }
-      const entries = p.entries ?? [];
-      const running = p.runningPromptId ? String(p.runningPromptId) : "";
-      const head = entries[0];
-      if (head?.text?.trim().startsWith("/compact")) {
-        this.emitActivity("Compacting conversation\u2026", "compact");
-      } else if (running && head?.text) {
-        this.emitActivity(
-          `Queued: ${String(head.text).slice(0, 60)}`,
-          "queue"
-        );
-      } else if (running) {
-        this.emitActivity("Waiting for model\u2026", "working");
-      }
-      return;
-    }
-    if (method === "_x.ai/session_notification" || method === "x.ai/session_notification") {
-      const update = p.update ?? p;
-      const kind = String(update.sessionUpdate ?? "");
-      if (kind === "tool_call_delta_chunk") {
-        const toolId = String(update.tool_call_id ?? update.toolCallId ?? "delta");
-        const name = String(update.name ?? "");
-        const argDelta = update.arguments_delta;
-        if (name && !name.startsWith("pending")) {
-          this.emit({
-            type: "ToolProgress",
-            sessionId: this.domainSessionId,
-            toolId,
-            detail: name + (argDelta ? ` ${String(argDelta).slice(0, 120)}` : ""),
-            at: nowIso()
-          });
-          this.emitActivity(`Calling ${name}\u2026`, "tool");
-        }
-      } else if (kind === "pending_interaction") {
-        const ik = String(update.kind ?? "interaction");
-        if (ik === "permission") {
-          this.emitActivity("Waiting for permission\u2026", "permission");
-        } else {
-          this.emitActivity(`Waiting: ${ik}\u2026`, "working");
-        }
-      } else if (kind === "interaction_resolved") {
-        this.emitActivity(null);
-      } else if (kind === "auto_compact_started" || kind === "compact_started" || kind === "compacting") {
-        this.emitActivity("Compacting conversation\u2026", "compact");
-        const used = this.numField(update.tokens_used ?? update.tokensUsed);
-        const size = this.numField(
-          update.context_window ?? update.contextWindow
-        );
-        if (used != null && size != null) {
-          this.emitContextUsage(used, size, "compact");
-        }
-      } else if (kind === "auto_compact_completed" || kind === "compact_completed") {
-        const before = update.tokens_before ?? update.tokensBefore;
-        const after = update.tokens_after ?? update.tokensAfter;
-        const msg = before != null && after != null ? `Compacted \xB7 ${before} \u2192 ${after} tokens` : "Compact complete";
-        this.emitActivity(msg, "compact");
-        const afterN = this.numField(after);
-        const size = this.numField(update.context_window ?? update.contextWindow) ?? (this.lastContextSize > 0 ? this.lastContextSize : void 0);
-        if (afterN != null && size != null) {
-          this.emitContextUsage(afterN, size, "compact_done");
-        }
-        setTimeout(() => this.emitActivity(null), 8e3);
-      } else if (kind === "turn_completed") {
-      } else if (kind === "session_summary_generated") {
-      }
-    }
-  }
-  mapSessionUpdate(update) {
-    const kind = String(update.sessionUpdate ?? update.type ?? "");
-    const sid = this.domainSessionId;
-    const at = nowIso();
-    if (this.absorbUpdates) {
-      return;
-    }
-    if (this.turnCancelled && (kind === "agent_message_chunk" || kind === "agent_thought_chunk" || kind === "tool_call" || kind === "tool_call_update" || kind === "plan")) {
-      return;
-    }
-    switch (kind) {
-      case "agent_message_chunk": {
-        const content = update.content;
-        const text = content?.text ?? update.text ?? "";
-        if (text) {
-          this.turnAssistantText += text;
-          if (/Session\s*ID|Context\s*:/i.test(this.turnAssistantText) && this.turnAssistantText.length < 2e4) {
-            this.ingestSessionInfoText(this.turnAssistantText);
-          }
-          this.emit({
-            type: "MessageChunk",
-            sessionId: sid,
-            role: "assistant",
-            text,
-            at
-          });
-        }
-        break;
-      }
-      case "agent_thought_chunk": {
-        const content = update.content;
-        const text = content?.text ?? update.text ?? "";
-        if (text) {
-          this.emit({ type: "ThoughtChunk", sessionId: sid, text, at });
-          this.emitActivity("Thinking\u2026", "thinking");
-        }
-        break;
-      }
-      case "tool_call": {
-        const toolId = String(update.toolCallId ?? update.id ?? (0, import_node_crypto.randomUUID)());
-        const title = String(update.title ?? update.kind ?? "tool");
-        const toolKind = String(update.kind ?? "other");
-        this.emit({
-          type: "ToolStarted",
-          sessionId: sid,
-          toolId,
-          title,
-          kind: toolKind,
-          inputSummary: summarize(update.rawInput ?? update.input ?? update.arguments),
-          at
-        });
-        this.emitActivity(
-          title.startsWith("Execute") || toolKind === "execute" ? `${title.slice(0, 72)}${title.length > 72 ? "\u2026" : ""}` : `Using ${title.slice(0, 60)}\u2026`,
-          "tool"
-        );
-        break;
-      }
-      case "tool_call_update": {
-        const toolId = String(update.toolCallId ?? update.id ?? "unknown");
-        const status = String(update.status ?? "").toLowerCase();
-        const title = update.title != null ? String(update.title) : void 0;
-        const detail = summarize(update.content ?? update.rawOutput ?? update.output) || title || summarize(update);
-        if (status === "failed" || status === "error") {
-          this.emit({
-            type: "ToolFailed",
-            sessionId: sid,
-            toolId,
-            error: detail || "failed",
-            at
-          });
-        } else if (status === "completed" || status === "success") {
-          this.emit({
-            type: "ToolFinished",
-            sessionId: sid,
-            toolId,
-            outputSummary: detail,
-            at
-          });
-        } else {
-          this.emit({
-            type: "ToolProgress",
-            sessionId: sid,
-            toolId,
-            detail: detail || title,
-            at
-          });
-          if (title && !status) {
-          }
-        }
-        break;
-      }
-      case "plan": {
-        const entries = update.entries ?? update.tasks ?? update.plan ?? [];
-        const tasks = entries.map((e, i) => ({
-          id: e.id ?? `task-${i}`,
-          content: e.content ?? String(e),
-          status: mapTaskStatus(e.status),
-          source: "plan"
-        }));
-        this.emit({ type: "TasksReplaced", sessionId: sid, tasks, at });
-        break;
-      }
-      case "usage_update": {
-        const used = this.numField(update.used);
-        const size = this.numField(update.size);
-        if (used != null && size != null) {
-          this.emitContextUsage(used, size, "acp");
-        }
-        break;
-      }
-      case "auto_compact_started":
-      case "compact_started": {
-        const used = this.numField(update.tokens_used ?? update.tokensUsed);
-        const size = this.numField(
-          update.context_window ?? update.contextWindow
-        );
-        if (used != null && size != null) {
-          this.emitContextUsage(used, size, "compact");
-        }
-        this.emitActivity("Compacting conversation\u2026", "compact");
-        break;
-      }
-      case "auto_compact_completed":
-      case "compact_completed": {
-        const after = this.numField(
-          update.tokens_after ?? update.tokensAfter
-        );
-        const size = this.numField(update.context_window ?? update.contextWindow) ?? (this.lastContextSize > 0 ? this.lastContextSize : void 0);
-        if (after != null && size != null) {
-          this.emitContextUsage(after, size, "compact_done");
-        }
-        break;
-      }
-      default:
-        break;
-    }
-  }
-  async start(opts) {
-    this.cwd = opts.cwd;
-    this.model = opts.model;
-    this.effort = opts.effort;
-    this.closed = false;
-    this.lastContextSize = 0;
-    this.lastContextUsed = 0;
-    this.lastContextProviderId = "";
-    this.turnAssistantText = "";
-    this.domainSessionId = opts.domainSessionId ?? (0, import_node_crypto.randomUUID)();
-    if (opts.permissionMode === "default" || opts.permissionMode === "ask") {
-      this.autoApprove = false;
-    } else {
-      this.autoApprove = true;
-    }
-    const agentArgs = ["agent"];
-    if (opts.model) agentArgs.push("--model", opts.model);
-    if (opts.effort) agentArgs.push("--effort", opts.effort);
-    if (this.autoApprove) agentArgs.push("--always-approve");
-    agentArgs.push("stdio");
-    this.proc = (0, import_node_child_process2.spawn)(this.grokBin, agentArgs, {
-      cwd: opts.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      // Inherit bridge PATH (already augmented at boot); re-apply in case env was stripped.
-      env: withHealthyEnv(process.env)
-    });
-    this.proc.stderr?.on("data", (buf) => {
-      const line = buf.toString();
-      try {
-        const logDir = import_node_path6.default.join(
-          process.env.HOME || "/tmp",
-          ".agent-pane"
-        );
-        import_node_fs6.default.mkdirSync(logDir, { recursive: true });
-        import_node_fs6.default.appendFileSync(
-          import_node_path6.default.join(logDir, "grok-stderr.log"),
-          `[${(/* @__PURE__ */ new Date()).toISOString()}] ${line.slice(0, 2e3)}`
-        );
-      } catch {
-      }
-      if (process.env.AGENT_PANE_DEBUG) {
-        console.error("[grok stderr]", line.slice(0, 500));
-      }
-    });
-    this.rl = readline.createInterface({ input: this.proc.stdout });
-    this.rl.on("line", (line) => this.handleLine(line));
-    this.proc.on("exit", (code) => {
-      const unexpected = !this.closed;
-      this.proc = null;
-      this.stopSignalsWatcher();
-      if (unexpected) {
-        this.emit({
-          type: "SessionError",
-          sessionId: this.domainSessionId,
-          message: `grok agent exited (${code}) \u2014 send again to resume`,
-          at: nowIso()
-        });
-        this.emit({
-          type: "SessionEnded",
-          sessionId: this.domainSessionId,
-          stopReason: `exited:${code ?? "?"}`,
-          at: nowIso()
-        });
-        for (const h of this.deadHandlers) {
-          try {
-            h(this.domainSessionId);
-          } catch (e) {
-            console.error("[adapter] onDead error", e);
-          }
-        }
-      }
-    });
-    const init = await this.send("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: {
-        fs: { readTextFile: true, writeTextFile: true },
-        // Implemented: terminal/create|output|wait_for_exit|kill|release
-        terminal: true
-      },
-      clientInfo: { name: "agent-pane", version: "0.1.2" }
-    });
-    const methods = Array.isArray(init?.authMethods) ? init.authMethods : [];
-    const methodId = typeof init?._meta?.defaultAuthMethodId === "string" && init._meta.defaultAuthMethodId || methods.find((m) => typeof m?.id === "string" && m.id)?.id || (methods.length > 0 ? "grok.com" : null);
-    this.absorbUpdates = false;
-    const { browserMcpServers: browserMcpServers2 } = await Promise.resolve().then(() => (init_browser_mcp_config(), browser_mcp_config_exports));
-    const wantMcp = process.env.AGENT_PANE_BROWSER_MCP !== "0" && !opts.resumed;
-    const mcpServers = wantMcp ? browserMcpServers2() : [];
-    const isAuthRequired = (err) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      return /Authentication required|auth_required|no auth method/i.test(msg);
-    };
-    const sessionNew = async (servers, timeoutMs) => await this.send(
-      "session/new",
-      { cwd: opts.cwd, mcpServers: servers },
-      timeoutMs
-    );
-    const t0 = Date.now();
-    let result;
-    try {
-      const firstTimeout = mcpServers.length > 0 ? 2e4 : 25e3;
-      this.emitActivity("Connecting\u2026", "working");
-      result = await sessionNew(mcpServers, firstTimeout);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (methodId && isAuthRequired(e)) {
-        console.warn(
-          `[adapter] session/new needs auth after ${Date.now() - t0}ms \u2014 authenticate once`
-        );
-        try {
-          this.emitActivity("Grok login required\u2026", "working");
-          await this.send("authenticate", { methodId }, 45e3);
-        } catch (authErr) {
-          this.emitActivity(null);
-          const am = authErr instanceof Error ? authErr.message : String(authErr);
-          throw new Error(
-            `\u9700\u8981\u767B\u5F55 Grok\uFF08${am}\uFF09\u3002\u7EC8\u7AEF\u8DD1\uFF1Agrok login  \u7136\u540E\u56DE\u5230\u8FD9\u91CC\u518D Send\u3002`
-          );
-        }
-        this.emitActivity("Connecting\u2026", "working");
-        result = await sessionNew([], 25e3);
-      } else if (mcpServers.length > 0 && /timed out/i.test(msg)) {
-        console.warn(
-          `[adapter] session/new with MCP timed out after ${Date.now() - t0}ms \u2014 retry without MCP`
-        );
-        this.emitActivity("Connecting\u2026", "working");
-        result = await sessionNew([], 25e3);
-      } else if (isAuthRequired(e)) {
-        this.emitActivity(null);
-        throw new Error(
-          `\u9700\u8981\u767B\u5F55 Grok\u3002\u7EC8\u7AEF\u8DD1\uFF1Agrok login  \u7136\u540E\u56DE\u5230\u8FD9\u91CC\u518D Send\u3002\uFF08${msg}\uFF09`
-        );
-      } else {
-        this.emitActivity(null);
-        throw e;
-      }
-    }
-    this.emitActivity(null);
-    this.providerSessionId = result.sessionId ?? (0, import_node_crypto.randomUUID)();
-    this.startSignalsWatcher();
-    return {
-      providerSessionId: this.providerSessionId,
-      domainSessionId: this.domainSessionId,
-      resumed: Boolean(opts.resumed),
-      cwd: opts.cwd,
-      model: opts.model,
-      effort: opts.effort,
-      /** Always need digest when resumed (we no longer session/load). */
-      needsHistoryDigest: Boolean(opts.resumed)
-    };
-  }
-  /** Optional preamble for first prompt after resume-without-load. */
-  setContextPrefix(text) {
-    this.contextPrefix = text && text.trim() ? text.trim() : null;
-  }
-  getSessionId() {
-    return this.domainSessionId;
-  }
-  getProviderSessionId() {
-    return this.providerSessionId;
-  }
-  async sendPrompt(input) {
-    if (!this.isAlive()) {
-      this.emit({
-        type: "SessionError",
-        sessionId: this.domainSessionId,
-        message: "grok agent not running \u2014 send again to resume",
-        at: nowIso()
-      });
-      throw new Error("agent not alive");
-    }
-    this.absorbUpdates = false;
-    let promptText = input.text;
-    if (this.contextPrefix) {
-      promptText = `${this.contextPrefix}
-
----
-
-${input.text}`;
-      this.contextPrefix = null;
-    }
-    const blocks = [
-      { type: "text", text: promptText }
-    ];
-    const attachments = stabilizeAttachments(input.attachments);
-    const imageNames = [];
-    if (attachments?.length) {
-      for (const a of attachments) {
-        const abs = a.path;
-        const name = import_node_path6.default.basename(abs);
-        if (a.kind !== "folder" && isImagePath(abs) && import_node_fs6.default.existsSync(abs)) {
-          try {
-            const buf = import_node_fs6.default.readFileSync(abs);
-            if (buf.length <= 12 * 1024 * 1024) {
-              blocks.push({
-                type: "image",
-                mimeType: guessMime(abs),
-                data: buf.toString("base64")
-              });
-              imageNames.push(name);
-            }
-          } catch {
-          }
-        }
-        blocks.push({
-          type: "resource_link",
-          uri: `file://${abs}`,
-          name
-        });
-      }
-    }
-    if (imageNames.length) {
-      blocks.push({
-        type: "text",
-        text: `[Attached image${imageNames.length > 1 ? "s" : ""}: ${imageNames.join(", ")}. Vision content is already included above \u2014 look at the image(s) directly. Do NOT call Read/read_file on these image paths (binary files).]`
-      });
-    }
-    const shown = input.displayText ?? input.text;
-    this.turnCancelled = false;
-    this.promptInFlight = true;
-    this.turnAssistantText = "";
-    if (!input.skipUserEvent) {
-      this.userTurns.push(shown);
-      this.emit({
-        type: "UserMessageAppended",
-        sessionId: this.domainSessionId,
-        text: shown,
-        attachments,
-        at: nowIso()
-      });
-    }
-    if (shown.trim().startsWith("/compact")) {
-      this.emitActivity("Compacting conversation\u2026", "compact");
-    } else if (shown.trim().startsWith("/")) {
-      this.emitActivity(`Running ${shown.trim().split(/\s+/)[0]}\u2026`, "working");
-    } else {
-      this.emitActivity("Waiting for model\u2026", "working");
-    }
-    try {
-      const result = await this.send("session/prompt", {
-        sessionId: this.providerSessionId,
-        prompt: blocks
-      });
-      this.promptInFlight = false;
-      this.emitActivity(null);
-      const stop = result?.stopReason ?? "end_turn";
-      if (stop === "cancelled" || this.turnCancelled) {
-        this.emit({
-          type: "MessageDone",
-          sessionId: this.domainSessionId,
-          role: "assistant",
-          at: nowIso()
-        });
-        return;
-      }
-      this.emit({
-        type: "MessageDone",
-        sessionId: this.domainSessionId,
-        role: "assistant",
-        at: nowIso()
-      });
-      this.ingestSessionInfoText(this.turnAssistantText);
-      this.turnAssistantText = "";
-      this.signalsWatcher?.refresh();
-      setTimeout(() => this.signalsWatcher?.refresh(), 400);
-      setTimeout(() => this.signalsWatcher?.refresh(), 1200);
-    } catch (e) {
-      this.promptInFlight = false;
-      if (this.turnCancelled) {
-        this.emit({
-          type: "MessageDone",
-          sessionId: this.domainSessionId,
-          role: "assistant",
-          at: nowIso()
-        });
-        this.signalsWatcher?.refresh();
-        return;
-      }
-      this.emit({
-        type: "SessionError",
-        sessionId: this.domainSessionId,
-        message: e instanceof Error ? e.message : String(e),
-        at: nowIso()
-      });
-    }
-  }
-  /**
-   * 取消当前 turn。
-   * ACP 规定 session/cancel 是 **notification（无 id）**，
-   * 若带 id 当 request 发，Grok 会回 Method not found，生成不会停。
-   */
-  async cancel(_sessionId) {
-    this.turnCancelled = true;
-    for (const [requestId, pending] of this.pendingPermissions) {
-      this.reply(pending.rpcId, { outcome: { outcome: "cancelled" } });
-      this.emit({
-        type: "PermissionResolved",
-        sessionId: this.domainSessionId,
-        requestId,
-        allow: false,
-        at: nowIso()
-      });
-    }
-    this.pendingPermissions.clear();
-    if (this.providerSessionId) {
-      this.write({
-        jsonrpc: "2.0",
-        method: "session/cancel",
-        params: { sessionId: this.providerSessionId }
-      });
-    }
-    if (this.promptInFlight) {
-      this.emit({
-        type: "MessageDone",
-        sessionId: this.domainSessionId,
-        role: "assistant",
-        at: nowIso()
-      });
-    }
-  }
-  /**
-   * Discard user turn `userTurnIndex` and everything after (Claude Code Undo).
-   * 1) cancel in-flight turn
-   * 2) best-effort Grok `_x.ai/rewind/*` to that prompt index
-   * 3) always emit SessionRewound so UI + event store can truncate
-   */
-  async rewindToUserTurn(userTurnIndex) {
-    if (this.userTurns.length === 0) {
-      throw new Error("Nothing to undo");
-    }
-    if (!Number.isFinite(userTurnIndex) || userTurnIndex < 0 || userTurnIndex >= this.userTurns.length) {
-      throw new Error("Invalid turn to undo");
-    }
-    await this.cancel(this.domainSessionId);
-    const restoredText = this.userTurns[userTurnIndex];
-    let providerOk = false;
-    let note;
-    try {
-      const pts = await this.send("_x.ai/rewind/points", {
-        sessionId: this.providerSessionId
-      });
-      const points = pts?.rewind_points ?? [];
-      if (points.length === 0) {
-        note = "UI undid the turn; Grok had no rewind point";
-      } else {
-        let target = points[userTurnIndex] ?? points.find((p) => {
-          const preview = (p.prompt_preview ?? "").trim();
-          return preview && restoredText.trim().startsWith(preview.slice(0, 40));
-        }) ?? null;
-        if (!target && points.length === this.userTurns.length) {
-          target = points[userTurnIndex] ?? null;
-        }
-        if (!target && userTurnIndex === this.userTurns.length - 1) {
-          target = points[points.length - 1] ?? null;
-        }
-        if (!target) {
-          const offset = points.length - this.userTurns.length;
-          if (offset >= 0 && points[offset + userTurnIndex]) {
-            target = points[offset + userTurnIndex];
-          }
-        }
-        if (!target) {
-          note = "UI undid the turn; could not map Grok rewind point \u2014 model may still recall later messages";
-        } else {
-          const result = await this.send("_x.ai/rewind/execute", {
-            sessionId: this.providerSessionId,
-            target_prompt_index: target.prompt_index,
-            mode: "conversation_only"
-          });
-          if (result?.success) {
-            providerOk = true;
-            note = void 0;
-          } else {
-            note = "UI undid the turn; Grok rewind not confirmed \u2014 model may still recall later messages";
-            try {
-              await this.send("_x.ai/rewind/execute", {
-                sessionId: this.providerSessionId,
-                target_prompt_index: target.prompt_index,
-                mode: "all"
-              });
-            } catch {
-            }
-          }
-        }
-      }
-    } catch (e) {
-      note = `UI undid the turn; Grok rewind failed: ${e instanceof Error ? e.message : String(e)}`;
-    }
-    this.userTurns = this.userTurns.slice(0, userTurnIndex);
-    this.emit({
-      type: "SessionRewound",
-      sessionId: this.domainSessionId,
-      restoredText,
-      userTurnIndex,
-      providerOk,
-      note,
-      at: nowIso()
-    });
-    return { restoredText, userTurnIndex, providerOk, note };
-  }
-  /**
-   * 撤回上一条用户消息 — thin wrapper around rewindToUserTurn.
-   */
-  async undoLastTurn() {
-    if (this.userTurns.length === 0) {
-      throw new Error("Nothing to undo");
-    }
-    const r = await this.rewindToUserTurn(this.userTurns.length - 1);
-    return {
-      restoredText: r.restoredText,
-      providerOk: r.providerOk,
-      note: r.note
-    };
-  }
-  /** Rebuild turn list after resume / history hydrate. */
-  hydrateUserTurns(texts) {
-    this.userTurns = texts.filter((t) => typeof t === "string");
-  }
-  /**
-   * Weekly credit usage / billing snapshot (Grok TUI `/usage`).
-   * Not advertised in available_commands under ACP — pager-only there;
-   * exposed via extension `_x.ai/billing`.
-   */
-  async fetchBillingUsage() {
-    if (!this.isAlive() || !this.providerSessionId) {
-      throw new Error("agent not alive");
-    }
-    const result = await this.send("_x.ai/billing", {
-      sessionId: this.providerSessionId
-    });
-    const cfg = result?.config ?? {};
-    const period = cfg.currentPeriod ?? {};
-    const numVal = (v) => {
-      if (typeof v === "number") return v;
-      if (v && typeof v === "object" && "val" in v) {
-        const n = Number(v.val);
-        return Number.isFinite(n) ? n : void 0;
-      }
-      return void 0;
-    };
-    return {
-      creditUsagePercent: typeof cfg.creditUsagePercent === "number" ? cfg.creditUsagePercent : void 0,
-      periodType: typeof period.type === "string" ? period.type : void 0,
-      periodStart: (typeof period.start === "string" ? period.start : void 0) ?? (typeof cfg.billingPeriodStart === "string" ? cfg.billingPeriodStart : void 0),
-      periodEnd: (typeof period.end === "string" ? period.end : void 0) ?? (typeof cfg.billingPeriodEnd === "string" ? cfg.billingPeriodEnd : void 0),
-      subscriptionTier: result?.subscription_tier,
-      onDemandCap: numVal(cfg.onDemandCap),
-      onDemandUsed: numVal(cfg.onDemandUsed),
-      prepaidBalance: numVal(cfg.prepaidBalance),
-      raw: result
-    };
-  }
-  /** Show a local system-style reply without hitting the model. */
-  emitLocalReply(userText, assistantText) {
-    const at = nowIso();
-    this.userTurns.push(userText);
-    this.emit({
-      type: "UserMessageAppended",
-      sessionId: this.domainSessionId,
-      text: userText,
-      at
-    });
-    this.emit({
-      type: "MessageChunk",
-      sessionId: this.domainSessionId,
-      role: "assistant",
-      text: assistantText,
-      at
-    });
-    this.emit({
-      type: "MessageDone",
-      sessionId: this.domainSessionId,
-      role: "assistant",
-      at: nowIso()
-    });
-  }
-  hasPendingPermission(requestId) {
-    return this.pendingPermissions.has(requestId);
-  }
-  async respondPermission(requestId, allow) {
-    const pending = this.pendingPermissions.get(requestId);
-    this.emit({
-      type: "PermissionResolved",
-      sessionId: this.domainSessionId,
-      requestId,
-      allow,
-      at: nowIso()
-    });
-    if (!pending) return;
-    this.pendingPermissions.delete(requestId);
-    const optionId = allow ? pending.options.find((o) => o.kind === "allow_once")?.optionId ?? pending.options.find((o) => o.kind?.startsWith("allow"))?.optionId ?? "allow-once" : pending.options.find((o) => o.kind === "reject_once")?.optionId ?? pending.options.find((o) => o.kind?.startsWith("reject"))?.optionId ?? "reject-once";
-    this.reply(pending.rpcId, {
-      outcome: allow ? { outcome: "selected", optionId } : { outcome: "selected", optionId }
-    });
-  }
-  async stop() {
-    this.closed = true;
-    this.stopSignalsWatcher();
-    for (const term of this.terminals.values()) {
-      if (!term.exited) {
-        try {
-          term.proc.kill("SIGTERM");
-        } catch {
-        }
-      }
-    }
-    this.terminals.clear();
-    this.rl?.close();
-    this.proc?.kill();
-    this.proc = null;
-    if (this.domainSessionId) {
-      this.emit({
-        type: "SessionEnded",
-        sessionId: this.domainSessionId,
-        stopReason: "client_stop",
-        at: nowIso()
-      });
-    }
-  }
-};
-function summarize(v) {
-  if (v == null) return "";
-  if (typeof v === "string") return v.slice(0, 12e3);
-  const unwrapped = unwrapAcpText(v);
-  if (unwrapped) return unwrapped.slice(0, 12e3);
-  try {
-    return JSON.stringify(v).slice(0, 12e3);
-  } catch {
-    return String(v).slice(0, 12e3);
-  }
-}
-function unwrapAcpText(v) {
-  if (typeof v === "string") return v;
-  if (!v || typeof v !== "object") return "";
-  if (Array.isArray(v)) {
-    const parts = [];
-    for (const item of v) {
-      const t = unwrapAcpText(item);
-      if (t) parts.push(t);
-    }
-    return parts.join("\n").trim();
-  }
-  const o = v;
-  if (typeof o.text === "string" && o.text.trim()) return o.text;
-  if (o.content != null) {
-    const inner = unwrapAcpText(o.content);
-    if (inner) return inner;
-  }
-  for (const key of ["message", "error", "output", "rawOutput"]) {
-    const x = o[key];
-    if (typeof x === "string" && x.trim()) return x;
-    if (x && typeof x === "object") {
-      const inner = unwrapAcpText(x);
-      if (inner) return inner;
-    }
-  }
-  return "";
-}
-function mapTaskStatus(s) {
-  const x = (s ?? "pending").toLowerCase();
-  if (x.includes("progress") || x === "active") return "in_progress";
-  if (x.includes("complete") || x === "done") return "completed";
-  if (x.includes("cancel")) return "cancelled";
-  return "pending";
+// ../bridge/src/provider-api.ts
+async function createGrokAcpProvider(opts) {
+  const { GrokAcpAdapter: GrokAcpAdapter2 } = await Promise.resolve().then(() => (init_grok_acp_adapter(), grok_acp_adapter_exports));
+  return new GrokAcpAdapter2(opts);
 }
 
 // ../bridge/src/workspace-snapshot.ts
@@ -6953,6 +6997,7 @@ var SessionManager = class {
           break;
         }
         try {
+          this.hydrateProviderTurns(live.adapter, cmd.sessionId);
           await live.adapter.undoLastTurn();
         } catch (e) {
           this.broadcast({
@@ -6969,7 +7014,7 @@ var SessionManager = class {
           break;
         }
         try {
-          this.hydrateAdapterTurns(live.adapter, cmd.sessionId);
+          this.hydrateProviderTurns(live.adapter, cmd.sessionId);
           await live.adapter.rewindToUserTurn(cmd.userTurnIndex);
         } catch (e) {
           this.broadcast({
@@ -7018,9 +7063,14 @@ var SessionManager = class {
         break;
     }
   }
-  hydrateAdapterTurns(adapter, sessionId) {
+  /**
+   * Host-owned turn list: rebuild from Pane EventStore before any undo/rewind
+   * so provider indices match disk (resume leaves adapter turns empty).
+   */
+  hydrateProviderTurns(adapter, sessionId) {
     const texts = this.store.list(sessionId, 0).filter((e) => e.type === "UserMessageAppended").map((e) => e.text ?? "");
     adapter.hydrateUserTurns(texts);
+    return texts;
   }
   /**
    * History-only / dead agent rewind: truncate events + broadcast SessionRewound.
@@ -7104,7 +7154,7 @@ var SessionManager = class {
       message: "Starting Grok agent\u2026",
       clientRequestId
     });
-    const adapter = new GrokAcpAdapter({
+    const adapter = await createGrokAcpProvider({
       autoApprove: modeUsesAlwaysApprove(mode)
     });
     this.wireAdapter(adapter);
@@ -7217,7 +7267,7 @@ var SessionManager = class {
       message: "Resuming session\u2026",
       sessionId
     });
-    const adapter = new GrokAcpAdapter({
+    const adapter = await createGrokAcpProvider({
       autoApprove: modeUsesAlwaysApprove(mode)
     });
     this.wireAdapter(adapter);
@@ -7260,7 +7310,7 @@ var SessionManager = class {
       acceptedFp: /* @__PURE__ */ new Map()
     });
     this.broadcastLive();
-    this.hydrateAdapterTurns(adapter, sessionId);
+    this.hydrateProviderTurns(adapter, sessionId);
     this.publish({
       type: "SessionStarted",
       sessionId,
@@ -7318,6 +7368,13 @@ var SessionManager = class {
     if (slashName === "usage" || slashName === "billing") {
       try {
         this.broadcast({ type: "status", message: "Fetching usage\u2026" });
+        if (!live.adapter.fetchBillingUsage) {
+          this.broadcast({
+            type: "error",
+            message: "Usage not available for this provider"
+          });
+          return;
+        }
         const u = await live.adapter.fetchBillingUsage();
         const pct = u.creditUsagePercent != null ? `${Math.round(u.creditUsagePercent)}%` : "\u2014";
         const fmtDate = (iso) => {
@@ -7932,6 +7989,8 @@ function defaultHookTemplate(nameBase) {
 }
 
 // ../bridge/src/http-api.ts
+init_grok_signals_watcher();
+init_attachment_persist();
 var execFileAsync = (0, import_node_util.promisify)(import_node_child_process6.execFile);
 var recentPath = import_node_path12.default.join(import_node_os9.default.homedir(), ".agent-pane", "recent.json");
 function parseSkillFrontmatter(raw) {
@@ -8794,6 +8853,7 @@ async function handleHttp(req, res, hooks = {}) {
 var import_node_fs13 = __toESM(require("node:fs"), 1);
 var import_node_path13 = __toESM(require("node:path"), 1);
 var import_node_module2 = require("node:module");
+init_path_env();
 var SHELL = process.env.SHELL || "/bin/zsh";
 function dynamicImport(specifier) {
   return new Function("s", "return import(s)")(specifier);
@@ -9076,6 +9136,7 @@ function createTerminalConnection(ws) {
 }
 
 // ../bridge/src/index.ts
+init_path_env();
 applyHealthyPathToProcess();
 var PORT = Number(process.env.AGENT_PANE_PORT ?? 8787);
 var HOST = process.env.AGENT_PANE_HOST ?? "127.0.0.1";

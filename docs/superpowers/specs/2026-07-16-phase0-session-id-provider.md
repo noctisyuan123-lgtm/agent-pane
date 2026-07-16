@@ -133,11 +133,12 @@ Do **not** mix glass UI polish into these PRs.
 | **PR-A** | docs: session ID single-truth map | This file + architecture link; comment fixes on `session/load` | **done** (2026-07-16) |
 | **PR-B** | fix: providerSessionId resolution for context usage | live → meta → query; UI no longer keys off last ContextUsage event | **done** |
 | **PR-C** | feat: sourceProviderSessionId on import meta | Typed field + import write + upsert preserve | **done** |
-| **PR-D** | refactor: AgentProvider Host contract | Add `isAlive`/`onDead`/…; retype LiveSession; factory for Grok | pending |
-| **PR-E** | refactor: Host-owned user turns | hydrate from events; narrow adapter undo | pending |
+| **PR-D** | refactor: AgentProvider Host contract | `isAlive`/`onDead`/… on interface; LiveSession uses AgentProvider; `createGrokAcpProvider` factory | **done** |
+| **PR-E** | refactor: Host-owned user turns | `hydrateProviderTurns` from EventStore before undo/rewind/resume | **done** |
 
-**Stop line for “large project wave 1”:** PR-A…C (identity truth) — **landed**.  
-PR-D…E start wave 2 (thin adapter).
+**Stop line for “large project wave 1”:** PR-A…C — **landed**.  
+**Wave 2 (thin Host boundary):** PR-D…E — **landed** (2026-07-16).  
+Next: extract ACP transport modules / optional DaemonAcpProvider (`grok agent serve`).
 
 ---
 
