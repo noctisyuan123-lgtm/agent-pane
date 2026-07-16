@@ -3,7 +3,9 @@
 **Date:** 2026-07-16  
 **Rev:** 2 — aligned with code reality + external review (Fable5)  
 **Status:** Working notes (refactor constitution; keep in sync with `apps/bridge`)  
-**Context:** Grok Build open-sourced after the “private data upload” controversy; Agent Pane already has a local Bridge + Grok ACP adapter.
+**Context:** Public narrative around Grok Build / privacy; Agent Pane has Bridge + Grok ACP adapter.  
+**Reality check (2026-07-16):** No open-source Grok Core tree on this machine — live **CLI binary 0.2.101** only. Multi-front thinning still proceeds against stdio/`serve`; embed stays blocked until Core is actually available.  
+**Phase 0 execution spec:** [`docs/superpowers/specs/2026-07-16-phase0-session-id-provider.md`](./superpowers/specs/2026-07-16-phase0-session-id-provider.md)
 
 This doc captures how Claude Code / Codex-style desktop stacks are usually shaped, how Agent Pane looks today, and what is worth simplifying (or *not* simplifying) next.
 
