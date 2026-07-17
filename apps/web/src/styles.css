@@ -613,7 +613,7 @@ html.is-tauri {
   /* 正文底：几乎不透；与左轨 border 同色连续 */
   background: var(--bg-editor);
   background-image: none;
-  /* Isolate paint from sidebar vibrancy while streaming DOM churns */
+  /* Isolate paint from sidebar vibrancy; promote scrollport for WKWebView */
   isolation: isolate;
   transform: translateZ(0);
 }
@@ -1924,6 +1924,172 @@ html.is-tauri {
   font-size: 10.5px;
   color: rgba(255, 255, 255, 0.34);
   word-break: break-word;
+}
+
+/* Cursor Glass Agents Tray — `{n} Working` pill above composer */
+.working-pill-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  align-self: flex-start;
+  max-width: min(100%, 360px);
+  min-width: 0;
+  margin: 0 0 4px;
+  padding: 0 2px;
+}
+
+.working-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  margin: 0;
+  padding: 4px 10px 4px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(255, 255, 255, 0.82);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  cursor: default;
+  user-select: none;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
+}
+
+button.working-pill {
+  cursor: pointer;
+}
+
+button.working-pill:hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+.working-pill-dots {
+  flex-shrink: 0;
+}
+
+.working-pill-label {
+  white-space: nowrap;
+}
+
+.working-pill-chev {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.38);
+  transform: rotate(-90deg);
+  transition: transform 0.12s ease;
+  line-height: 1;
+}
+
+.working-pill-chev.open {
+  transform: rotate(0deg);
+}
+
+.working-pill-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0 2px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+}
+
+.working-pill-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.working-pill-kind {
+  flex-shrink: 0;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.32);
+}
+
+.working-pill-item-label {
+  color: rgba(255, 255, 255, 0.72);
+  min-width: 0;
+  word-break: break-word;
+}
+
+.working-pill-item-detail {
+  flex: 1 1 100%;
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, 0.34);
+  word-break: break-word;
+}
+
+/* Hanging subagent card under spawn/task tool row */
+.subagent-task-card {
+  margin: 4px 0 2px 18px;
+  padding: 0;
+  min-width: 0;
+  max-width: min(100%, 420px);
+}
+
+.subagent-task-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.subagent-task-card-dots {
+  flex-shrink: 0;
+  align-self: center;
+}
+
+.subagent-task-card-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.86);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-task-card-model {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.36);
+  letter-spacing: 0.01em;
+}
+
+.subagent-task-card-activity {
+  margin-top: 2px;
+  margin-left: 0;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  line-height: 1.35;
+}
+
+.subagent-task-card-roll {
+  display: block;
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.48);
+}
+
+.tl-subagent-hang {
+  margin-left: 18px;
 }
 
 .composer-shell.hero {
@@ -3493,21 +3659,40 @@ html.is-tauri {
   color: rgba(255, 255, 255, 0.5);
 }
 
+/*
+ * Flex slot between stage chrome and composer — owns the scrollport height.
+ * Without this wrapper, fragment children + flex can leave .chat growing with
+ * content (body overflow:hidden) so the wheel has nothing to scroll.
+ */
+.stage-main {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 /* ── chat stage ──
- * Full-width scrollport so the scrollbar sits at the far right of the stage
- * (not inset to the 860px content column). Content is centered via .chat-inner.
+ * Full-width scrollport; content centered via .chat-inner.
  */
 .chat {
   flex: 1 1 auto;
-  min-height: 0;
+  min-height: 0 !important;
+  height: 100%;
   overflow-x: hidden;
-  overflow-y: auto;
+  overflow-y: scroll !important;
   overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
   width: 100%;
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
   -webkit-app-region: no-drag;
   app-region: no-drag;
+  position: relative;
+  z-index: 1;
 }
 
 .chat::-webkit-scrollbar {
@@ -4007,42 +4192,160 @@ html.is-tauri {
 }
 
 /*
- * Live process mini window: compact by default so tool swaps don't thrash
- * body layout. When a thought is expanded, grow + scroll inside so the
- * chain is not clipped mid-sentence (was 4.75rem + overflow:hidden).
+ * Live process — Cursor ui-text-roll style (not dual-card enter/exit).
+ * Sealed pack + one clipped status line that rolls previous↑ / current↑.
  */
 .live-process-stack {
   display: flex;
   flex-direction: column;
-  justify-content: flex-end;
-  gap: 4px;
+  gap: 6px;
   position: relative;
-  min-height: 1.35rem;
-  max-height: 4.75rem;
   overflow: hidden;
-  contain: layout style;
-  box-sizing: border-box;
 }
 
-.live-process-stack:has(.tl-thought[open]),
-.live-process-stack:has(.process-pack.open) {
-  max-height: min(50vh, 28rem);
-  overflow-x: hidden;
-  overflow-y: auto;
-  justify-content: flex-start;
-  contain: layout style;
+.live-process-sealed {
+  flex: 0 0 auto;
+}
+
+.live-process-sealed .process-pack-summary {
+  opacity: 0.72;
+  font-size: 12px;
+}
+
+.live-process-stage {
+  position: relative;
+  min-height: 1.4rem;
+  overflow: hidden;
 }
 
 .live-process-item {
-  flex: 0 0 auto;
-  max-height: 100%;
-  overflow: hidden;
+  max-width: 100%;
 }
 
-.live-process-stack:has(.tl-thought[open]) .live-process-item:has(.tl-thought[open]),
-.live-process-stack:has(.process-pack.open) .live-process-item {
-  max-height: none;
-  overflow: visible;
+.live-process-roll-line {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.live-process-text-roll {
+  max-width: 100%;
+}
+
+/* Cursor ui-text-roll — duration-slower 300ms, ease-out cubic */
+.text-roll {
+  position: relative;
+  display: inline-grid;
+  grid-template-areas: "text";
+  max-width: 100%;
+  vertical-align: bottom;
+}
+
+.text-roll-stage {
+  grid-area: text;
+  position: relative;
+  display: block;
+  overflow: hidden;
+  max-width: 100%;
+  line-height: 1.5;
+  min-height: 1.5em;
+}
+
+.text-roll-item {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transform: none;
+}
+
+.text-roll-item--enter {
+  animation: text-roll-enter 300ms cubic-bezier(0.215, 0.61, 0.355, 1) both;
+}
+
+.text-roll-item--exit {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  animation: text-roll-exit 300ms cubic-bezier(0.215, 0.61, 0.355, 1) both;
+  pointer-events: none;
+}
+
+.text-roll-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.text-roll--shimmer .text-roll-item:not(.text-roll-item--exit) {
+  background-image: linear-gradient(
+    90deg,
+    color-mix(in srgb, currentColor 60%, transparent) 0%,
+    color-mix(in srgb, currentColor 60%, transparent) 25%,
+    var(--text, currentColor) 60%,
+    color-mix(in srgb, currentColor 60%, transparent) 75%,
+    color-mix(in srgb, currentColor 60%, transparent) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.text-roll--shimmer[data-status="idle"] .text-roll-item:not(.text-roll-item--exit) {
+  animation: text-shimmer 2s linear infinite;
+}
+
+.text-roll--shimmer[data-status="rolling"] .text-roll-item--enter {
+  animation:
+    text-roll-enter 300ms cubic-bezier(0.215, 0.61, 0.355, 1) both,
+    text-shimmer 2s linear infinite;
+}
+
+@keyframes text-roll-enter {
+  from {
+    transform: translateY(calc(100% + 1px));
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes text-roll-exit {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(calc(-100% - 1px));
+  }
+}
+
+@keyframes text-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .text-roll-item--enter,
+  .text-roll-item--exit,
+  .text-roll--shimmer .text-roll-item {
+    animation: none !important;
+    transform: none !important;
+    -webkit-text-fill-color: unset;
+    background-image: none;
+  }
 }
 
 .msg.assistant,
@@ -4050,8 +4353,9 @@ html.is-tauri {
   overflow-anchor: auto;
 }
 
-.tl-live .tl-list {
-  overflow: hidden;
+.tl-open .tl-list {
+  overflow: visible;
+  max-height: none;
 }
 
 /* ── Cursor-like tool timeline ── */

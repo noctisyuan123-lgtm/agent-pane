@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import type { ToolRow } from "./toolFormat";
 import {
   aggregateToolDiffStats,
@@ -6,14 +6,33 @@ import {
 } from "./toolFormat";
 import { highlightCode, highlightLine } from "./codeHighlight";
 import { releaseChatStickForInspect } from "./chatScrollStick";
+import { TextRoll } from "./TextRoll";
 
-function ToolRowView({ tool }: { tool: ToolRow }) {
-  // Default collapsed — expand on click only (keeps chat skim-friendly).
+function ToolRowView({
+  tool,
+  rollLabels = false,
+  subagentCard,
+}: {
+  tool: ToolRow;
+  rollLabels?: boolean;
+  subagentCard?: ReactNode;
+}) {
   const [open, setOpen] = useState(false);
   const hasBody =
     (tool.detailLines && tool.detailLines.length > 0) ||
     (tool.diffLines && tool.diffLines.length > 0) ||
     Boolean(tool.error);
+
+  const labelCore = rollLabels ? (
+    <TextRoll
+      text={tool.label}
+      textKey={`${tool.toolId}:${tool.label}`}
+      shimmer={tool.status === "running"}
+      className="tl-label-roll"
+    />
+  ) : (
+    tool.label
+  );
 
   return (
     <div
@@ -37,7 +56,7 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
           {hasBody ? "▸" : "·"}
         </span>
         <span className="tl-label">
-          {tool.label}
+          {labelCore}
           {tool.additions != null && (
             <span className="tl-stats">
               {" "}
@@ -45,12 +64,17 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
               <span className="del">−{tool.deletions ?? 0}</span>
             </span>
           )}
-          {tool.status === "running" && <span className="tl-spin"> …</span>}
+          {tool.status === "running" && !rollLabels && (
+            <span className="tl-spin"> …</span>
+          )}
           {tool.status === "fail" && (
             <span className="tl-fail-tag"> failed</span>
           )}
         </span>
       </button>
+      {subagentCard ? (
+        <div className="tl-subagent-hang">{subagentCard}</div>
+      ) : null}
       {open && hasBody && (
         <div className="tl-body">
           {tool.path && <div className="tl-path">{tool.path}</div>}
@@ -63,7 +87,6 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
                   </span>
                   <code
                     className="tl-code"
-                    // highlight.js HTML for Cursor-like token colors
                     dangerouslySetInnerHTML={{
                       __html: highlightLine(l.text, tool.path),
                     }}
@@ -94,53 +117,83 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
 
 export function ToolTimeline({
   tools,
-  /** Cursor: bottom list default collapsed; live turn can pass true */
   defaultOpen = false,
-  /** Live: keep summary + at most last N tool rows visible */
+  /** @deprecated live multi-row slot removed — single-slot is process-card level */
   liveMaxRows,
-  /**
-   * Nested under L1 ProcessPackFold — skip the outer "Explored…" summary
-   * (parent already owns that title) and show rows directly.
-   */
   embedded = false,
+  /** Cursor text-roll on labels (live process seat). */
+  rollLabels = false,
+  /** Optional hanging subagent card per running spawn tool (toolId → node). */
+  subagentCardsByToolId,
 }: {
   tools: ToolRow[];
   defaultOpen?: boolean;
   liveMaxRows?: number;
   embedded?: boolean;
+  rollLabels?: boolean;
+  subagentCardsByToolId?: Record<string, ReactNode>;
 }) {
-  // Summary always visible; step list folds (Cursor "Explored N files…")
+  // Live process card: summary line only by default (compact single card).
+  // User expands to see rows — not a carousel of tools.
   const [groupOpen, setGroupOpen] = useState(
-    defaultOpen || liveMaxRows != null || embedded
+    defaultOpen || embedded || liveMaxRows != null
   );
   if (!tools.length) return null;
 
   const summary = summarizeToolGroup(tools);
   const running = tools.some((t) => t.status === "running");
-  // Cursor: summary line shows sum of all row +/− (e.g. +97 −3)
   const { additions: sumAdd, deletions: sumDel } =
     aggregateToolDiffStats(tools);
   const hasDiffStats = sumAdd > 0 || sumDel > 0;
-  const listTools =
-    liveMaxRows != null && groupOpen
-      ? tools.slice(-liveMaxRows)
-      : tools;
 
-  // L2 inside process pack: rows only (L1 already has Explored/Edited title)
   if (embedded) {
     return (
       <div className="tl tl-embedded">
         <div className="tl-list">
-          {listTools.map((t) => (
-            <ToolRowView key={t.toolId} tool={t} />
+          {tools.map((t) => (
+            <ToolRowView
+              key={t.toolId}
+              tool={t}
+              rollLabels={rollLabels}
+              subagentCard={subagentCardsByToolId?.[t.toolId]}
+            />
           ))}
         </div>
       </div>
     );
   }
 
+  // Single-tool live seat: show the row directly (TextRoll on label).
+  if (rollLabels && tools.length === 1) {
+    return (
+      <div className="tl tl-live-seat">
+        <div className="tl-list">
+          <ToolRowView
+            tool={tools[0]!}
+            rollLabels
+            subagentCard={subagentCardsByToolId?.[tools[0]!.toolId]}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  const summaryNode = rollLabels ? (
+    <TextRoll
+      text={`${summary}${running ? " …" : ""}`}
+      textKey={summary}
+      shimmer={running}
+      className="tl-summary-roll"
+    />
+  ) : (
+    <>
+      {summary}
+      {running ? " …" : ""}
+    </>
+  );
+
   return (
-    <div className={`tl${liveMaxRows != null ? " tl-live" : ""}`}>
+    <div className={`tl${groupOpen ? " tl-open" : ""}`}>
       <button
         type="button"
         className="tl-summary"
@@ -151,8 +204,7 @@ export function ToolTimeline({
         aria-expanded={groupOpen}
       >
         <span className="tl-summary-text">
-          {summary}
-          {running ? " …" : ""}
+          {summaryNode}
           {hasDiffStats ? (
             <span className="tl-stats tl-stats-sum">
               {" "}
@@ -165,8 +217,13 @@ export function ToolTimeline({
       </button>
       {groupOpen ? (
         <div className="tl-list">
-          {listTools.map((t) => (
-            <ToolRowView key={t.toolId} tool={t} />
+          {tools.map((t) => (
+            <ToolRowView
+              key={t.toolId}
+              tool={t}
+              rollLabels={rollLabels}
+              subagentCard={subagentCardsByToolId?.[t.toolId]}
+            />
           ))}
         </div>
       ) : null}

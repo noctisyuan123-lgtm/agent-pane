@@ -49,17 +49,52 @@ class BrowserSession {
     try {
       const pw = (await new Function("return import('playwright')")()) as {
         chromium: {
-          launch(opts: { headless: boolean }): Promise<PlaywrightBrowser>;
+          launch(opts: {
+            headless: boolean;
+            channel?: string;
+            executablePath?: string;
+          }): Promise<PlaywrightBrowser>;
+          executablePath(): string;
         };
       };
-      const browser = await pw.chromium.launch({ headless: true });
+      // Prefer bundled chromium; fall back to channel if headless-shell missing
+      let browser: PlaywrightBrowser;
+      try {
+        browser = await pw.chromium.launch({ headless: true });
+      } catch (first) {
+        const msg = first instanceof Error ? first.message : String(first);
+        // Version skew: playwright package newer than cached browsers
+        if (/Executable doesn't exist|chrome-headless-shell/i.test(msg)) {
+          try {
+            browser = await pw.chromium.launch({
+              headless: true,
+              channel: "chrome",
+            });
+          } catch {
+            this.lastError =
+              `${msg}\n\nFix: cd apps/bridge && npx playwright install chromium`;
+            throw first;
+          }
+        } else {
+          this.lastError =
+            msg ||
+            "Playwright not available. Run: cd apps/bridge && npx playwright install chromium";
+          throw first;
+        }
+      }
       this.browser = browser;
       this.page = await browser.newPage();
       this.lastError = undefined;
       return this.page;
     } catch (e) {
-      this.lastError =
-        "Playwright not available. Install with: npx playwright install chromium";
+      if (!this.lastError) {
+        const msg = e instanceof Error ? e.message : String(e);
+        this.lastError =
+          msg.includes("Executable doesn't exist") ||
+          msg.includes("chrome-headless-shell")
+            ? `${msg}\n\nFix: cd apps/bridge && npx playwright install chromium`
+            : "Playwright not available. Install with: cd apps/bridge && npx playwright install chromium";
+      }
       throw e;
     }
   }

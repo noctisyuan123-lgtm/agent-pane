@@ -116,9 +116,70 @@ export type RunningDockProps = {
 };
 
 /**
- * Compact running shell/subagent bar — sits above the composer, left-aligned.
+ * Compact running subagent / long-work bar — sits above the composer, left-aligned.
  * Particles + outline (+ optional expand list). Hidden by parent when idle.
  */
+export type WorkingPillProps = {
+  /** Active nested subagents only */
+  count: number;
+  /** Optional expand list (click pill) */
+  runningItems?: RunningProcessItem[];
+};
+
+/**
+ * Cursor Glass Agents Tray parity — compact `{n} Working` pill above composer.
+ */
+export function WorkingPill({ count, runningItems = [] }: WorkingPillProps) {
+  const [listOpen, setListOpen] = useState(false);
+  if (count <= 0) return null;
+
+  const label = `${count} Working`;
+  const canExpand = runningItems.length > 0;
+
+  return (
+    <div
+      className={`working-pill-wrap${listOpen ? " working-pill-wrap--expanded" : ""}`}
+      aria-live="polite"
+    >
+      {canExpand ? (
+        <button
+          type="button"
+          className="working-pill"
+          onClick={() => setListOpen((v) => !v)}
+          aria-expanded={listOpen}
+          title={listOpen ? "Hide agents" : "Show running agents"}
+        >
+          <SessionWorkingDots className="working-pill-dots" />
+          <span className="working-pill-label">{label}</span>
+          <span className={`working-pill-chev ${listOpen ? "open" : ""}`}>▾</span>
+        </button>
+      ) : (
+        <div className="working-pill" aria-label={label}>
+          <SessionWorkingDots className="working-pill-dots" />
+          <span className="working-pill-label">{label}</span>
+        </div>
+      )}
+      {listOpen && canExpand ? (
+        <ul className="working-pill-list">
+          {runningItems.map((item) => (
+            <li key={item.id} className="working-pill-item">
+              {item.kind ? (
+                <span className="working-pill-kind">{item.kind}</span>
+              ) : null}
+              <span className="working-pill-item-label">{item.label}</span>
+              {item.detail?.trim() ? (
+                <span className="working-pill-item-detail">
+                  {item.detail.trim()}
+                </span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 export function RunningDock({
   outline,
   detail,

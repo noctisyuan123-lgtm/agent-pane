@@ -20,8 +20,18 @@ import { SessionWorkingDots } from "./SessionWorkingDots";
 import {
   AgentActivityStrip,
   RunningDock,
+  WorkingPill,
   type RunningProcessItem,
 } from "./AgentActivityStrip";
+import { SubagentTaskCard } from "./SubagentTaskCard";
+import {
+  collectActiveSubagentItems,
+  countActiveSubagents,
+  deriveSubagentActivityLine,
+  deriveSubagentCardTitle,
+  hasNonSubagentDockProcess,
+  isSubagentSpawnTool,
+} from "./subagentProcess";
 import { WorkspacePicker } from "./WorkspacePicker";
 import {
   buildContextBreakdown,
@@ -125,18 +135,32 @@ function folderName(p: string): string {
 /**
  * Bottom of *real* content inside a live turn (scrollport coordinates).
  * Skips the paper spacer so blank reserve is never treated as "overflow".
+ * Prefer agent body (.worked-live / .settled-turn-body) once it has height so
+ * user-bubble padding does not false-arm "past write-line" on send.
  */
 function paperContentBottom(
   turn: HTMLElement,
   chat: HTMLElement
 ): number {
   const chatTop = chat.getBoundingClientRect().top;
+  const toContentY = (el: HTMLElement) =>
+    el.getBoundingClientRect().bottom - chatTop + chat.scrollTop;
+
+  const agentBody = turn.querySelector(
+    ".worked-live, .settled-turn-body"
+  ) as HTMLElement | null;
+  if (agentBody && agentBody.getBoundingClientRect().height > 2) {
+    return toContentY(agentBody);
+  }
+
   let maxBottom = turn.getBoundingClientRect().top - chatTop + chat.scrollTop;
   for (const node of turn.children) {
     if (!(node instanceof HTMLElement)) continue;
     if (node.classList.contains("chat-turn-paper-spacer")) continue;
-    const r = node.getBoundingClientRect();
-    const bottom = r.bottom - chatTop + chat.scrollTop;
+    if (node.classList.contains("msg") && node.classList.contains("user")) {
+      continue; // user box alone does not count as "reply past the line"
+    }
+    const bottom = toContentY(node);
     if (bottom > maxBottom) maxBottom = bottom;
   }
   return maxBottom;
@@ -180,8 +204,8 @@ function findRunningTool(messages: ChatItem[]): {
 }
 
 /**
- * Composer RunningDock only for "long external work":
- * subagents, shell/execute, sleeping terminal — NOT every Read/Grep flash.
+ * Composer RunningDock only for long external work:
+ * subagents, sleeping terminal — NOT ordinary shell/execute or Read/Grep flash.
  */
 function isDockWorthyRunningTool(t: {
   kind?: string;
@@ -190,7 +214,6 @@ function isDockWorthyRunningTool(t: {
 }): boolean {
   const kind = (t.kind || "").toLowerCase();
   const blob = `${t.name || ""} ${t.label || ""}`;
-  if (kind === "execute") return true;
   if (kind === "sleeping") return true;
   // Subagent / task spawn tools (ACP titles vary)
   if (
@@ -200,16 +223,13 @@ function isDockWorthyRunningTool(t: {
   ) {
     return true;
   }
-  // Long shell-looking labels
-  if (/^Ran\s+/i.test(t.label || "") || /^Running\s+/i.test(t.label || "")) {
-    return true;
-  }
-  // Explicitly skip flash tools
+  // Explicitly skip flash tools and ordinary foreground shell
   if (
     kind === "read" ||
     kind === "search" ||
     kind === "edit" ||
-    kind === "write"
+    kind === "write" ||
+    kind === "execute"
   ) {
     return false;
   }
@@ -217,8 +237,8 @@ function isDockWorthyRunningTool(t: {
 }
 
 /**
- * Show RunningDock above composer — subagent / long script only.
- * Quick Read·Grep·Edit stay off the dock (timeline L1 is enough).
+ * Show RunningDock above composer — subagent / sleeping / permission only.
+ * Ordinary foreground shell and Read·Grep·Edit stay off the dock.
  */
 function hasDockWorthyProcess(
   messages: ChatItem[],
@@ -230,19 +250,15 @@ function hasDockWorthyProcess(
   if (phase === "sleeping") return true;
   // Permission waits can be long — keep dock
   if (phase === "permission") return true;
-  if (
-    statusMsg != null &&
-    /^(Running|Permission|Queued:|Calling spawn|Calling task)/i.test(statusMsg)
-  ) {
-    // "Using read_file…" / "Calling grep" → no dock
-    if (/^(Using|Calling)\s+/i.test(statusMsg) && !/spawn|task|subagent|bash|shell|terminal|execute/i.test(statusMsg)) {
-      return false;
-    }
-    if (/^(Using|Calling)\s+/i.test(statusMsg) && /spawn|task|subagent|bash|shell|terminal|execute/i.test(statusMsg)) {
+  if (statusMsg != null) {
+    if (/^Permission\b/i.test(statusMsg)) return true;
+    // Subagent / task spawn status only — not generic "Running …" shell
+    if (
+      /spawn|task|subagent/i.test(statusMsg) &&
+      /^(Queued:|Calling|Using|Running)/i.test(statusMsg)
+    ) {
       return true;
     }
-    if (/^Running\b/i.test(statusMsg)) return true;
-    if (/^Permission\b/i.test(statusMsg)) return true;
   }
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
@@ -265,7 +281,7 @@ function activityOutline(
     const inProg = tasks.find((t) => t.status === "in_progress");
     if (inProg?.content?.trim()) return truncateOneLine(inProg.content);
   }
-  // Prefer dock-worthy running tools (shell/subagent), not flash Read/Grep
+  // Prefer dock-worthy running tools (subagent/sleeping), not flash Read/Grep/shell
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
     if (m.kind !== "tools") continue;
@@ -601,6 +617,53 @@ const MemoMarkdown = memo(function MemoMarkdown({ text }: { text: string }) {
   );
 });
 
+/**
+ * Thought row: summary only until opened. Streaming full text into a closed
+ * <details> still layout-cost the whole chat (felt frozen while scrolling).
+ */
+function LazyThoughtFold({
+  id,
+  label,
+  text,
+}: {
+  id: string;
+  label: string;
+  text: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const body = text.trim();
+  const upstreamCut =
+    (body.endsWith("...") || body.endsWith("…")) &&
+    body.length <= 220 &&
+    !/[.!?。！？]\s*$/.test(body.replace(/\.\.\.$|…$/u, "").trim());
+
+  return (
+    <details
+      className="tl-thought"
+      data-thought-id={id}
+      onToggle={(e) => {
+        releaseChatStickForInspect();
+        setOpen((e.currentTarget as HTMLDetailsElement).open);
+      }}
+    >
+      <summary>
+        <span className="tl-meta-label">{label}</span>
+        <span className="tl-meta-chev">▾</span>
+      </summary>
+      {open ? (
+        <div className="tl-thought-body">
+          {text}
+          {upstreamCut ? (
+            <div className="tl-thought-truncated-note">
+              思维链被上游截断（约 200 字），不是界面折叠裁切
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
 export function App() {
   const b = useBridge();
   const [input, setInput] = useState("");
@@ -685,13 +748,19 @@ export function App() {
   /** Live turn root — min-height "paper" + scroll anchor for user bubble */
   const liveTurnRef = useRef<HTMLDivElement | null>(null);
   /**
-   * Paper mode (Cursor-style): user bubble *bottom* sits at the write-line
-   * (~mid-lower viewport), with ~1/4–1/3 viewport empty below for the model
-   * to fill top→down — not flush-to-top, not toothpaste stick-bottom.
+   * Paper mode (Cursor-style):
+   * 1) On send — user bubble *bottom* at write-line (~28% empty below).
+   * 2) After reply content crosses that line — follow content bottom near
+   *    the viewport bottom (gentle scroll-with-reply), NOT keep locking 28%.
    */
   const paperModeRef = useRef(false);
   /** Only re-snap anchor once per send (not every MessageChunk). */
   const paperAnchoredRef = useRef(false);
+  /**
+   * false = still in initial 28% write-line phase;
+   * true  = content overflowed write-line → follow near viewport bottom.
+   */
+  const paperFollowPastLineRef = useRef(false);
   /** Spacer px last applied — used to cancel jump when turn settles. */
   const paperSpacerPxRef = useRef(0);
   /** Follow new output only while user is pinned near the bottom. */
@@ -700,6 +769,8 @@ export function App() {
   const [paperReservePx, setPaperReservePx] = useState(200);
   /** Coalesce paper scroll layout to 1×/frame. */
   const paperLayoutRafRef = useRef<number | null>(null);
+  /** Ignore paper/stick auto-scroll while user is using the wheel/trackpad. */
+  const userScrollLockUntilRef = useRef(0);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const plusBtnRef = useRef<HTMLButtonElement>(null);
@@ -1063,6 +1134,7 @@ export function App() {
     const el = chatRef.current;
     if (!el) return;
     paperModeRef.current = false;
+    paperFollowPastLineRef.current = false;
     if (behavior === "smooth") {
       bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
     } else {
@@ -1074,13 +1146,14 @@ export function App() {
   }, []);
 
   /**
-   * Cursor write-line: place user bubble *bottom* so ~paperReserve of the
-   * viewport stays empty below (about 28% ≈ between 1/4 and 1/3).
+   * Cursor write-line (initial only): place user bubble *bottom* so ~28%
+   * of the viewport stays empty below. Later growth uses follow-past-line.
    */
   const anchorUserToWriteLine = useCallback(() => {
     stickToBottomRef.current = false;
     paperModeRef.current = true;
     paperAnchoredRef.current = false;
+    paperFollowPastLineRef.current = false;
     setShowJumpBottom(false);
     const run = () => {
       const chat = chatRef.current;
@@ -1138,6 +1211,7 @@ export function App() {
     registerChatStickRelease(() => {
       stickToBottomRef.current = false;
       paperModeRef.current = false;
+      paperFollowPastLineRef.current = false;
       const el = chatRef.current;
       if (el) {
         const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
@@ -1150,8 +1224,9 @@ export function App() {
   }, []);
 
   // Stream growth — rAF-coalesced.
-  // paper: keep *content bottom* above the reserve band (write-line floor)
-  // stick: classic pin to bottom
+  // paper phase A: hold content above the 28% write-line until it overflows
+  // paper phase B: follow content bottom near viewport bottom (user request)
+  // stick: classic pin to bottom (after user re-pins or jump)
   useLayoutEffect(() => {
     if (!hasMessages) return;
     if (paperLayoutRafRef.current != null) return;
@@ -1159,6 +1234,11 @@ export function App() {
       paperLayoutRafRef.current = null;
       const el = chatRef.current;
       if (!el) return;
+      // User is actively scrolling — never fight the wheel
+      if (Date.now() < userScrollLockUntilRef.current) {
+        chatScrollHeightRef.current = el.scrollHeight;
+        return;
+      }
       const h = el.scrollHeight;
       const prevH = chatScrollHeightRef.current;
       chatScrollHeightRef.current = h;
@@ -1167,12 +1247,27 @@ export function App() {
         const turn = liveTurnRef.current;
         if (turn) {
           const contentBottom = paperContentBottom(turn, el);
-          // Write floor = bottom of viewport minus reserve (plus tiny margin)
           const reserve = paperSpacerPxRef.current || paperReservePx;
-          const writeFloor =
-            el.scrollTop + el.clientHeight - Math.min(reserve, el.clientHeight * 0.2);
-          if (contentBottom > writeFloor) {
-            el.scrollTop += contentBottom - writeFloor;
+          // Full 28% write-line (do NOT clamp to 0.2 — that fought the anchor)
+          const writeFloor = el.scrollTop + el.clientHeight - reserve;
+          // Once past the line: pad near viewport bottom, not re-lock 28%
+          const followPad = 28;
+          const viewportFloor = el.scrollTop + el.clientHeight - followPad;
+
+          // Arm when pen crosses write-line — do NOT re-lock scroll to 28%.
+          // Content may fill the empty paper first; follow starts at viewport floor.
+          if (
+            !paperFollowPastLineRef.current &&
+            contentBottom > writeFloor + 1
+          ) {
+            paperFollowPastLineRef.current = true;
+          }
+          if (
+            paperFollowPastLineRef.current &&
+            contentBottom > viewportFloor
+          ) {
+            // Scroll with the reply — content bottom rides near the bottom edge
+            el.scrollTop += contentBottom - viewportFloor;
           }
         }
         setShowJumpBottom(false);
@@ -1211,6 +1306,7 @@ export function App() {
       const spacerH = paperSpacerPxRef.current;
       paperModeRef.current = false;
       paperAnchoredRef.current = false;
+      paperFollowPastLineRef.current = false;
       paperSpacerPxRef.current = 0;
       if (el && spacerH > 0) {
         // Spacer sat below content; removing it shrinks scrollHeight.
@@ -1276,6 +1372,7 @@ export function App() {
         // Was reading history — re-pin only when they scroll all the way down
         stickToBottomRef.current = true;
         paperModeRef.current = false;
+        paperFollowPastLineRef.current = false;
         setShowJumpBottom(false);
       } else {
         setShowJumpBottom(true);
@@ -1283,15 +1380,22 @@ export function App() {
     };
 
     const onWheel = (e: WheelEvent) => {
-      // Intentional upward gesture → release paper + stick (reading trail)
-      if (e.deltaY < 0) {
-        stickToBottomRef.current = false;
-        paperModeRef.current = false;
-        setShowJumpBottom(true);
-      }
+      // Any intentional wheel/trackpad → free the scrollport for the user.
+      // (Only releasing on deltaY<0 left downward-follow fighting the wheel.)
+      if (e.deltaY === 0 && e.deltaX === 0) return;
+      userScrollLockUntilRef.current = Date.now() + 1200;
+      stickToBottomRef.current = false;
+      paperModeRef.current = false;
+      paperFollowPastLineRef.current = false;
+      const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+      setShowJumpBottom(dist > REPIN_BOTTOM_PX);
     };
 
     const onTouchMove = () => {
+      userScrollLockUntilRef.current = Date.now() + 1200;
+      stickToBottomRef.current = false;
+      paperModeRef.current = false;
+      paperFollowPastLineRef.current = false;
       requestAnimationFrame(syncStickFromPosition);
     };
 
@@ -2085,16 +2189,21 @@ export function App() {
     return { add, del, files: b.diffs.length };
   }, [b.diffs]);
 
-  const runningProcessItems = collectRunningProcessItems(
+  const activeSubagentCount = countActiveSubagents(
+    b.messages,
+    b.activitySubagentModel
+  );
+  const activeSubagentItems = collectActiveSubagentItems(
     b.messages,
     b.activitySubagentModel,
-    b.statusMsg
+    b.statusMsg,
+    b.tasks
   );
-  const showRunningDock = hasDockWorthyProcess(
+  const showWorkingPill = activeSubagentCount > 0;
+  const showRunningDock = hasNonSubagentDockProcess(
     b.messages,
     b.activityPhase,
-    b.statusMsg,
-    b.activitySubagentModel
+    b.statusMsg
   );
 
   const composer = (
@@ -2103,6 +2212,12 @@ export function App() {
         composerCrowded ? "crowded" : "compact"
       }`}
     >
+      {showWorkingPill ? (
+        <WorkingPill
+          count={activeSubagentCount}
+          runningItems={activeSubagentItems}
+        />
+      ) : null}
       {showRunningDock ? (
         <RunningDock
           outline={activityOutline(
@@ -2116,7 +2231,11 @@ export function App() {
             b.activityPhase,
             b.messages
           )}
-          runningItems={runningProcessItems}
+          runningItems={collectRunningProcessItems(
+            b.messages,
+            b.activitySubagentModel,
+            b.statusMsg
+          ).filter((item) => item.kind !== "subagent")}
         />
       ) : null}
       <div
@@ -3064,6 +3183,7 @@ export function App() {
           </div>
         ) : (
           <>
+            <div className="stage-main">
             <main
               className="chat"
               ref={(n) => {
@@ -3131,32 +3251,15 @@ export function App() {
                     if (!preview) return null;
                     // Prefer wall-clock durationMs (true); never char-count fake.
                     const label = thoughtLabel(preview, m.durationMs);
-                    const body = m.text.trim();
-                    const upstreamCut =
-                      (body.endsWith("...") || body.endsWith("…")) &&
-                      body.length <= 220 &&
-                      !/[.!?。！？]\s*$/.test(
-                        body.replace(/\.\.\.$|…$/u, "").trim()
-                      );
+                    // Body mounts only when open — streaming full text into a
+                    // closed <details> still reflowed the whole chat and froze scroll.
                     return (
-                      <details
-                        className="tl-thought"
+                      <LazyThoughtFold
                         key={m.id}
-                        onToggle={() => releaseChatStickForInspect()}
-                      >
-                        <summary>
-                          <span className="tl-meta-label">{label}</span>
-                          <span className="tl-meta-chev">▾</span>
-                        </summary>
-                        <div className="tl-thought-body">
-                          {m.text}
-                          {upstreamCut ? (
-                            <div className="tl-thought-truncated-note">
-                              思维链被上游截断（约 200 字），不是界面折叠裁切
-                            </div>
-                          ) : null}
-                        </div>
-                      </details>
+                        id={m.id}
+                        label={label}
+                        text={m.text}
+                      />
                     );
                   }
                   if (m.kind === "status") {
@@ -3167,16 +3270,42 @@ export function App() {
                     );
                   }
                   if (m.kind === "tools") {
-                    // L1 pack already owns "Explored…" — nested rows only.
-                    // Live open segment: keep group summary + window.
-                    const liveTools = turn.isLive && !ctx?.embeddedInPack;
+                    const liveCard =
+                      turn.isLive && !ctx?.embeddedInPack;
+                    const subagentCardsByToolId: Record<string, ReactNode> =
+                      {};
+                    if (liveCard) {
+                      for (const t of m.tools) {
+                        if (!isSubagentSpawnTool(t)) continue;
+                        if (t.status !== "running") continue;
+                        const activityLine = deriveSubagentActivityLine({
+                          statusMsg: b.statusMsg,
+                          activityPhase: b.activityPhase,
+                          subagentModel: b.activitySubagentModel,
+                          spawnRunning: true,
+                          tasks: b.tasks,
+                        });
+                        subagentCardsByToolId[t.toolId] = (
+                          <SubagentTaskCard
+                            title={deriveSubagentCardTitle(t, b.tasks)}
+                            model={b.activitySubagentModel}
+                            activityLine={activityLine}
+                            active
+                          />
+                        );
+                      }
+                    }
                     return (
                       <ToolTimeline
                         key={m.id}
                         tools={m.tools}
-                        defaultOpen={false}
-                        liveMaxRows={liveTools ? 4 : undefined}
+                        defaultOpen={!liveCard}
                         embedded={Boolean(ctx?.embeddedInPack)}
+                        subagentCardsByToolId={
+                          Object.keys(subagentCardsByToolId).length > 0
+                            ? subagentCardsByToolId
+                            : undefined
+                        }
                       />
                     );
                   }
@@ -3478,7 +3607,7 @@ export function App() {
                     );
                     // Dock already shows external work — skip redundant soft filler
                     if (
-                      showRunningDock &&
+                      (showRunningDock || showWorkingPill) &&
                       /^(Working…|Planning next moves)$/i.test(line)
                     ) {
                       return "";
@@ -3502,6 +3631,7 @@ export function App() {
                 <IconArrowDown size={12} />
               </button>
             )}
+            </div>
 
             <div className="composer-dock">{composer}</div>
           </>
