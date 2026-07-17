@@ -4433,7 +4433,8 @@ html.is-tauri {
 
 .assistant-text pre {
   margin: 0.55em 0;
-  padding: 10px 12px;
+  /* Slightly more air between glyphs and the bubble edge */
+  padding: 12px 14px;
   border-radius: 10px;
   /* Transparent bubble — sits close to chat bg (ChatGPT-ish) */
   background: rgba(255, 255, 255, 0.035);
