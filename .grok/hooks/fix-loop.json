@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "search_replace|Write|Edit|MultiEdit|write|Bash|run_terminal_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./fix-loop-mark-dirty.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./fix-loop-ensure-web.sh",
+            "timeout": 25
+          }
+        ]
+      }
+    ]
+  }
+}

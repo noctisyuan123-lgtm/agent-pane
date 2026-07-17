@@ -98,19 +98,23 @@ export class GrokSignalsWatcher {
   private lastKey = "";
   private stopped = false;
   private paths: string[];
+  private intervalMs: number;
+  private readonly idleIntervalMs: number;
 
   constructor(
     paths: string[],
     private onUsage: (u: GrokSignalsUsage) => void,
-    private intervalMs = 1200
+    idleIntervalMs = 1200
   ) {
     this.paths = paths;
+    this.idleIntervalMs = idleIntervalMs;
+    this.intervalMs = idleIntervalMs;
   }
 
   start(): void {
     this.stopped = false;
     this.tick();
-    this.timer = setInterval(() => this.tick(), this.intervalMs);
+    this.armTimer();
     // Best-effort instant wake on write (macOS may coalesce; poll is source of truth)
     for (const p of this.paths) {
       try {
@@ -131,6 +135,26 @@ export class GrokSignalsWatcher {
         /* poll still runs */
       }
     }
+  }
+
+  private armTimer(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    if (this.stopped) return;
+    this.timer = setInterval(() => this.tick(), this.intervalMs);
+  }
+
+  /**
+   * Busy (prompt in flight): poll faster so the ring updates sooner after
+   * Grok flushes signals.json. Idle: back to ~1.2s.
+   */
+  setActive(active: boolean): void {
+    const next = active ? 350 : this.idleIntervalMs;
+    if (next === this.intervalMs) return;
+    this.intervalMs = next;
+    if (!this.stopped) this.armTimer();
   }
 
   /** Force a read (e.g. after prompt completes). */

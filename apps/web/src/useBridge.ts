@@ -212,15 +212,50 @@ export function useBridge() {
    * Keep only a few sessions: large ChatItem trees were piling up like a leak
    * after continuous switching.
    */
-  const sessionChatCacheRef = useRef<
-    Map<string, { messages: ChatItem[]; at: number }>
-  >(new Map());
+  type ContextUsageState = {
+    used: number;
+    size: number;
+    source:
+      | "acp"
+      | "compact"
+      | "compact_done"
+      | "signals"
+      | "session_info"
+      | "estimate";
+    at?: string;
+    pct?: number;
+  };
+  type SessionChatCacheEntry = {
+    messages: ChatItem[];
+    at: number;
+    contextUsage?: ContextUsageState | null;
+  };
+  const sessionChatCacheRef = useRef<Map<string, SessionChatCacheEntry>>(
+    new Map()
+  );
+  const contextUsageRef = useRef<ContextUsageState | null>(null);
+
+  /** Write messages into cache without dropping stored contextUsage. */
+  const setSessionCacheMessages = useCallback(
+    (id: string, messages: ChatItem[]) => {
+      const prev = sessionChatCacheRef.current.get(id);
+      sessionChatCacheRef.current.set(id, {
+        messages,
+        at: Date.now(),
+        contextUsage: prev?.contextUsage ?? contextUsageRef.current,
+      });
+    },
+    []
+  );
+
   const stashSessionChat = useCallback((id: string | null | undefined) => {
     if (!id) return;
     const msgs = messagesRef.current;
     if (!msgs.length) return;
     const cache = sessionChatCacheRef.current;
     const existing = cache.get(id)?.messages;
+    const prevUsage =
+      cache.get(id)?.contextUsage ?? contextUsageRef.current ?? null;
     // Never overwrite a longer full timeline with a windowed paint slice —
     // that corrupted userTurnIndex and made Retry wipe early history.
     let next = msgs.slice();
@@ -234,8 +269,12 @@ export function useBridge() {
       } else if (start === 0) {
         next = msgs.slice();
       } else {
-        // Can't align — keep the longer cache, only bump mtime
-        cache.set(id, { messages: existing.slice(), at: Date.now() });
+        // Can't align — keep the longer cache, only bump mtime + usage
+        cache.set(id, {
+          messages: existing.slice(),
+          at: Date.now(),
+          contextUsage: prevUsage,
+        });
         while (cache.size > 4) {
           let oldestId: string | null = null;
           let oldestAt = Infinity;
@@ -251,7 +290,11 @@ export function useBridge() {
         return;
       }
     }
-    cache.set(id, { messages: next, at: Date.now() });
+    cache.set(id, {
+      messages: next,
+      at: Date.now(),
+      contextUsage: prevUsage,
+    });
     while (cache.size > 4) {
       let oldestId: string | null = null;
       let oldestAt = Infinity;
@@ -276,19 +319,123 @@ export function useBridge() {
   // NOTE: do NOT tick busyElapsed in this hook — a 200ms setState here
   // re-rendered the entire App (sidebar + markdown chat) and made rapid
   // session switching feel frozen. Elapsed UI lives in AgentActivityStrip.
-  const [contextUsage, setContextUsage] = useState<{
-    used: number;
-    size: number;
-    source:
-      | "acp"
-      | "compact"
-      | "compact_done"
-      | "signals"
-      | "session_info"
-      | "estimate";
-    at?: string;
-    pct?: number;
-  } | null>(null);
+  const [contextUsage, setContextUsageState] =
+    useState<ContextUsageState | null>(null);
+  contextUsageRef.current = contextUsage;
+
+  /** Set ring + keep session cache warm (history switch must not flash —). */
+  const setContextUsage = useCallback(
+    (
+      next:
+        | ContextUsageState
+        | null
+        | ((prev: ContextUsageState | null) => ContextUsageState | null)
+    ) => {
+      setContextUsageState((prev) => {
+        const resolved = typeof next === "function" ? next(prev) : next;
+        contextUsageRef.current = resolved;
+        const sid = sessionIdRef.current;
+        if (sid) {
+          const cache = sessionChatCacheRef.current;
+          const entry = cache.get(sid);
+          if (entry) {
+            cache.set(sid, {
+              ...entry,
+              contextUsage: resolved,
+              at: Date.now(),
+            });
+          }
+        }
+        return resolved;
+      });
+    },
+    []
+  );
+
+  /**
+   * Shared usage refresh for history open (cache hit + full load).
+   * Estimate first, then HTTP reconcile; keep estimate when signals too small.
+   */
+  const refreshContextUsage = useCallback(
+    async (opts: {
+      sessionId: string;
+      cwd: string;
+      messages: ChatItem[];
+      stillCurrent: () => boolean;
+      /** Prefer showing this immediately (cache) before async resolve */
+      bootstrap?: ContextUsageState | null;
+    }) => {
+      const { sessionId, cwd, messages, stillCurrent, bootstrap } = opts;
+      if (!stillCurrent()) return;
+
+      if (bootstrap != null) {
+        setContextUsage(bootstrap);
+      }
+
+      try {
+        const { estimateMessagesTokens } = await import("./contextUsage");
+        if (!stillCurrent()) return;
+        const estimated = estimateMessagesTokens(messages);
+        const fallbackSize = 500_000;
+
+        // Instant ring from estimate when no bootstrap
+        if (bootstrap == null && estimated > 0) {
+          setContextUsage({
+            used: estimated,
+            size: fallbackSize,
+            source: "estimate",
+            pct: Math.min(100, Math.round((estimated / fallbackSize) * 100)),
+          });
+        }
+
+        let lastUsage: ContextUsageState | null = null;
+        try {
+          const { fetchContextUsage } = await import("./api");
+          const u = await fetchContextUsage({ sessionId, cwd });
+          if (!stillCurrent()) return;
+          if (u) {
+            const signalsTooSmall =
+              estimated > 8_000 && u.used + 2_000 < estimated * 0.5;
+            if (signalsTooSmall) {
+              lastUsage = {
+                used: estimated,
+                size: u.size > 0 ? u.size : fallbackSize,
+                source: "estimate",
+                pct: Math.min(
+                  100,
+                  Math.round(
+                    (estimated / (u.size > 0 ? u.size : fallbackSize)) * 100
+                  )
+                ),
+              };
+            } else {
+              lastUsage = {
+                used: u.used,
+                size: u.size,
+                source: u.source as ContextUsageState["source"],
+                pct: u.pct,
+              };
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        if (!lastUsage && estimated > 0) {
+          lastUsage = {
+            used: estimated,
+            size: fallbackSize,
+            source: "estimate",
+            pct: Math.min(100, Math.round((estimated / fallbackSize) * 100)),
+          };
+        }
+        if (!stillCurrent() || !lastUsage) return;
+        setContextUsage(lastUsage);
+      } catch {
+        /* ignore */
+      }
+    },
+    [setContextUsage]
+  );
   const [restoredDraft, setRestoredDraft] = useState<string | null>(null);
   /** True while session.resume is in flight — must NOT flip Send→Stop */
   const [resuming, setResuming] = useState(false);
@@ -317,6 +464,14 @@ export function useBridge() {
   const toolStartRef = useRef(new Map<string, number>());
   /** Wall-clock start of current user turn (Worked for Xs) */
   const turnStartedAtRef = useRef<number | null>(null);
+  /**
+   * Coalesce MessageChunk/ThoughtChunk paints to 1× per animation frame.
+   * After fold/paper work, every 1-char chunk was setMessages + full App layout
+   * (segmentTurnBody + paper getBoundingClientRect + markdown) — felt like ~10 tok/s.
+   */
+  const streamRafRef = useRef<number | null>(null);
+  const streamAssistantDirtyRef = useRef(false);
+  const streamThoughtDirtyRef = useRef(false);
   /**
    * Active session for event gating. Intentionally NOT synced from `sessionId`
    * state on every render — that race reverted optimistic openHistorySession
@@ -380,15 +535,50 @@ export function useBridge() {
     userTurnIndex: number;
   }>(null);
 
-  const sealThoughtLogLine = useCallback(() => {
-    if (thoughtStartRef.current == null) return;
-    const ms = Date.now() - thoughtStartRef.current;
+  /**
+   * Wall-clock thinking duration. Does NOT push ◆ Thought to turn_log —
+   * that doubled the UI (fake 1s from char count + real 12s log line).
+   * Duration is stamped onto the thought ChatItem instead.
+   */
+  const sealThoughtDurationMs = useCallback((): number | null => {
+    if (thoughtStartRef.current == null) return null;
+    const ms = Math.max(0, Date.now() - thoughtStartRef.current);
     thoughtStartRef.current = null;
-    turnLogRef.current.push({
-      tone: "dim",
-      text: `Thought for ${formatDurationSec(ms)}`,
-    });
+    return ms;
   }, []);
+
+  /** Write thought buffer into messages, optionally with wall-clock duration. */
+  const paintThoughtToMessages = useCallback(
+    (
+      messages: ChatItem[],
+      durationMs?: number | null
+    ): ChatItem[] => {
+      const tid = thoughtLiveId.current;
+      const text = (thoughtBufMap.current.get(tid) ?? "").trim();
+      if (!text) return messages;
+      const copy = [...messages];
+      const idx = copy.findIndex((x) => x.id === tid && x.kind === "thought");
+      const item: Extract<ChatItem, { kind: "thought" }> = {
+        kind: "thought",
+        text,
+        id: tid,
+        ...(durationMs != null && durationMs > 0
+          ? { durationMs }
+          : idx >= 0 && copy[idx]!.kind === "thought" && copy[idx].durationMs
+            ? { durationMs: copy[idx].durationMs }
+            : {}),
+      };
+      if (idx >= 0) copy[idx] = item;
+      else copy.push(item);
+      return copy;
+    },
+    []
+  );
+
+  /** @deprecated name kept for call sites — only seals wall clock now */
+  const sealThoughtLogLine = useCallback(() => {
+    sealThoughtDurationMs();
+  }, [sealThoughtDurationMs]);
 
   const pushTurnLog = useCallback(() => {
     const lines = turnLogRef.current;
@@ -460,6 +650,9 @@ export function useBridge() {
       // or busy sticks forever after MessageDone (sidebar particles).
       if (event.type === "UserMessageAppended") {
         busyBySessionRef.current[id] = true;
+        if (id === active && !replayingRef.current) {
+          turnDoneRef.current = false;
+        }
       } else if (event.type === "ToolStarted") {
         if (!sealedHere) busyBySessionRef.current[id] = true;
       } else if (
@@ -468,6 +661,15 @@ export function useBridge() {
         event.type === "SessionError"
       ) {
         busyBySessionRef.current[id] = false;
+        // Seal BEFORE paint gate — MessageDone paint can be skipped (suppress/
+        // foreign session/dedupe) while busy already false; without this,
+        // residual Thinking re-arms phase and Stop sticks.
+        if (id === active && !replayingRef.current) {
+          turnDoneRef.current = true;
+          setActivityPhase(null);
+          setActivitySubagentModel(null);
+          setStatusMsg(null);
+        }
       } else if (
         event.type === "ToolFinished" ||
         event.type === "ToolFailed"
@@ -657,10 +859,7 @@ export function useBridge() {
         });
         // Keep full-timeline cache in sync (windowed paint must not be SoT)
         if (cacheU) {
-          sessionChatCacheRef.current.set(sidU, {
-            messages: [...cacheU, userItem],
-            at: Date.now(),
-          });
+          setSessionCacheMessages(sidU, [...cacheU, userItem]);
         } else if (sidU === sessionIdRef.current) {
           const base = messagesRef.current.filter(
             (x) =>
@@ -670,10 +869,7 @@ export function useBridge() {
                 x.text === event.text
               )
           );
-          sessionChatCacheRef.current.set(sidU, {
-            messages: [...base, userItem],
-            at: Date.now(),
-          });
+          setSessionCacheMessages(sidU, [...base, userItem]);
         }
         if (!replayingRef.current) setBusy(true);
         // Next user turn: drop previous fully-done plan (keep incomplete multi-turn plans)
@@ -699,32 +895,74 @@ export function useBridge() {
         // Stop / cancel seals the turn — drop residual stream (was "can't stop")
         if (turnDoneRef.current) break;
         // 重要：assistantBuf += 必须在 setState 外；StrictMode 会双跑 updater。
-        sealThoughtLogLine();
+        const thoughtMs = sealThoughtDurationMs();
         const wasEmpty = assistantBuf.current === "";
         assistantBuf.current += event.text;
-        const textSnapshot = assistantBuf.current;
 
-        setMessages((m) => {
-          let id = assistantLiveId.current;
-          const last = m[m.length - 1];
-
-          // After tools: one bubble per tools-group (NOT per session — that
-          // collapsed every turn into one id and the last reply overwrote
-          // earlier ones when replaying history).
-          if (wasEmpty && (last?.kind === "tools" || postToolsAssistantId.current)) {
-            if (postToolsAssistantId.current) {
-              id = postToolsAssistantId.current;
-            } else {
-              id = `a-${event.sessionId}-after-${toolsGroupId.current}`;
-              postToolsAssistantId.current = id;
+        // Resolve post-tool assistant id immediately (needs wasEmpty + last kind)
+        if (wasEmpty) {
+          setMessages((m) => {
+            let next = paintThoughtToMessages(m, thoughtMs);
+            let id = assistantLiveId.current;
+            const last = next[next.length - 1];
+            if (last?.kind === "tools" || postToolsAssistantId.current) {
+              if (postToolsAssistantId.current) {
+                id = postToolsAssistantId.current;
+              } else {
+                id = `a-${event.sessionId}-after-${toolsGroupId.current}`;
+                postToolsAssistantId.current = id;
+              }
+              assistantLiveId.current = id;
             }
-            assistantLiveId.current = id;
+            return upsertAssistant(next, assistantBuf.current, id);
+          });
+        } else {
+          // Coalesce subsequent chars into one paint per frame
+          streamAssistantDirtyRef.current = true;
+          if (streamRafRef.current == null) {
+            const paintedSid = event.sessionId;
+            streamRafRef.current = requestAnimationFrame(() => {
+              streamRafRef.current = null;
+              // Drop if user switched session while we waited a frame
+              if (sessionIdRef.current !== paintedSid) {
+                streamAssistantDirtyRef.current = false;
+                streamThoughtDirtyRef.current = false;
+                return;
+              }
+              const flushA = streamAssistantDirtyRef.current;
+              const flushT = streamThoughtDirtyRef.current;
+              streamAssistantDirtyRef.current = false;
+              streamThoughtDirtyRef.current = false;
+              if (!flushA && !flushT) return;
+              setMessages((m) => {
+                if (sessionIdRef.current !== paintedSid) return m;
+                let next = m;
+                if (flushA) {
+                  next = upsertAssistant(
+                    next,
+                    assistantBuf.current,
+                    assistantLiveId.current
+                  );
+                }
+                if (flushT) {
+                  const id = thoughtLiveId.current;
+                  const textSnapshot = thoughtBufMap.current.get(id) ?? "";
+                  const copy = [...next];
+                  const idx = copy.findIndex(
+                    (x) => x.id === id && x.kind === "thought"
+                  );
+                  if (idx >= 0) {
+                    copy[idx] = { kind: "thought", text: textSnapshot, id };
+                  } else if (textSnapshot) {
+                    copy.push({ kind: "thought", text: textSnapshot, id });
+                  }
+                  next = copy;
+                }
+                return next;
+              });
+            });
           }
-
-          // Late chunks after MessageDone: keep merging into current live bubble
-          // (do NOT open a second bubble — that was the double-hello bug)
-          return upsertAssistant(m, textSnapshot, id);
-        });
+        }
         break;
       }
 
@@ -734,40 +972,85 @@ export function useBridge() {
         if (thoughtStartRef.current == null) {
           thoughtStartRef.current = Date.now();
         }
-        // Soft status for line-3 while thoughts stream (unless a tool activity owns the strip)
+        // Soft status once — React bails if already "thinking"
         setActivityPhase((p) => (p === "tool" || p === "permission" ? p : "thinking"));
         const id = thoughtLiveId.current;
         const prev =
           (thoughtBufMap.current.get(id) ?? "") + event.text;
         thoughtBufMap.current.set(id, prev);
-        const textSnapshot = prev;
-        setMessages((m) => {
-          const next = [...m];
-          const idx = next.findIndex((x) => x.id === id && x.kind === "thought");
-          if (idx >= 0) {
-            next[idx] = { kind: "thought", text: textSnapshot, id };
-          } else {
-            next.push({ kind: "thought", text: textSnapshot, id });
-          }
-          return next;
-        });
+        streamThoughtDirtyRef.current = true;
+        if (streamRafRef.current == null) {
+          const paintedSid = event.sessionId;
+          streamRafRef.current = requestAnimationFrame(() => {
+            streamRafRef.current = null;
+            if (sessionIdRef.current !== paintedSid) {
+              streamAssistantDirtyRef.current = false;
+              streamThoughtDirtyRef.current = false;
+              return;
+            }
+            const flushA = streamAssistantDirtyRef.current;
+            const flushT = streamThoughtDirtyRef.current;
+            streamAssistantDirtyRef.current = false;
+            streamThoughtDirtyRef.current = false;
+            if (!flushA && !flushT) return;
+            setMessages((m) => {
+              if (sessionIdRef.current !== paintedSid) return m;
+              let next = m;
+              if (flushA) {
+                next = upsertAssistant(
+                  next,
+                  assistantBuf.current,
+                  assistantLiveId.current
+                );
+              }
+              if (flushT) {
+                const tid = thoughtLiveId.current;
+                const textSnapshot = thoughtBufMap.current.get(tid) ?? "";
+                const copy = [...next];
+                const idx = copy.findIndex(
+                  (x) => x.id === tid && x.kind === "thought"
+                );
+                if (idx >= 0) {
+                  copy[idx] = { kind: "thought", text: textSnapshot, id: tid };
+                } else if (textSnapshot) {
+                  copy.push({ kind: "thought", text: textSnapshot, id: tid });
+                }
+                next = copy;
+              }
+              return next;
+            });
+          });
+        }
         break;
       }
 
-      case "MessageDone":
+      case "MessageDone": {
+        // Flush any coalesced stream paint before seal
+        if (streamRafRef.current != null) {
+          cancelAnimationFrame(streamRafRef.current);
+          streamRafRef.current = null;
+        }
+        streamAssistantDirtyRef.current = false;
+        streamThoughtDirtyRef.current = false;
         // Finalize in place — keep buffer id so residual chunks still merge.
         // Only clear buffer on next UserMessageAppended.
-        sealThoughtLogLine();
-        if (assistantBuf.current.trim()) {
-          const sealed = assistantBuf.current;
-          const liveId = assistantLiveId.current;
-          setMessages((m) =>
-            collapseDuplicateAssistants(upsertAssistant(m, sealed, liveId))
-          );
-        } else {
-          // Empty done can still leave a trailing twin from a prior seal
-          setMessages((m) => collapseDuplicateAssistants(m));
-        }
+        const thoughtMs = sealThoughtDurationMs();
+        // ALWAYS flush thought buffer (even if assistant empty) — old path only
+        // flushed thought when assistantBuf non-empty and dropped last RAF frame.
+        const sealed = assistantBuf.current;
+        const liveId = assistantLiveId.current;
+        setMessages((m) => {
+          let next = paintThoughtToMessages(m, thoughtMs);
+          if (sealed.trim()) {
+            next = collapseDuplicateAssistants(
+              upsertAssistant(next, sealed, liveId)
+            );
+          } else {
+            next = collapseDuplicateAssistants(next);
+          }
+          return next;
+        });
+        // turn_log: tools only — Thought duration is on the thought item now
         pushTurnLog();
         {
           const t0 = turnStartedAtRef.current;
@@ -782,14 +1065,43 @@ export function useBridge() {
           turnStartedAtRef.current = null;
         }
         turnDoneRef.current = true;
+        // Hard clear UI "in flight" — residual AgentActivity must not keep Stop/Thinking
         setActivityPhase(null);
         setActivitySubagentModel(null);
         setStatusMsg(null);
+        if (event.sessionId) {
+          busyBySessionRef.current[event.sessionId] = false;
+        }
         // Keep fully-done To-dos visible with ✅ until the *next* user turn.
         // noteSessionBusy already cleared the map — sync, don't blanket setBusy(false)
         // (that used to clear busy while viewing another live session after a gate miss).
         syncBusyFromMap();
+        // Dual insurance: don't wait solely on signals watcher poll
+        {
+          const sid = event.sessionId || sessionIdRef.current;
+          const cwdNow =
+            cwd ||
+            (typeof localStorage !== "undefined"
+              ? localStorage.getItem("agent-pane-cwd") || ""
+              : "");
+          if (sid && cwdNow) {
+            const msgs =
+              sessionChatCacheRef.current.get(sid)?.messages ??
+              messagesRef.current;
+            window.setTimeout(() => {
+              if (sessionIdRef.current !== sid) return;
+              void refreshContextUsage({
+                sessionId: sid,
+                cwd: cwdNow,
+                messages: msgs,
+                stillCurrent: () => sessionIdRef.current === sid,
+                bootstrap: contextUsageRef.current,
+              });
+            }, 120);
+          }
+        }
         break;
+      }
 
       case "ToolStarted": {
         // CRITICAL: after MessageDone, never re-seal the finished assistant as
@@ -797,18 +1109,23 @@ export function useBridge() {
         if (turnDoneRef.current) {
           break;
         }
-        sealThoughtLogLine();
-        // Seal this thought bubble; further thinking after tools gets a new id
-        thoughtBufMap.current.delete(thoughtLiveId.current);
-        thoughtLiveId.current = `t-${event.sessionId}-pretool-${event.seq ?? Date.now()}`;
-        thoughtStartRef.current = null;
-        // Pre-tool speech stays a full assistant bubble (linear timeline).
-        // Next MessageChunks after tools open a new bubble.
+        // REAL flush: cancel RAF but write buffers into messages first.
+        // Old path cancelled RAF then deleted thoughtBuf → mid-sentence truncate.
+        if (streamRafRef.current != null) {
+          cancelAnimationFrame(streamRafRef.current);
+          streamRafRef.current = null;
+        }
+        streamAssistantDirtyRef.current = false;
+        streamThoughtDirtyRef.current = false;
+        const thoughtMs = sealThoughtDurationMs();
+
+        const tid = thoughtLiveId.current;
+        const thoughtText = (thoughtBufMap.current.get(tid) ?? "").trim();
+        // Keep text in map until painted, then rotate id for post-tool thinking
         const sealedBuf = assistantBuf.current;
         const liveId = assistantLiveId.current;
         if (sealedBuf.trim()) {
           assistantBuf.current = "";
-          setMessages((m) => sealAsAssistant(m, sealedBuf, liveId));
           assistantLiveId.current = `a-${event.sessionId}-mid-${event.seq ?? Date.now()}`;
         }
         postToolsAssistantId.current = null;
@@ -826,26 +1143,42 @@ export function useBridge() {
         });
 
         setMessages((m) => {
+          let next = m;
+          if (thoughtText) {
+            // Stamp wall-clock duration (true 12s), not char-count fake 1s
+            thoughtBufMap.current.set(tid, thoughtText);
+            next = paintThoughtToMessages(next, thoughtMs);
+            thoughtBufMap.current.delete(tid);
+          } else {
+            thoughtBufMap.current.delete(tid);
+          }
+          thoughtLiveId.current = `t-${event.sessionId}-pretool-${event.seq ?? Date.now()}`;
+          if (sealedBuf.trim()) {
+            next = sealAsAssistant(next, sealedBuf, liveId);
+          }
           const gid = toolsGroupId.current;
-          const next = [...m];
-          const idx = next.findIndex((x) => x.id === gid && x.kind === "tools");
-          if (idx >= 0 && next[idx].kind === "tools") {
+          const copy2 = [...next];
+          const idx = copy2.findIndex((x) => x.id === gid && x.kind === "tools");
+          if (idx >= 0 && copy2[idx]!.kind === "tools") {
             const tools = [
-              ...next[idx].tools.filter((t) => t.toolId !== row.toolId),
+              ...copy2[idx]!.tools.filter((t) => t.toolId !== row.toolId),
               row,
             ];
-            next[idx] = { kind: "tools", id: gid, tools };
+            copy2[idx] = { kind: "tools", id: gid, tools };
           } else {
-            // new tools group after sealed text
             toolsGroupId.current = `tools-${event.sessionId}-${event.seq ?? Date.now()}`;
-            next.push({
+            copy2.push({
               kind: "tools",
               id: toolsGroupId.current,
               tools: [row],
             });
           }
-          return next;
+          return copy2;
         });
+        // Rotate thought id after paint when setMessages didn't (empty thought)
+        if (!thoughtText) {
+          thoughtLiveId.current = `t-${event.sessionId}-pretool-${event.seq ?? Date.now()}`;
+        }
         break;
       }
 
@@ -887,21 +1220,33 @@ export function useBridge() {
         break;
 
       case "AgentActivity": {
-        // Residual activity after the turn sealed must not re-open Stop / busy
+        const text = event.text?.trim() || null;
+        const phase = event.phase ?? (text ? "working" : null);
+        // After seal: still apply CLEARS (null text) so Thinking/Stop cannot stick
+        // if idle arrives after MessageDone or MessageDone was reordered.
         if (turnDoneRef.current && !replayingRef.current) {
+          if (text == null || phase === "idle") {
+            setStatusMsg(null);
+            setActivityPhase(null);
+            setActivitySubagentModel(null);
+          }
           break;
         }
-        const text = event.text?.trim() || null;
         setStatusMsg(text);
-        const phase = event.phase ?? (text ? "working" : null);
-        setActivityPhase(text ? phase : null);
-        const subagentModel =
-          typeof event.subagentModel === "string"
-            ? event.subagentModel.trim()
-            : event.agentKind === "subagent" && typeof event.model === "string"
-              ? event.model.trim()
-              : "";
-        setActivitySubagentModel(subagentModel || null);
+        // phase "idle" or empty text → clear strip (not "working")
+        if (text == null || phase === "idle") {
+          setActivityPhase(null);
+          setActivitySubagentModel(null);
+        } else {
+          setActivityPhase(phase);
+          const subagentModel =
+            typeof event.subagentModel === "string"
+              ? event.subagentModel.trim()
+              : event.agentKind === "subagent" && typeof event.model === "string"
+                ? event.model.trim()
+                : "";
+          setActivitySubagentModel(subagentModel || null);
+        }
         // Keep busy/isLive aligned while a tool process is reporting
         if (
           event.sessionId &&
@@ -1111,10 +1456,7 @@ export function useBridge() {
         const finishUi = (built: ChatItem[] | null) => {
           if (built) {
             if (sid) {
-              sessionChatCacheRef.current.set(sid, {
-                messages: built.slice(),
-                at: Date.now(),
-              });
+              setSessionCacheMessages(sid, built.slice());
             }
             paintWindowed(built);
             messagesRef.current = built;
@@ -1187,6 +1529,9 @@ export function useBridge() {
     syncBusyFromMap,
     paintWindowed,
     isTaskSettled,
+    refreshContextUsage,
+    cwd,
+    setSessionCacheMessages,
   ]);
 
   useEffect(() => {
@@ -1472,6 +1817,20 @@ export function useBridge() {
         stashSessionChat(prevId);
       }
 
+      // Kill live stream paints from the PREVIOUS session. Without this, a
+      // pending rAF still runs setMessages(upsertAssistant from A) after B
+      // was painted — classic "sidebar says B, chat still A / click no-op".
+      if (streamRafRef.current != null) {
+        cancelAnimationFrame(streamRafRef.current);
+        streamRafRef.current = null;
+      }
+      streamAssistantDirtyRef.current = false;
+      streamThoughtDirtyRef.current = false;
+      assistantBuf.current = "";
+      thoughtBufMap.current.clear();
+      postToolsAssistantId.current = null;
+      thoughtStartRef.current = null;
+
       // Pin active session immediately so in-flight WS from other sessions is ignored
       pendingAttachRef.current = null;
       sessionIdRef.current = histSessionId;
@@ -1482,7 +1841,9 @@ export function useBridge() {
       setStatusMsg(null);
       setActivityPhase(null);
       setActivitySubagentModel(null);
-      setContextUsage(null);
+      // Do NOT blindly clear the ring — paint cached usage first (P0).
+      const cachedEarly = sessionChatCacheRef.current.get(histSessionId);
+      setContextUsage(cachedEarly?.contextUsage ?? null);
       setBusy(!!busyBySessionRef.current[histSessionId]);
       pendingPromptRef.current = null;
       setHiddenHistoryCount(0);
@@ -1502,12 +1863,22 @@ export function useBridge() {
           !!busyBySessionRef.current[histSessionId];
         setHistoryOnly(!stillLive);
         setBusy(!!busyBySessionRef.current[histSessionId]);
-        turnDoneRef.current = !stillLive;
+        // turnDone = this session not mid-prompt — NOT "process still in liveSessionIds"
+        // (live-idle used to reopen turnDone and let residual Thinking stick Stop)
+        turnDoneRef.current = !busyBySessionRef.current[histSessionId];
         seenSeq.current.clear();
         setCwd(histCwd);
         localStorage.setItem("agent-pane-cwd", histCwd);
+        // Always refresh usage (history-only used to early-return with no ring).
+        void refreshContextUsage({
+          sessionId: histSessionId,
+          cwd: histCwd,
+          messages: cached.messages,
+          stillCurrent,
+          bootstrap: cached.contextUsage ?? null,
+        });
         if (!stillLive) {
-          // History-only: memory is enough. Skip multi‑MB re-parse.
+          // History-only: skip multi‑MB re-parse; usage already refreshing.
           return;
         }
         // Live: paint cache now. Debounced catch-up — rapid A↔B must not
@@ -1529,9 +1900,12 @@ export function useBridge() {
                 shouldContinue: stillCurrent,
               });
               if (!built || !stillCurrent()) return;
+              const prevU =
+                sessionChatCacheRef.current.get(histSessionId)?.contextUsage;
               sessionChatCacheRef.current.set(histSessionId, {
                 messages: built.slice(),
                 at: Date.now(),
+                contextUsage: prevU ?? contextUsageRef.current,
               });
               paintWindowed(built);
             } catch {
@@ -1541,8 +1915,9 @@ export function useBridge() {
         }, 450);
         return;
       } else if (prevId !== histSessionId) {
+        // Keep previous session on screen until fetch paints (no empty flash).
+        // Only suppress live WS for the target id while loading.
         suppressPaintRef.current = histSessionId;
-        setMessages([]);
         setTasks([]);
         setDiffs([]);
         setPermissions([]);
@@ -1550,6 +1925,9 @@ export function useBridge() {
         suppressPaintRef.current = histSessionId;
       }
 
+      // Track whether this gen still owns suppressPaint — abort mid-load used
+      // to leave suppress stuck and make subsequent sidebar clicks "dead".
+      let paintedOk = false;
       try {
         const {
           fetchSessionEvents,
@@ -1574,6 +1952,7 @@ export function useBridge() {
           invalidateHistoryClientCache(histSessionId);
           if (!stillCurrent()) return;
           suppressPaintRef.current = null;
+          paintedOk = true;
           setBusy(false);
           setError("Session is gone or empty — removed from history");
           return { scrubbed: true };
@@ -1613,91 +1992,51 @@ export function useBridge() {
         sessionChatCacheRef.current.set(histSessionId, {
           messages: built.slice(),
           at: Date.now(),
+          contextUsage:
+            sessionChatCacheRef.current.get(histSessionId)?.contextUsage ??
+            null,
         });
         paintWindowed(built);
 
         // Paint chat first — usage fetch must NOT retain the events array
         suppressPaintRef.current = null;
+        paintedOk = true;
         const stillLive =
           liveSessionIdsRef.current.includes(histSessionId) ||
           !!busyBySessionRef.current[histSessionId];
         setHistoryOnly(!stillLive);
         setBusy(!!busyBySessionRef.current[histSessionId]);
+        turnDoneRef.current = !busyBySessionRef.current[histSessionId];
 
-        void (async () => {
-          if (!stillCurrent()) return;
-          const { estimateMessagesTokens } = await import("./contextUsage");
-          if (!stillCurrent()) return;
-          const estimated = estimateMessagesTokens(built);
-          const fallbackSize = 500_000;
-          let lastUsage: {
-            used: number;
-            size: number;
-            source:
-              | "acp"
-              | "compact"
-              | "compact_done"
-              | "signals"
-              | "session_info"
-              | "estimate";
-            at?: string;
-            pct?: number;
-          } | null = null;
-          try {
-            const { fetchContextUsage } = await import("./api");
-            // Server resolves: live provider → meta.providerSessionId
-            const u = await fetchContextUsage({
-              sessionId: histSessionId,
-              cwd: histCwd,
-            });
-            if (!stillCurrent()) return;
-            if (u) {
-              const signalsTooSmall =
-                estimated > 8_000 && u.used + 2_000 < estimated * 0.5;
-              if (signalsTooSmall) {
-                lastUsage = {
-                  used: estimated,
-                  size: u.size > 0 ? u.size : fallbackSize,
-                  source: "estimate",
-                  pct: Math.min(
-                    100,
-                    Math.round(
-                      (estimated / (u.size > 0 ? u.size : fallbackSize)) * 100
-                    )
-                  ),
-                };
-              } else {
-                lastUsage = {
-                  used: u.used,
-                  size: u.size,
-                  source: u.source,
-                  pct: u.pct,
-                };
-              }
-            }
-          } catch {
-            /* ignore */
-          }
-          if (!lastUsage && estimated > 0) {
-            lastUsage = {
-              used: estimated,
-              size: fallbackSize,
-              source: "estimate",
-              pct: Math.min(100, Math.round((estimated / fallbackSize) * 100)),
-            };
-          }
-          if (!stillCurrent()) return;
-          setContextUsage(lastUsage);
-        })();
+        void refreshContextUsage({
+          sessionId: histSessionId,
+          cwd: histCwd,
+          messages: built,
+          stillCurrent,
+          bootstrap:
+            sessionChatCacheRef.current.get(histSessionId)?.contextUsage ??
+            null,
+        });
       } catch (e) {
         if (signal?.aborted || !stillCurrent()) return;
         suppressPaintRef.current = null;
+        paintedOk = true;
         replayingRef.current = false;
         setBusy(false);
         setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        // Abort / superseded mid-load: release suppress if we still own it.
+        // Without this, live WS for the session is paint-gated forever.
+        if (
+          !paintedOk &&
+          gen === openHistGenRef.current &&
+          suppressPaintRef.current === histSessionId
+        ) {
+          suppressPaintRef.current = null;
+        }
       }
     },
-    [stashSessionChat]
+    [stashSessionChat, refreshContextUsage]
   );
 
   const prompt = useCallback(
@@ -1840,10 +2179,7 @@ export function useBridge() {
       // Optimistic UI truncate (Claude-style) — don't wait for SessionRewound
       // or Retry looks like a plain re-send when the event is delayed/gated.
       const nextFull = sliceMessagesBeforeUserTurn(full, userTurnIndex);
-      sessionChatCacheRef.current.set(sid, {
-        messages: nextFull.slice(),
-        at: Date.now(),
-      });
+      setSessionCacheMessages(sid, nextFull.slice());
       paintWindowed(nextFull);
       messagesRef.current = nextFull;
       setTasks([]);

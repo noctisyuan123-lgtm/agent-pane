@@ -39,6 +39,10 @@ import {
   renderSettledTurnBody,
 } from "./LiveProcessStack";
 import { groupChatIntoTurns, thoughtLabel } from "./TurnBlocks";
+import {
+  registerChatStickRelease,
+  releaseChatStickForInspect,
+} from "./chatScrollStick";
 import type { ChatItem } from "./chatFromEvents";
 import {
   deleteSessionApi,
@@ -118,6 +122,29 @@ function folderName(p: string): string {
   return parts[parts.length - 1] || p;
 }
 
+/**
+ * Bottom of *real* content inside a live turn (scrollport coordinates).
+ * Skips the paper spacer so blank reserve is never treated as "overflow".
+ */
+function paperContentBottom(
+  turn: HTMLElement,
+  chat: HTMLElement
+): number {
+  const chatTop = chat.getBoundingClientRect().top;
+  let maxBottom = turn.getBoundingClientRect().top - chatTop + chat.scrollTop;
+  for (const node of turn.children) {
+    if (!(node instanceof HTMLElement)) continue;
+    if (node.classList.contains("chat-turn-paper-spacer")) continue;
+    const r = node.getBoundingClientRect();
+    const bottom = r.bottom - chatTop + chat.scrollTop;
+    if (bottom > maxBottom) maxBottom = bottom;
+  }
+  return maxBottom;
+}
+
+/** Cursor-ish: reserve ~28% of the chat viewport below the write line. */
+const PAPER_RESERVE_RATIO = 0.28;
+
 function truncateOneLine(text: string, max = 72): string {
   const t = text.replace(/\s+/g, " ").trim();
   if (t.length <= max) return t;
@@ -131,6 +158,8 @@ function truncateOneLine(text: string, max = 72): string {
 function findRunningTool(messages: ChatItem[]): {
   label: string;
   title: string;
+  kind: string;
+  name: string;
 } | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
@@ -140,31 +169,87 @@ function findRunningTool(messages: ChatItem[]): {
     const raw = running.label?.trim() || "";
     if (!raw) continue;
     const title = raw.replace(/^Ran\s+/i, "").trim() || raw;
-    return { label: raw, title };
+    return {
+      label: raw,
+      title,
+      kind: running.kind || "other",
+      name: running.name || "",
+    };
   }
   return null;
 }
 
 /**
- * External process block (tools / subagents) — excludes sister-only thinking.
- * Particles + outline + detail only when this is true.
+ * Composer RunningDock only for "long external work":
+ * subagents, shell/execute, sleeping terminal — NOT every Read/Grep flash.
  */
-function hasExternalProcess(
+function isDockWorthyRunningTool(t: {
+  kind?: string;
+  name?: string;
+  label?: string;
+}): boolean {
+  const kind = (t.kind || "").toLowerCase();
+  const blob = `${t.name || ""} ${t.label || ""}`;
+  if (kind === "execute") return true;
+  if (kind === "sleeping") return true;
+  // Subagent / task spawn tools (ACP titles vary)
+  if (
+    /subagent|spawn_subagent|Task\b|task_tool|dispatch|browser|playwright|mcp/i.test(
+      blob
+    )
+  ) {
+    return true;
+  }
+  // Long shell-looking labels
+  if (/^Ran\s+/i.test(t.label || "") || /^Running\s+/i.test(t.label || "")) {
+    return true;
+  }
+  // Explicitly skip flash tools
+  if (
+    kind === "read" ||
+    kind === "search" ||
+    kind === "edit" ||
+    kind === "write"
+  ) {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Show RunningDock above composer — subagent / long script only.
+ * Quick Read·Grep·Edit stay off the dock (timeline L1 is enough).
+ */
+function hasDockWorthyProcess(
   messages: ChatItem[],
   phase: string | null | undefined,
   statusMsg: string | null,
   subagentModel: string | null | undefined
 ): boolean {
   if (subagentModel?.trim()) return true;
-  if (findRunningTool(messages)) return true;
-  if (phase === "tool" || phase === "sleeping" || phase === "permission") {
-    return true;
-  }
+  if (phase === "sleeping") return true;
+  // Permission waits can be long — keep dock
+  if (phase === "permission") return true;
   if (
     statusMsg != null &&
-    /^(Running|Using|Calling|Permission|Queued:)/i.test(statusMsg)
+    /^(Running|Permission|Queued:|Calling spawn|Calling task)/i.test(statusMsg)
   ) {
-    return true;
+    // "Using read_file…" / "Calling grep" → no dock
+    if (/^(Using|Calling)\s+/i.test(statusMsg) && !/spawn|task|subagent|bash|shell|terminal|execute/i.test(statusMsg)) {
+      return false;
+    }
+    if (/^(Using|Calling)\s+/i.test(statusMsg) && /spawn|task|subagent|bash|shell|terminal|execute/i.test(statusMsg)) {
+      return true;
+    }
+    if (/^Running\b/i.test(statusMsg)) return true;
+    if (/^Permission\b/i.test(statusMsg)) return true;
+  }
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.kind !== "tools") continue;
+    for (const t of m.tools) {
+      if (t.status === "running" && isDockWorthyRunningTool(t)) return true;
+    }
   }
   return false;
 }
@@ -180,26 +265,31 @@ function activityOutline(
     const inProg = tasks.find((t) => t.status === "in_progress");
     if (inProg?.content?.trim()) return truncateOneLine(inProg.content);
   }
-  const running = findRunningTool(messages);
-  if (running) return truncateOneLine(running.title);
-  const inProg = tasks.find((t) => t.status === "in_progress");
-  if (inProg?.content?.trim()) return truncateOneLine(inProg.content);
-  // Last completed tool title while still in tool phase (brief gap)
+  // Prefer dock-worthy running tools (shell/subagent), not flash Read/Grep
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
-    if (m.kind === "tools" && m.tools.length) {
-      const tool = m.tools[m.tools.length - 1]!;
-      const label = tool.label?.trim();
-      if (label) {
-        return truncateOneLine(label.replace(/^Ran\s+/i, "").trim() || label);
-      }
+    if (m.kind !== "tools") continue;
+    const running = [...m.tools]
+      .reverse()
+      .find((t) => t.status === "running" && isDockWorthyRunningTool(t));
+    if (running) {
+      const title = (running.label || running.name || "tool")
+        .replace(/^Ran\s+/i, "")
+        .trim();
+      return truncateOneLine(title);
     }
   }
+  const running = findRunningTool(messages);
+  if (running && isDockWorthyRunningTool(running)) {
+    return truncateOneLine(running.title);
+  }
+  const inProg = tasks.find((t) => t.status === "in_progress");
+  if (inProg?.content?.trim()) return truncateOneLine(inProg.content);
   return "Working…";
 }
 
 /**
- * Live running tools / scripts / subagents for the particle strip expand list.
+ * Live list for RunningDock expand — same filter as hasDockWorthyProcess.
  */
 function collectRunningProcessItems(
   messages: ChatItem[],
@@ -225,18 +315,10 @@ function collectRunningProcessItems(
     if (m.kind !== "tools") continue;
     for (const t of m.tools) {
       if (t.status !== "running") continue;
+      if (!isDockWorthyRunningTool(t)) continue;
       if (seen.has(t.toolId)) continue;
       seen.add(t.toolId);
-      const kind =
-        t.kind === "execute"
-          ? "script"
-          : t.kind === "search"
-            ? "search"
-            : t.kind === "read"
-              ? "read"
-              : t.kind === "edit"
-                ? "edit"
-                : "tool";
+      const kind = t.kind === "execute" ? "script" : "tool";
       items.push({
         id: t.toolId,
         kind,
@@ -246,7 +328,6 @@ function collectRunningProcessItems(
     }
   }
 
-  // Newest first in messages walk was reverse tools groups; keep stable list order
   return items;
 }
 
@@ -601,8 +682,24 @@ export function App() {
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const chatRef = useRef<HTMLElement | null>(null);
+  /** Live turn root — min-height "paper" + scroll anchor for user bubble */
+  const liveTurnRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * Paper mode (Cursor-style): user bubble *bottom* sits at the write-line
+   * (~mid-lower viewport), with ~1/4–1/3 viewport empty below for the model
+   * to fill top→down — not flush-to-top, not toothpaste stick-bottom.
+   */
+  const paperModeRef = useRef(false);
+  /** Only re-snap anchor once per send (not every MessageChunk). */
+  const paperAnchoredRef = useRef(false);
+  /** Spacer px last applied — used to cancel jump when turn settles. */
+  const paperSpacerPxRef = useRef(0);
   /** Follow new output only while user is pinned near the bottom. */
   const stickToBottomRef = useRef(true);
+  /** Bottom reserve height (px) under the write-line. */
+  const [paperReservePx, setPaperReservePx] = useState(200);
+  /** Coalesce paper scroll layout to 1×/frame. */
+  const paperLayoutRafRef = useRef<number | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const plusBtnRef = useRef<HTMLButtonElement>(null);
@@ -612,18 +709,11 @@ export function App() {
   createFn.current = b.createSession;
 
   const hasMessages = b.messages.length > 0;
-  /** Stop whenever a turn looks in-flight — don't require !historyOnly (that hid Stop). */
-  const showStop =
-    hasMessages &&
-    !b.resuming &&
-    (b.busy ||
-      b.activityPhase === "working" ||
-      b.activityPhase === "thinking" ||
-      b.activityPhase === "tool" ||
-      b.activityPhase === "permission" ||
-      b.activityPhase === "compact" ||
-      b.activityPhase === "queue" ||
-      b.activityPhase === "sleeping");
+  /**
+   * Stop only while session is busy. Do NOT key off activityPhase alone —
+   * residual "thinking" after MessageDone kept Stop forever (regression).
+   */
+  const showStop = hasMessages && !b.resuming && b.busy;
   /** 有消息才进对话布局；空会话/新会话 = Cursor 式居中 Home */
   const showHome = !hasMessages;
   // Home hero: always roomy toolbar row (model bottom-left); follow-up uses auto crowded
@@ -898,49 +988,214 @@ export function App() {
   const NEAR_BOTTOM_PX = 48;
   /** Re-pin only when truly at bottom (hysteresis — avoids 一抽一抽). */
   const REPIN_BOTTOM_PX = 16;
+  /** Last chat scrollHeight — pin only on growth (fold shrink must not thrash). */
+  const chatScrollHeightRef = useRef(0);
 
   const scrollChatToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
     const el = chatRef.current;
     if (!el) return;
+    paperModeRef.current = false;
     if (behavior === "smooth") {
       bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
     } else {
       // Instant — smooth + streaming = 一抽一抽
       el.scrollTop = el.scrollHeight;
     }
+    chatScrollHeightRef.current = el.scrollHeight;
     setShowJumpBottom(false);
   }, []);
 
-  const pinChatToBottom = useCallback(() => {
-    stickToBottomRef.current = true;
-    // After send, DOM grows on next paint — pin now and once more after layout
-    scrollChatToBottom("auto");
+  /**
+   * Cursor write-line: place user bubble *bottom* so ~paperReserve of the
+   * viewport stays empty below (about 28% ≈ between 1/4 and 1/3).
+   */
+  const anchorUserToWriteLine = useCallback(() => {
+    stickToBottomRef.current = false;
+    paperModeRef.current = true;
+    paperAnchoredRef.current = false;
+    setShowJumpBottom(false);
+    const run = () => {
+      const chat = chatRef.current;
+      const turn = liveTurnRef.current;
+      if (!chat || !turn) return;
+      const user = turn.querySelector(".msg.user") as HTMLElement | null;
+      if (!user) return;
+      const bubble =
+        (user.querySelector(".bubble") as HTMLElement | null) || user;
+      const chatRect = chat.getBoundingClientRect();
+      const reserve = Math.max(
+        120,
+        Math.round(chat.clientHeight * PAPER_RESERVE_RATIO)
+      );
+      paperSpacerPxRef.current = reserve;
+      // Target: bubble bottom sits at write-line (above the reserved band)
+      const targetBottomY = chatRect.top + chat.clientHeight - reserve;
+      const bubbleBottom = bubble.getBoundingClientRect().bottom;
+      const delta = bubbleBottom - targetBottomY;
+      if (Math.abs(delta) > 0.5) {
+        chat.scrollTop += delta;
+      }
+      // Keep bubble fully visible (don't shove top under chrome)
+      const topAfter =
+        bubble.getBoundingClientRect().top - chat.getBoundingClientRect().top;
+      if (topAfter < 4) {
+        chat.scrollTop += topAfter - 4;
+      }
+      paperAnchoredRef.current = true;
+      chatScrollHeightRef.current = chat.scrollHeight;
+    };
     requestAnimationFrame(() => {
-      if (stickToBottomRef.current) scrollChatToBottom("auto");
+      requestAnimationFrame(run);
     });
-  }, [scrollChatToBottom]);
+  }, []);
 
-  // Stream / layout growth: stick only if user hasn't scrolled away
-  useLayoutEffect(() => {
-    if (!hasMessages) return;
-    if (!stickToBottomRef.current) {
+  // Measure reserve band (~28% of chat viewport)
+  useEffect(() => {
+    const el = chatRef.current;
+    if (!el || !hasMessages) return;
+    const measure = () => {
+      setPaperReservePx(
+        Math.max(120, Math.round(el.clientHeight * PAPER_RESERVE_RATIO))
+      );
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [hasMessages, showHome]);
+
+  // Expanding L1/Worked-for/tools while thinking streams must release pin
+  // (otherwise height growth forces 一键到底 over the fold the user opened).
+  useEffect(() => {
+    registerChatStickRelease(() => {
+      stickToBottomRef.current = false;
+      paperModeRef.current = false;
       const el = chatRef.current;
       if (el) {
         const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
         setShowJumpBottom(dist > REPIN_BOTTOM_PX);
+      } else {
+        setShowJumpBottom(true);
       }
-      return;
-    }
-    scrollChatToBottom("auto");
-  }, [b.messages, b.diffs, b.tasks, b.statusMsg, b.busy, hasMessages, scrollChatToBottom]);
+    });
+    return () => registerChatStickRelease(null);
+  }, []);
 
-  // User scroll / wheel: release stick when reading history
+  // Stream growth — rAF-coalesced.
+  // paper: keep *content bottom* above the reserve band (write-line floor)
+  // stick: classic pin to bottom
+  useLayoutEffect(() => {
+    if (!hasMessages) return;
+    if (paperLayoutRafRef.current != null) return;
+    paperLayoutRafRef.current = requestAnimationFrame(() => {
+      paperLayoutRafRef.current = null;
+      const el = chatRef.current;
+      if (!el) return;
+      const h = el.scrollHeight;
+      const prevH = chatScrollHeightRef.current;
+      chatScrollHeightRef.current = h;
+
+      if (paperModeRef.current) {
+        const turn = liveTurnRef.current;
+        if (turn) {
+          const contentBottom = paperContentBottom(turn, el);
+          // Write floor = bottom of viewport minus reserve (plus tiny margin)
+          const reserve = paperSpacerPxRef.current || paperReservePx;
+          const writeFloor =
+            el.scrollTop + el.clientHeight - Math.min(reserve, el.clientHeight * 0.2);
+          if (contentBottom > writeFloor) {
+            el.scrollTop += contentBottom - writeFloor;
+          }
+        }
+        setShowJumpBottom(false);
+        return;
+      }
+
+      if (!stickToBottomRef.current) {
+        const dist = h - el.scrollTop - el.clientHeight;
+        setShowJumpBottom(dist > REPIN_BOTTOM_PX);
+        return;
+      }
+      if (h > prevH || prevH === 0) {
+        el.scrollTop = el.scrollHeight;
+        setShowJumpBottom(false);
+      } else if (h < prevH) {
+        el.scrollTop = el.scrollHeight;
+        setShowJumpBottom(false);
+      }
+    });
+    return () => {
+      if (paperLayoutRafRef.current != null) {
+        cancelAnimationFrame(paperLayoutRafRef.current);
+        paperLayoutRafRef.current = null;
+      }
+    };
+  }, [b.messages, b.diffs, b.tasks, b.statusMsg, b.busy, hasMessages, paperReservePx]);
+
+  // End of turn: drop spacer without "short reply falls from top".
+  // Compensate scrollHeight loss so on-screen content stays put.
+  const wasBusyRef = useRef(false);
+  useLayoutEffect(() => {
+    const was = wasBusyRef.current;
+    wasBusyRef.current = b.busy;
+    if (was && !b.busy) {
+      const el = chatRef.current;
+      const spacerH = paperSpacerPxRef.current;
+      paperModeRef.current = false;
+      paperAnchoredRef.current = false;
+      paperSpacerPxRef.current = 0;
+      if (el && spacerH > 0) {
+        // Spacer sat below content; removing it shrinks scrollHeight.
+        // Keep visual position of content by clamping scrollTop.
+        const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+        if (el.scrollTop > maxScroll) {
+          el.scrollTop = maxScroll;
+        }
+        chatScrollHeightRef.current = el.scrollHeight;
+      }
+    }
+  }, [b.busy]);
+
+  // One-shot write-line re-snap when user bubble mounts late
+  useLayoutEffect(() => {
+    if (!paperModeRef.current || !b.busy || paperAnchoredRef.current) return;
+    const chat = chatRef.current;
+    const turn = liveTurnRef.current;
+    const user = turn?.querySelector(".msg.user") as HTMLElement | null;
+    if (!chat || !user) return;
+    const bubble =
+      (user.querySelector(".bubble") as HTMLElement | null) || user;
+    const chatRect = chat.getBoundingClientRect();
+    const reserve = Math.max(
+      120,
+      Math.round(chat.clientHeight * PAPER_RESERVE_RATIO)
+    );
+    paperSpacerPxRef.current = reserve;
+    const targetBottomY = chatRect.top + chat.clientHeight - reserve;
+    const bubbleBottom = bubble.getBoundingClientRect().bottom;
+    const delta = bubbleBottom - targetBottomY;
+    if (Math.abs(delta) > 8) {
+      chat.scrollTop += delta;
+      const topAfter =
+        bubble.getBoundingClientRect().top - chat.getBoundingClientRect().top;
+      if (topAfter < 4) chat.scrollTop += topAfter - 4;
+      chatScrollHeightRef.current = chat.scrollHeight;
+    }
+    paperAnchoredRef.current = true;
+  }, [b.messages.length, b.busy, paperReservePx]);
+
+  // User scroll / wheel: release paper + stick when reading history
   useEffect(() => {
     const el = chatRef.current;
     if (!el || !hasMessages) return;
 
     const syncStickFromPosition = () => {
       const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (paperModeRef.current) {
+        // In paper mode, small drifts are fine; only clear jump button
+        setShowJumpBottom(dist > REPIN_BOTTOM_PX + 80);
+        return;
+      }
       if (stickToBottomRef.current) {
         // Already following — only unpin after clearly leaving the bottom
         if (dist > NEAR_BOTTOM_PX) {
@@ -952,6 +1207,7 @@ export function App() {
       } else if (dist <= REPIN_BOTTOM_PX) {
         // Was reading history — re-pin only when they scroll all the way down
         stickToBottomRef.current = true;
+        paperModeRef.current = false;
         setShowJumpBottom(false);
       } else {
         setShowJumpBottom(true);
@@ -959,9 +1215,10 @@ export function App() {
     };
 
     const onWheel = (e: WheelEvent) => {
-      // Intentional upward gesture → release immediately (don't wait for threshold)
+      // Intentional upward gesture → release paper + stick (reading trail)
       if (e.deltaY < 0) {
         stickToBottomRef.current = false;
+        paperModeRef.current = false;
         setShowJumpBottom(true);
       }
     };
@@ -981,6 +1238,7 @@ export function App() {
   }, [hasMessages]);
 
   const jumpBottom = () => {
+    paperModeRef.current = false;
     stickToBottomRef.current = true;
     scrollChatToBottom("smooth");
   };
@@ -1257,8 +1515,8 @@ export function App() {
       return;
     }
 
-    // Sending → always pin chat to bottom (don't fight user later if they scroll up)
-    pinChatToBottom();
+    // Sending → Cursor write-line: user bubble bottom mid-lower, reserve below
+    anchorUserToWriteLine();
 
     // History-only / agent died after idle: resume SAME session, then send
     if (b.sessionId && b.historyOnly) {
@@ -1343,23 +1601,46 @@ export function App() {
   };
 
   const histAbortRef = useRef<AbortController | null>(null);
+  /** Dedupe pointerdown+click; also coalesce same-session while in-flight. */
+  const histOpenDedupeRef = useRef<{ id: string; at: number } | null>(null);
+  const histInFlightIdRef = useRef<string | null>(null);
   const openHist = (sessionId: string, cwd: string) => {
-    // Expand target folder without collapsing others / without forcing a remount
-    // when already open (pointerdown→setState was swallowing the click).
-    setExpandedCwd((prev) => (prev[cwd] ? prev : { ...prev, [cwd]: true }));
-    setSidebarSelectedId((prev) => (prev === sessionId ? prev : sessionId));
-    // Cancel in-flight history load — rapid multi-click was stacking fetches
-    // and feeling like a freeze.
+    const now = Date.now();
+    const prev = histOpenDedupeRef.current;
+    // Same session within 200ms = pointerdown then click → one open only.
+    if (prev && prev.id === sessionId && now - prev.at < 200) {
+      return;
+    }
+    // Already loading this session — don't abort ourselves (was "need 2 clicks")
+    if (histInFlightIdRef.current === sessionId) {
+      setSidebarSelectedId(sessionId);
+      return;
+    }
+    histOpenDedupeRef.current = { id: sessionId, at: now };
+
+    // Expand target folder without collapsing others.
+    setExpandedCwd((m) => (m[cwd] ? m : { ...m, [cwd]: true }));
+    setSidebarSelectedId(sessionId);
+    // Cancel *other* session loads only
     histAbortRef.current?.abort();
     const ac = new AbortController();
     histAbortRef.current = ac;
+    histInFlightIdRef.current = sessionId;
     void (async () => {
-      const result = await b.openHistorySession(sessionId, cwd, ac.signal);
-      if (ac.signal.aborted) return;
-      // Only refresh sidebar when a zombie session was scrubbed
-      if (result?.scrubbed) {
-        invalidateHistoryClientCache(sessionId);
-        void refreshLists(true);
+      try {
+        const result = await b.openHistorySession(sessionId, cwd, ac.signal);
+        if (ac.signal.aborted) return;
+        if (result?.scrubbed) {
+          invalidateHistoryClientCache(sessionId);
+          void refreshLists(true);
+        }
+      } catch (e) {
+        if (ac.signal.aborted) return;
+        console.warn("[agent-pane] openHist failed", e);
+      } finally {
+        if (histInFlightIdRef.current === sessionId) {
+          histInFlightIdRef.current = null;
+        }
       }
     })();
   };
@@ -1728,7 +2009,7 @@ export function App() {
     b.activitySubagentModel,
     b.statusMsg
   );
-  const showRunningDock = hasExternalProcess(
+  const showRunningDock = hasDockWorthyProcess(
     b.messages,
     b.activityPhase,
     b.statusMsg,
@@ -2401,10 +2682,9 @@ export function App() {
                     type="button"
                     className="session-main"
                     onPointerDown={(e) => {
-                      // Open on pointerdown — a prior setState here remounted the
-                      // row and dropped the subsequent click (multi-click stuck).
+                      // Open on pointerdown for snappy feel; dedupe absorbs click.
+                      // Do NOT preventDefault — that used to drop focus/click races.
                       if (e.button !== 0) return;
-                      e.preventDefault();
                       openHist(s.sessionId, s.cwd);
                     }}
                     onClick={() => openHist(s.sessionId, s.cwd)}
@@ -2522,7 +2802,6 @@ export function App() {
                           className="session-main"
                           onPointerDown={(e) => {
                             if (e.button !== 0) return;
-                            e.preventDefault();
                             openHist(s.sessionId, s.cwd);
                           }}
                           onClick={() => openHist(s.sessionId, s.cwd)}
@@ -2769,16 +3048,33 @@ export function App() {
                   if (m.kind === "thought") {
                     const preview = m.text.trim();
                     if (!preview) return null;
-                    // Live stack: labeled fold. L1 pack embeds body only via
-                    // ProcessPackFold (skips this branch for thoughts).
-                    const label = thoughtLabel(preview);
+                    // Prefer wall-clock durationMs (true); never char-count fake.
+                    const label = thoughtLabel(preview, m.durationMs);
+                    const body = m.text.trim();
+                    const upstreamCut =
+                      (body.endsWith("...") || body.endsWith("…")) &&
+                      body.length <= 220 &&
+                      !/[.!?。！？]\s*$/.test(
+                        body.replace(/\.\.\.$|…$/u, "").trim()
+                      );
                     return (
-                      <details className="tl-thought" key={m.id}>
+                      <details
+                        className="tl-thought"
+                        key={m.id}
+                        onToggle={() => releaseChatStickForInspect()}
+                      >
                         <summary>
                           <span className="tl-meta-label">{label}</span>
                           <span className="tl-meta-chev">▾</span>
                         </summary>
-                        <div className="tl-thought-body">{m.text}</div>
+                        <div className="tl-thought-body">
+                          {m.text}
+                          {upstreamCut ? (
+                            <div className="tl-thought-truncated-note">
+                              思维链被上游截断（约 200 字），不是界面折叠裁切
+                            </div>
+                          ) : null}
+                        </div>
                       </details>
                     );
                   }
@@ -2807,9 +3103,14 @@ export function App() {
                     if (turn.process.some((x) => x.kind === "tools")) {
                       return null;
                     }
+                    // Drop ◆ Thought for Xs — duration is on thought bubbles now
+                    const lines = m.lines.filter(
+                      (line) => !/^Thought for\b/i.test(line.text)
+                    );
+                    if (!lines.length) return null;
                     return (
                       <div className="turn-log" key={m.id}>
-                        {m.lines.map((line, i) => (
+                        {lines.map((line, i) => (
                           <div
                             key={`${m.id}-${i}`}
                             className={`turn-log-line ${line.tone}`}
@@ -2854,11 +3155,16 @@ export function App() {
 
                 const user = turn.user;
                 return (
-                  <div className="chat-turn" key={turn.key}>
+                  <div
+                    className={`chat-turn${turn.isLive ? " chat-turn-live" : ""}`}
+                    key={turn.key}
+                    ref={turn.isLive ? liveTurnRef : undefined}
+                  >
                     {user && (
                       <div
                         className={`msg user${showMsgActions ? "" : " no-actions"}`}
                         key={user.id}
+                        data-paper-anchor="user"
                       >
                         <div className="label-row">
                           <div className="label">You</div>
@@ -2955,6 +3261,16 @@ export function App() {
                         )}
                       </div>
                     )}
+                    {/* Cursor reserve band: empty write space under content
+                        (~1/4–1/3 viewport). Not min-height on whole turn —
+                        short replies won't "fall from the top" when removed. */}
+                    {turn.isLive ? (
+                      <div
+                        className="chat-turn-paper-spacer"
+                        aria-hidden
+                        style={{ height: paperReservePx }}
+                      />
+                    ) : null}
                   </div>
                 );
               })}

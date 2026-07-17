@@ -3782,6 +3782,22 @@ html.is-tauri {
   margin: 0;
 }
 
+/*
+ * Live turn: spacer child holds ~28% viewport as write reserve.
+ * Process stack is a fixed-height "mini window" so trail swaps don't
+ * thrash assistant layout (Cursor-like independent scroll region).
+ */
+.chat-turn-live {
+  box-sizing: border-box;
+}
+
+.chat-turn-paper-spacer {
+  flex: 0 0 auto;
+  width: 100%;
+  pointer-events: none;
+  /* invisible write pad under content */
+}
+
 /* User bubble → Worked for / assistant: tighter than generic .msg pad */
 .chat-turn > .msg.user {
   padding-bottom: 15px;
@@ -3898,6 +3914,8 @@ html.is-tauri {
   flex-direction: column;
   gap: 2px;
   margin: 0;
+  min-height: 1.35em; /* stable L1 line height */
+  contain: layout style;
 }
 
 .process-pack-summary {
@@ -3942,9 +3960,15 @@ html.is-tauri {
   font-size: 12.5px;
   color: var(--text-dim);
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   line-height: 1.45;
   margin: 0;
   padding: 2px 0;
+  max-height: none;
+  overflow: visible;
+  text-overflow: unset;
+  -webkit-line-clamp: unset;
 }
 
 /* Mid assistant replies inside expanded Worked-for */
@@ -3963,53 +3987,48 @@ html.is-tauri {
   opacity: 0.9;
 }
 
-/* Live process window — at most 2 cards, slide up on change */
+/*
+ * Live process mini window: compact by default so tool swaps don't thrash
+ * body layout. When a thought is expanded, grow + scroll inside so the
+ * chain is not clipped mid-sentence (was 4.75rem + overflow:hidden).
+ */
 .live-process-stack {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  justify-content: flex-end;
+  gap: 4px;
   position: relative;
+  min-height: 1.35rem;
+  max-height: 4.75rem;
   overflow: hidden;
+  contain: layout style;
+  box-sizing: border-box;
+}
+
+.live-process-stack:has(.tl-thought[open]),
+.live-process-stack:has(.process-pack.open) {
+  max-height: min(50vh, 28rem);
+  overflow-x: hidden;
+  overflow-y: auto;
+  justify-content: flex-start;
+  contain: layout style;
 }
 
 .live-process-item {
-  will-change: transform, opacity;
+  flex: 0 0 auto;
+  max-height: 100%;
+  overflow: hidden;
 }
 
-.live-process-enter {
-  animation: live-process-enter 280ms ease-out forwards;
+.live-process-stack:has(.tl-thought[open]) .live-process-item:has(.tl-thought[open]),
+.live-process-stack:has(.process-pack.open) .live-process-item {
+  max-height: none;
+  overflow: visible;
 }
 
-.live-process-exit {
-  animation: live-process-exit 280ms ease-in forwards;
-  pointer-events: none;
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  z-index: 1;
-}
-
-@keyframes live-process-enter {
-  from {
-    opacity: 0;
-    transform: translateY(14px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@keyframes live-process-exit {
-  from {
-    opacity: 1;
-    transform: translateY(0);
-  }
-  to {
-    opacity: 0;
-    transform: translateY(-14px);
-  }
+.msg.assistant,
+.worked-for-mid-reply {
+  overflow-anchor: auto;
 }
 
 .tl-live .tl-list {
@@ -4326,8 +4345,20 @@ html.is-tauri {
   line-height: 1.45;
   color: var(--text-muted);
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   max-height: none;
   overflow: visible;
+  text-overflow: unset;
+  -webkit-line-clamp: unset;
+}
+
+.tl-thought-truncated-note {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.32);
+  font-style: italic;
+}
   opacity: 0.9;
 }
 
@@ -4390,7 +4421,8 @@ html.is-tauri {
 .assistant-text code {
   font-family: var(--mono);
   font-size: 0.92em;
-  background: rgba(255, 255, 255, 0.1);
+  /* Soft chip — still readable, not a hard slab */
+  background: rgba(255, 255, 255, 0.06);
   padding: 1px 5px;
   border-radius: 4px;
 }
@@ -4399,14 +4431,28 @@ html.is-tauri {
   margin: 0.55em 0;
   padding: 10px 12px;
   border-radius: 10px;
-  /* Light translucent glass — not near-black slabs */
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  /* Transparent bubble — sits close to chat bg (ChatGPT-ish) */
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.06);
   overflow-x: auto;
   max-width: 100%;
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.45;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+
+.assistant-text pre::-webkit-scrollbar {
+  height: 3px;
+  width: 3px;
+}
+.assistant-text pre::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+}
+.assistant-text pre::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .assistant-text pre code {
@@ -4479,27 +4525,29 @@ html.is-tauri {
   color: #f07178;
 }
 
-/* GFM tables — light translucent glass; full-width rhythm + thin scroll */
+/*
+ * GFM tables — ChatGPT-style: only thin horizontal rules, no glass box / vertical grid.
+ * Wide tables still scroll under .md-table-wrap; scrollbar is hairline.
+ */
 .assistant-text .md-table-wrap {
   margin: 0.55em 0;
   overflow-x: auto;
   overflow-y: hidden;
   width: 100%;
   max-width: 100%;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.06);
-  /* thin, quiet scrollbar */
+  border-radius: 0;
+  border: none;
+  background: transparent;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
 }
 
 .assistant-text .md-table-wrap::-webkit-scrollbar {
-  height: 5px;
-  width: 5px;
+  height: 3px;
+  width: 3px;
 }
 .assistant-text .md-table-wrap::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.14);
   border-radius: 999px;
 }
 .assistant-text .md-table-wrap::-webkit-scrollbar-track {
@@ -4512,18 +4560,22 @@ html.is-tauri {
   min-width: 100%;
   max-width: none;
   border-collapse: collapse;
-  font-size: 12px;
-  line-height: 1.35;
+  font-size: 13px;
+  line-height: 1.45;
   table-layout: auto;
+  border: none;
+  background: transparent;
 }
 
 .assistant-text th,
 .assistant-text td {
-  padding: 6px 10px;
+  padding: 10px 14px;
   text-align: left;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  vertical-align: top;
-  /* Never orphan a final letter (py,dem / o) — scroll the wrap, don't wrap cells */
+  border: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  vertical-align: middle;
+  background: transparent;
+  /* Never orphan a final letter — scroll the wrap, don't wrap cells */
   white-space: nowrap;
   word-break: normal;
   overflow-wrap: normal;
@@ -4531,18 +4583,19 @@ html.is-tauri {
   max-width: none;
 }
 
+/* No vertical cell borders */
 .assistant-text th:not(:last-child),
 .assistant-text td:not(:last-child) {
-  border-right: 1px solid rgba(255, 255, 255, 0.04);
+  border-right: none;
 }
 
 .assistant-text thead th {
-  font-weight: 600;
-  font-size: 11px;
-  letter-spacing: 0.015em;
-  color: rgba(255, 255, 255, 0.72);
-  background: rgba(255, 255, 255, 0.07);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  font-weight: 500;
+  font-size: 13px;
+  letter-spacing: 0;
+  color: var(--text-muted);
+  background: transparent;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
   white-space: nowrap;
 }
 
@@ -4550,23 +4603,24 @@ html.is-tauri {
   color: var(--text);
 }
 
+/* Keep last row rule too — ChatGPT draws every row separator including bottom */
 .assistant-text tr:last-child td {
-  border-bottom: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .assistant-text tbody tr:hover td {
-  background: rgba(255, 255, 255, 0.04);
+  background: transparent;
 }
 
-/* Inline code in cells: one line; table grows, wrap scrolls — never py,dem/o */
+/* Inline code in cells: one line; table grows, wrap scrolls */
 .assistant-text td code,
 .assistant-text th code {
   font-family: var(--mono);
   font-size: 0.9em;
-  background: rgba(255, 255, 255, 0.11);
+  background: rgba(255, 255, 255, 0.06);
   padding: 1px 5px;
   border-radius: 4px;
-  color: rgba(255, 255, 255, 0.92);
+  color: rgba(255, 255, 255, 0.9);
   white-space: nowrap;
   word-break: normal;
   overflow-wrap: normal;
@@ -4576,22 +4630,40 @@ html.is-tauri {
 .assistant-text td:has(> code:only-child),
 .assistant-text th:has(> code:only-child) {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 12px;
   letter-spacing: -0.01em;
   max-width: 28em;
 }
 
+/*
+ * Blockquotes — ChatGPT: only a soft left hairline, no fill / radius box.
+ * Nested quotes keep their own left bar + indent (image #2).
+ */
 .assistant-text blockquote {
-  margin: 0.55em 0;
-  padding: 6px 12px;
-  border-left: 3px solid rgba(129, 161, 193, 0.55);
-  color: var(--text-muted);
-  background: rgba(255, 255, 255, 0.03);
-  border-radius: 0 8px 8px 0;
+  margin: 0.45em 0;
+  padding: 0 0 0 0.85em;
+  border: none;
+  border-left: 2px solid rgba(255, 255, 255, 0.22);
+  color: var(--text);
+  background: transparent;
+  border-radius: 0;
+}
+
+.assistant-text blockquote blockquote {
+  margin: 0.35em 0;
+  /* Nested levels: same thin marker, extra indent from padding */
 }
 
 .assistant-text blockquote p {
-  margin: 0.25em 0;
+  margin: 0.2em 0;
+}
+
+.assistant-text blockquote > :first-child {
+  margin-top: 0;
+}
+
+.assistant-text blockquote > :last-child {
+  margin-bottom: 0;
 }
 
 .assistant-text hr {

@@ -1265,6 +1265,7 @@ export class GrokAcpAdapter implements AgentProvider {
     const shown = input.displayText ?? input.text;
     this.turnCancelled = false;
     this.promptInFlight = true;
+    this.signalsWatcher?.setActive(true);
     this.turnAssistantText = "";
     if (!input.skipUserEvent) {
       this.userTurns.push(shown);
@@ -1301,6 +1302,7 @@ export class GrokAcpAdapter implements AgentProvider {
       )) as { stopReason?: string } | undefined;
 
       this.promptInFlight = false;
+      this.signalsWatcher?.setActive(false);
       this.emitActivity(null);
       const stop = result?.stopReason ?? "end_turn";
       if (stop === "cancelled" || this.turnCancelled) {
@@ -1327,6 +1329,7 @@ export class GrokAcpAdapter implements AgentProvider {
       setTimeout(() => this.signalsWatcher?.refresh(), 1200);
     } catch (e) {
       this.promptInFlight = false;
+      this.signalsWatcher?.setActive(false);
       this.emitActivity(null);
       if (this.turnCancelled) {
         this.emit({
@@ -1488,6 +1491,7 @@ export class GrokAcpAdapter implements AgentProvider {
     // 5) UI drop busy immediately; in-flight session/prompt RPC returns cancelled later
     const wasInFlight = this.promptInFlight;
     this.promptInFlight = false;
+    this.signalsWatcher?.setActive(false);
     this.emitActivity(null);
     if (wasInFlight) {
       this.emit({

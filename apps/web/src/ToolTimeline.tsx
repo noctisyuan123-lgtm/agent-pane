@@ -5,6 +5,7 @@ import {
   summarizeToolGroup,
 } from "./toolFormat";
 import { highlightCode, highlightLine } from "./codeHighlight";
+import { releaseChatStickForInspect } from "./chatScrollStick";
 
 function ToolRowView({ tool }: { tool: ToolRow }) {
   // Default collapsed — expand on click only (keeps chat skim-friendly).
@@ -23,7 +24,11 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
       <button
         type="button"
         className="tl-head"
-        onClick={() => hasBody && setOpen((v) => !v)}
+        onClick={() => {
+          if (!hasBody) return;
+          releaseChatStickForInspect();
+          setOpen((v) => !v);
+        }}
         disabled={!hasBody}
       >
         <span
@@ -139,7 +144,10 @@ export function ToolTimeline({
       <button
         type="button"
         className="tl-summary"
-        onClick={() => setGroupOpen((v) => !v)}
+        onClick={() => {
+          releaseChatStickForInspect();
+          setGroupOpen((v) => !v);
+        }}
         aria-expanded={groupOpen}
       >
         <span className="tl-summary-text">

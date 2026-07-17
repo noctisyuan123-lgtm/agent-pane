@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import type { ChatItem } from "./chatFromEvents";
 import { formatDurationSec } from "./chatFromEvents";
 import {
@@ -8,8 +8,6 @@ import {
   WorkedForFold,
 } from "./TurnBlocks";
 
-const EXIT_MS = 280;
-
 type LiveProcessStackProps = {
   items: ChatItem[];
   renderItem: (item: ChatItem) => ReactNode;
@@ -17,83 +15,22 @@ type LiveProcessStackProps = {
 };
 
 /**
- * Live turn: show only the last N process cards (thought / tools / …).
- * Older cards slide up and fade; new ones rise from below.
+ * Live process trail: fixed-height mini window (CSS), last N cards only.
+ * Outer height stays constant so assistant text below doesn't thrash when
+ * tools/thoughts swap — Cursor-like independent "scroll slot".
  */
 export function LiveProcessStack({
   items,
   renderItem,
   maxVisible = 2,
 }: LiveProcessStackProps) {
+  // Always render the shell so height is reserved even between tool steps
   const visible = items.slice(-maxVisible);
-  const prevVisibleRef = useRef<ChatItem[]>([]);
-  const [exiting, setExiting] = useState<ChatItem[]>([]);
-  const [enteringIds, setEnteringIds] = useState<Set<string>>(new Set());
-  const exitTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
-    new Map()
-  );
-
-  useEffect(() => {
-    const prev = prevVisibleRef.current;
-    const currentIds = new Set(visible.map((i) => i.id));
-    const prevIds = new Set(prev.map((i) => i.id));
-
-    const newlyExiting = prev.filter((p) => !currentIds.has(p.id));
-    if (newlyExiting.length > 0) {
-      setExiting((ex) => {
-        const ids = new Set(ex.map((e) => e.id));
-        return [...ex, ...newlyExiting.filter((n) => !ids.has(n.id))];
-      });
-      for (const item of newlyExiting) {
-        if (exitTimersRef.current.has(item.id)) continue;
-        exitTimersRef.current.set(
-          item.id,
-          setTimeout(() => {
-            setExiting((ex) => ex.filter((e) => e.id !== item.id));
-            exitTimersRef.current.delete(item.id);
-          }, EXIT_MS)
-        );
-      }
-    }
-
-    const newlyEntering = visible.filter((v) => !prevIds.has(v.id));
-    if (newlyEntering.length > 0) {
-      setEnteringIds(new Set(newlyEntering.map((v) => v.id)));
-      const t = setTimeout(() => setEnteringIds(new Set()), EXIT_MS);
-      prevVisibleRef.current = visible;
-      return () => clearTimeout(t);
-    }
-
-    prevVisibleRef.current = visible;
-  }, [visible]);
-
-  useEffect(() => {
-    const timers = exitTimersRef.current;
-    return () => {
-      for (const t of timers.values()) clearTimeout(t);
-      timers.clear();
-    };
-  }, []);
-
-  if (visible.length === 0 && exiting.length === 0) return null;
 
   return (
-    <div className="live-process-stack">
-      {exiting.map((item) => (
-        <div
-          key={`exit-${item.id}`}
-          className="live-process-item live-process-exit"
-        >
-          {renderItem(item)}
-        </div>
-      ))}
+    <div className="live-process-stack" aria-live="polite">
       {visible.map((item) => (
-        <div
-          key={item.id}
-          className={`live-process-item${
-            enteringIds.has(item.id) ? " live-process-enter" : ""
-          }`}
-        >
+        <div key={item.id} className="live-process-item">
           {renderItem(item)}
         </div>
       ))}

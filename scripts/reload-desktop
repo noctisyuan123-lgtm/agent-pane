@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Rebuild Agent Pane production app, install to /Applications, relaunch once.
+#
+# Usage:
+#   ./scripts/reload-desktop
+#   npm run desktop:reload
+#   SKIP_BUILD=1 ./scripts/reload-desktop   # only reinstall last bundle + open
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BUNDLE="$ROOT/apps/desktop/src-tauri/target/release/bundle/macos/Agent Pane.app"
+APP="/Applications/Agent Pane.app"
+
+log() { printf '[reload-desktop] %s\n' "$*"; }
+
+quit_app() {
+  osascript -e 'tell application "Agent Pane" to quit' 2>/dev/null || true
+  # Prefer PID kill over pkill -f (avoids matching this script's cmdline)
+  local pid
+  for pid in $(pgrep -f '/Applications/Agent Pane.app/Contents/MacOS/agent-pane' 2>/dev/null || true); do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in $(pgrep -f 'target/debug/agent-pane' 2>/dev/null || true); do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in $(pgrep -f 'target/release/agent-pane' 2>/dev/null || true); do
+    # don't kill mid-copy if any; release binary path under target is fine
+    kill "$pid" 2>/dev/null || true
+  done
+  sleep 0.6
+}
+
+free_ports() {
+  # Desktop app owns 8787 via embedded bridge; free leftovers from npm run dev:bridge
+  local p
+  for p in $(lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null || true); do
+    kill "$p" 2>/dev/null || true
+  done
+}
+
+install_app() {
+  if [[ ! -d "$BUNDLE" ]]; then
+    log "bundle missing: $BUNDLE — run a full build first"
+    exit 1
+  fi
+  log "install → $APP"
+  rm -rf "$APP"
+  cp -R "$BUNDLE" "$APP"
+  xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+}
+
+launch_app() {
+  log "open Agent Pane"
+  open -a "Agent Pane"
+  sleep 1.5
+  if pgrep -f '/Applications/Agent Pane.app/Contents/MacOS/agent-pane' >/dev/null 2>&1; then
+    log "running (Applications binary)"
+  else
+    log "warn: process not detected yet — check Dock"
+  fi
+  if curl -sf -o /dev/null http://127.0.0.1:8787/health 2>/dev/null; then
+    log "bridge health ok"
+  else
+    log "bridge not up yet (may still be starting)"
+  fi
+}
+
+main() {
+  cd "$ROOT"
+  quit_app
+  free_ports
+
+  if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+    log "SKIP_BUILD=1 — reusing existing bundle"
+  else
+    log "desktop:build (web + bridge + tauri release)…"
+    npm run desktop:build
+  fi
+
+  install_app
+  launch_app
+  log "done — one Applications instance; avoid parallel npm run desktop:dev"
+}
+
+main "$@"

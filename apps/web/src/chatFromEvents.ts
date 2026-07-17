@@ -29,7 +29,8 @@ export type ChatItem =
   | { kind: "assistant"; text: string; id: string }
   /** Short pre-tool narration — muted, not a full reply bubble */
   | { kind: "status"; text: string; id: string }
-  | { kind: "thought"; text: string; id: string }
+  /** durationMs = wall-clock thinking time when sealed (not char-count guess). */
+  | { kind: "thought"; text: string; id: string; durationMs?: number }
   | { kind: "tools"; id: string; tools: ToolRow[] }
   /** Grok CLI-style end-of-turn step log (◆ Thought / Task / Run) */
   | { kind: "turn_log"; id: string; lines: TurnLogLine[] }
@@ -163,24 +164,43 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
   /** Last event timestamp seen (EOF incomplete-turn seal) */
   let lastEventMs = 0;
 
+  /** Wall-clock seal only — duration lives on thought ChatItem, not turn_log. */
   const sealThoughtLog = (endMs: number) => {
     if (!thoughtActive) return;
-    const ms = thoughtStartMs ? Math.max(0, endMs - thoughtStartMs) : 0;
-    turnLog.push({
-      tone: "dim",
-      text: `Thought for ${formatDurationSec(ms)}`,
-    });
+    // Attach duration onto the thought bubble (via flushThought) instead of
+    // a second ◆ Thought for Xs line (was 1s char-guess vs 12s wall double).
+    flushThought(endMs);
     thoughtActive = false;
     thoughtStartMs = 0;
   };
 
-  const flushThought = () => {
+  const flushThought = (endMs?: number) => {
     const t = thoughtBuf.trim();
     if (t && thoughtId) {
       const last = messages[messages.length - 1];
+      const durationMs =
+        thoughtActive && thoughtStartMs && endMs
+          ? Math.max(0, endMs - thoughtStartMs)
+          : thoughtActive && thoughtStartMs
+            ? Math.max(0, Date.now() - thoughtStartMs)
+            : undefined;
       // Avoid stacking identical thought shells from polluted / repeated streams
       if (!(last?.kind === "thought" && last.text.trim() === t)) {
-        messages.push({ kind: "thought", text: t, id: thoughtId });
+        messages.push({
+          kind: "thought",
+          text: t,
+          id: thoughtId,
+          ...(durationMs != null && durationMs > 0 ? { durationMs } : {}),
+        });
+      } else if (
+        last?.kind === "thought" &&
+        durationMs != null &&
+        durationMs > 0
+      ) {
+        messages[messages.length - 1] = {
+          ...last,
+          durationMs,
+        };
       }
     }
     thoughtBuf = "";

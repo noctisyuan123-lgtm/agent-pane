@@ -2,7 +2,9 @@ import type { ReactNode } from "react";
 import { useState } from "react";
 import type { ChatItem } from "./chatFromEvents";
 import { formatDurationSec } from "./chatFromEvents";
+// formatDurationSec used by WorkedForFold
 import { summarizeToolGroup, type ToolRow } from "./toolFormat";
+import { releaseChatStickForInspect } from "./chatScrollStick";
 
 /** One user message + the agent activity that followed it. */
 export type TurnBlock = {
@@ -121,6 +123,13 @@ export function mergeThoughtsInItems(items: ChatItem[]): ChatItem[] {
           kind: "thought",
           id: last.id,
           text: joined,
+          // Keep the longer wall-clock if either side has it
+          durationMs:
+            item.kind === "thought"
+              ? Math.max(last.durationMs ?? 0, item.durationMs ?? 0) ||
+                last.durationMs ||
+                item.durationMs
+              : last.durationMs,
         };
         continue;
       }
@@ -130,10 +139,23 @@ export function mergeThoughtsInItems(items: ChatItem[]): ChatItem[] {
   return out;
 }
 
-/** Cursor-style thought label from text length. */
-export function thoughtLabel(text: string): string {
+/**
+ * Thought header label.
+ * Prefer wall-clock durationMs (true elapsed). Char-count guess was wrong
+ * (e.g. 72 chars → "1s" while real think was 12s).
+ */
+export function thoughtLabel(text: string, durationMs?: number): string {
+  if (durationMs != null && durationMs > 0) {
+    const sec = durationMs / 1000;
+    if (sec < 1) return "Thought briefly";
+    // One decimal under 10s, integer above (matches Worked for style-ish)
+    const label =
+      sec < 10 ? sec.toFixed(1).replace(/\.0$/, "") : String(Math.round(sec));
+    return `Thought for ${label}s`;
+  }
   const preview = text.trim();
   if (!preview || preview.length < 40) return "Thought briefly";
+  // Fallback only when no wall-clock (legacy cache / incomplete seal)
   return `Thought for ${Math.max(1, Math.round(preview.length / 48))}s`;
 }
 
@@ -157,7 +179,13 @@ export function packSummary(items: ChatItem[]): string {
     }
   }
   if (thoughtTexts.length > 0) {
-    return thoughtLabel(thoughtTexts.join("\n\n"));
+    let maxMs: number | undefined;
+    for (const item of items) {
+      if (item.kind === "thought" && item.durationMs != null) {
+        maxMs = Math.max(maxMs ?? 0, item.durationMs);
+      }
+    }
+    return thoughtLabel(thoughtTexts.join("\n\n"), maxMs);
   }
 
   for (const item of items) {
@@ -263,9 +291,24 @@ export function ProcessPackFold({
     if (item.kind === "thought") {
       const text = item.text.trim();
       if (!text) continue;
+      // Nested under L1 pack that is already "Thought for Xs" — body only.
+      // If pack summary is Explored…, still show a mini header with real duration.
+      const upstreamCut =
+        (text.endsWith("...") || text.endsWith("…")) &&
+        text.length <= 220 &&
+        !/[.!?。！？]\s*$/.test(text.replace(/\.\.\.$|…$/u, "").trim());
       rendered.push({
         id: item.id,
-        node: <div className="tl-thought-body process-pack-thought">{text}</div>,
+        node: (
+          <div className="tl-thought-body process-pack-thought">
+            {text}
+            {upstreamCut ? (
+              <div className="tl-thought-truncated-note">
+                思维链被上游截断（约 200 字），不是界面折叠裁切
+              </div>
+            ) : null}
+          </div>
+        ),
       });
       continue;
     }
@@ -281,7 +324,11 @@ export function ProcessPackFold({
       <button
         type="button"
         className="process-pack-summary"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          // Expanding while thinking streams must not force-scroll to bottom
+          releaseChatStickForInspect();
+          setOpen((v) => !v);
+        }}
         aria-expanded={open}
       >
         <span className="tl-meta-label">{summary}</span>
@@ -350,7 +397,10 @@ function WorkedForDetails({
       <button
         type="button"
         className="worked-for-summary"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          releaseChatStickForInspect();
+          setOpen((v) => !v);
+        }}
         aria-expanded={open}
       >
         <span className="worked-for-label">{label}</span>
