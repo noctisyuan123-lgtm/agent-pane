@@ -5027,20 +5027,23 @@ var init_grok_signals_watcher = __esm({
     import_node_os3 = __toESM(require("node:os"), 1);
     import_node_path4 = __toESM(require("node:path"), 1);
     GrokSignalsWatcher = class {
-      constructor(paths, onUsage, intervalMs = 1200) {
+      constructor(paths, onUsage, idleIntervalMs = 1200) {
         this.onUsage = onUsage;
-        this.intervalMs = intervalMs;
         this.paths = paths;
+        this.idleIntervalMs = idleIntervalMs;
+        this.intervalMs = idleIntervalMs;
       }
       timer = null;
       watchers = [];
       lastKey = "";
       stopped = false;
       paths;
+      intervalMs;
+      idleIntervalMs;
       start() {
         this.stopped = false;
         this.tick();
-        this.timer = setInterval(() => this.tick(), this.intervalMs);
+        this.armTimer();
         for (const p of this.paths) {
           try {
             const dir = import_node_path4.default.dirname(p);
@@ -5055,6 +5058,24 @@ var init_grok_signals_watcher = __esm({
           } catch {
           }
         }
+      }
+      armTimer() {
+        if (this.timer) {
+          clearInterval(this.timer);
+          this.timer = null;
+        }
+        if (this.stopped) return;
+        this.timer = setInterval(() => this.tick(), this.intervalMs);
+      }
+      /**
+       * Busy (prompt in flight): poll faster so the ring updates sooner after
+       * Grok flushes signals.json. Idle: back to ~1.2s.
+       */
+      setActive(active) {
+        const next = active ? 350 : this.idleIntervalMs;
+        if (next === this.intervalMs) return;
+        this.intervalMs = next;
+        if (!this.stopped) this.armTimer();
       }
       /** Force a read (e.g. after prompt completes). */
       refresh() {
@@ -6169,6 +6190,7 @@ ${input.text}`;
         const shown = input.displayText ?? input.text;
         this.turnCancelled = false;
         this.promptInFlight = true;
+        this.signalsWatcher?.setActive(true);
         this.turnAssistantText = "";
         if (!input.skipUserEvent) {
           this.userTurns.push(shown);
@@ -6187,12 +6209,18 @@ ${input.text}`;
         } else {
           this.emitActivity("Waiting for model\u2026", "working");
         }
+        const PROMPT_TIMEOUT_MS = 30 * 6e4;
         try {
-          const result = await this.send("session/prompt", {
-            sessionId: this.providerSessionId,
-            prompt: blocks
-          });
+          const result = await this.send(
+            "session/prompt",
+            {
+              sessionId: this.providerSessionId,
+              prompt: blocks
+            },
+            PROMPT_TIMEOUT_MS
+          );
           this.promptInFlight = false;
+          this.signalsWatcher?.setActive(false);
           this.emitActivity(null);
           const stop = result?.stopReason ?? "end_turn";
           if (stop === "cancelled" || this.turnCancelled) {
@@ -6217,6 +6245,8 @@ ${input.text}`;
           setTimeout(() => this.signalsWatcher?.refresh(), 1200);
         } catch (e) {
           this.promptInFlight = false;
+          this.signalsWatcher?.setActive(false);
+          this.emitActivity(null);
           if (this.turnCancelled) {
             this.emit({
               type: "MessageDone",
@@ -6233,6 +6263,15 @@ ${input.text}`;
             message: e instanceof Error ? e.message : String(e),
             at: nowIso()
           });
+          this.emit({
+            type: "MessageDone",
+            sessionId: this.domainSessionId,
+            role: "assistant",
+            at: nowIso()
+          });
+          this.ingestSessionInfoText(this.turnAssistantText);
+          this.turnAssistantText = "";
+          this.signalsWatcher?.refresh();
         }
       }
       /**
@@ -6347,6 +6386,7 @@ ${input.text}`;
         this.pendingPermissions.clear();
         const wasInFlight = this.promptInFlight;
         this.promptInFlight = false;
+        this.signalsWatcher?.setActive(false);
         this.emitActivity(null);
         if (wasInFlight) {
           this.emit({
@@ -6928,7 +6968,7 @@ function listHistory(force = false) {
   listCache = { at: Date.now(), groups };
   return groups;
 }
-function loadSessionEvents(sessionId, force = false) {
+function loadSessionEvents(sessionId, _force = false) {
   const p = eventsPath(sessionId);
   if (!import_node_fs10.default.existsSync(p)) return [];
   let mtimeMs = 0;
@@ -6938,7 +6978,7 @@ function loadSessionEvents(sessionId, force = false) {
     return [];
   }
   const hit = eventsCache.get(sessionId);
-  if (!force && hit && hit.mtimeMs === mtimeMs && Date.now() - hit.at < EVENTS_TTL_MS) {
+  if (hit && hit.mtimeMs === mtimeMs) {
     return hit.events;
   }
   const events = [];
@@ -6950,6 +6990,11 @@ function loadSessionEvents(sessionId, force = false) {
     }
   }
   eventsCache.set(sessionId, { at: Date.now(), mtimeMs, events });
+  while (eventsCache.size > 12) {
+    const oldest = eventsCache.keys().next().value;
+    if (oldest == null) break;
+    eventsCache.delete(oldest);
+  }
   return events;
 }
 function patchMeta(sessionId, patch) {
@@ -7094,7 +7139,7 @@ function forkSession(sessionId, opts) {
   invalidateHistoryListCache();
   return meta;
 }
-var import_node_fs10, import_node_os6, import_node_path10, import_node_crypto5, ROOT, PINS_PATH, listCache, LIST_TTL_MS, eventsCache, EVENTS_TTL_MS;
+var import_node_fs10, import_node_os6, import_node_path10, import_node_crypto5, ROOT, PINS_PATH, listCache, LIST_TTL_MS, eventsCache;
 var init_history_index = __esm({
   "../bridge/src/history-index.ts"() {
     "use strict";
@@ -7107,7 +7152,6 @@ var init_history_index = __esm({
     listCache = null;
     LIST_TTL_MS = 12e3;
     eventsCache = /* @__PURE__ */ new Map();
-    EVENTS_TTL_MS = 6e4;
   }
 });
 

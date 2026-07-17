@@ -342,7 +342,7 @@ export function listHistory(force = false): HistoryGroup[] {
   return groups;
 }
 
-export function loadSessionEvents(sessionId: string, force = false): DomainEvent[] {
+export function loadSessionEvents(sessionId: string, _force = false): DomainEvent[] {
   const p = eventsPath(sessionId);
   if (!fs.existsSync(p)) return [];
 
@@ -354,14 +354,14 @@ export function loadSessionEvents(sessionId: string, force = false): DomainEvent
   }
 
   const hit = eventsCache.get(sessionId);
-  if (
-    !force &&
-    hit &&
-    hit.mtimeMs === mtimeMs &&
-    Date.now() - hit.at < EVENTS_TTL_MS
-  ) {
+  // Disk unchanged → reuse parse even when client sends force=1.
+  // Codex/Claude-style: list is cheap; re-reading multi‑MB jsonl on every
+  // sidebar click freezes the bridge event loop. Appends/deletes call
+  // invalidateSessionEventsCache so live writes still stay fresh.
+  if (hit && hit.mtimeMs === mtimeMs) {
     return hit.events;
   }
+  // `_force` kept for API compat; mtime miss always re-reads.
 
   const events: DomainEvent[] = [];
   const lines = fs.readFileSync(p, "utf8").split("\n").filter(Boolean);
@@ -373,6 +373,12 @@ export function loadSessionEvents(sessionId: string, force = false): DomainEvent
     }
   }
   eventsCache.set(sessionId, { at: Date.now(), mtimeMs, events });
+  // Bound memory: keep a handful of large session parses
+  while (eventsCache.size > 12) {
+    const oldest = eventsCache.keys().next().value;
+    if (oldest == null) break;
+    eventsCache.delete(oldest);
+  }
   return events;
 }
 

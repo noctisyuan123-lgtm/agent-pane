@@ -850,6 +850,74 @@ export function App() {
     void refreshLists(true);
   }, [refreshLists]);
 
+  /**
+   * Ensure current session appears in the left list after first user message.
+   * Bridge only writes meta on UserMessageAppended; UI used to need manual ↻.
+   * Optimistic insert — do NOT full refreshLists on every sessionId change.
+   */
+  const ensuredHistIdRef = useRef<string | null>(null);
+  const firstUserText = useMemo(() => {
+    const u = b.messages.find((m) => m.kind === "user");
+    return u && u.kind === "user" ? u.text : null;
+  }, [b.messages]);
+  useEffect(() => {
+    const sid = b.sessionId;
+    if (!sid || firstUserText == null) return;
+    if (ensuredHistIdRef.current === sid) return;
+    ensuredHistIdRef.current = sid;
+
+    const cwd = b.cwd || "(unknown)";
+    const name = cwd === "(unknown)" ? "Unknown" : cwd.split("/").pop() || cwd;
+    const title = (firstUserText || "Untitled").slice(0, 80);
+    const now = new Date().toISOString();
+
+    setHistory((groups) => {
+      for (const g of groups) {
+        if (g.sessions.some((s) => s.sessionId === sid)) {
+          // Already listed — bump recency / fill placeholder title
+          return groups.map((gg) => ({
+            ...gg,
+            sessions: gg.sessions.map((s) =>
+              s.sessionId === sid
+                ? {
+                    ...s,
+                    title:
+                      s.title && s.title !== "New session" ? s.title : title,
+                    updatedAt: now,
+                    messageCount: Math.max(s.messageCount || 0, 1),
+                  }
+                : s
+            ),
+          }));
+        }
+      }
+      const row: SessionMeta = {
+        sessionId: sid,
+        cwd,
+        title,
+        createdAt: now,
+        updatedAt: now,
+        messageCount: 1,
+      };
+      const idx = groups.findIndex((g) => g.cwd === cwd);
+      if (idx >= 0) {
+        const g = groups[idx]!;
+        const next = groups.slice();
+        next[idx] = { ...g, sessions: [row, ...g.sessions] };
+        return next;
+      }
+      return [{ cwd, name, sessions: [row] }, ...groups];
+    });
+    setExpandedCwd((m) => (m[cwd] ? m : { ...m, [cwd]: true }));
+
+    // Reconcile with disk shortly (meta may already exist server-side)
+    const t = window.setTimeout(() => {
+      invalidateHistoryClientCache();
+      void refreshLists(true);
+    }, 1200);
+    return () => window.clearTimeout(t);
+  }, [b.sessionId, b.cwd, firstUserText, refreshLists]);
+
   /** Flat list — always visible, not buried under collapsed project folders */
   const flatSessions = useMemo(() => {
     const rows: (SessionMeta & { projectName: string })[] = [];
@@ -1607,13 +1675,26 @@ export function App() {
   const openHist = (sessionId: string, cwd: string) => {
     const now = Date.now();
     const prev = histOpenDedupeRef.current;
-    // Same session within 200ms = pointerdown then click → one open only.
-    if (prev && prev.id === sessionId && now - prev.at < 200) {
+    // Same session within 280ms = pointerdown then click → one open only.
+    // (Wider than click latency under load — was 200ms and still double-fired.)
+    if (prev && prev.id === sessionId && now - prev.at < 280) {
       return;
     }
     // Already loading this session — don't abort ourselves (was "need 2 clicks")
     if (histInFlightIdRef.current === sessionId) {
       setSidebarSelectedId(sessionId);
+      return;
+    }
+    // Already the active painted session — highlight only, skip network reopen.
+    if (
+      (sidebarSelectedId === sessionId || b.sessionId === sessionId) &&
+      histInFlightIdRef.current == null
+    ) {
+      setSidebarSelectedId(sessionId);
+      setExpandedCwd((m) => (m[cwd] ? m : { ...m, [cwd]: true }));
+      // Soft open still runs cache skip path inside openHistorySession
+      histOpenDedupeRef.current = { id: sessionId, at: now };
+      void b.openHistorySession(sessionId, cwd);
       return;
     }
     histOpenDedupeRef.current = { id: sessionId, at: now };

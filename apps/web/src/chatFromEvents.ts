@@ -455,28 +455,77 @@ export function sliceLastUserTurns(
   return { visible: messages.slice(startIdx), hiddenCount: startIdx };
 }
 
+function yieldToMain(): Promise<void> {
+  return new Promise((r) => {
+    // Prefer macrotask so input/pointer handlers can run before heavy convert.
+    if (typeof MessageChannel !== "undefined") {
+      const ch = new MessageChannel();
+      ch.port1.onmessage = () => r();
+      ch.port2.postMessage(null);
+    } else {
+      setTimeout(r, 0);
+    }
+  });
+}
+
 /**
- * Same as eventsToChatItems, but yields to the main thread every `chunkSize`
- * events so rapid sidebar clicks stay responsive on multi‑MB histories.
+ * Index of the UserMessageAppended that starts the last `turns` user turns.
+ * Used for fast first-paint of long histories (window first, full cache later).
+ */
+export function lastUserTurnEventStart(
+  events: DomainEvent[],
+  turns: number
+): number {
+  if (turns <= 0 || events.length === 0) return 0;
+  let n = 0;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i]!.type === "UserMessageAppended") {
+      n++;
+      if (n >= turns) return i;
+    }
+  }
+  return 0;
+}
+
+/**
+ * Same as eventsToChatItems, but yields so rapid sidebar clicks stay responsive.
+ * Large histories: convert the visible tail first (returned immediately via
+ * onPartial), then full timeline for cache / "Load earlier".
  */
 export async function eventsToChatItemsAsync(
   events: DomainEvent[],
   opts?: {
     chunkSize?: number;
     shouldContinue?: () => boolean;
+    /** Prefer last N user turns for first paint (default 40). */
+    windowTurns?: number;
+    /** Called with windowed items before full convert finishes. */
+    onPartial?: (items: ChatItem[]) => void;
   }
 ): Promise<ChatItem[] | null> {
-  const chunkSize = opts?.chunkSize ?? 400;
   const shouldContinue = opts?.shouldContinue ?? (() => true);
-  if (events.length <= chunkSize) {
-    return shouldContinue() ? eventsToChatItems(events) : null;
+  const windowTurns = opts?.windowTurns ?? 40;
+  if (!shouldContinue()) return null;
+
+  await yieldToMain();
+  if (!shouldContinue()) return null;
+
+  // Fast path: small histories convert once.
+  if (events.length <= 500) {
+    const built = eventsToChatItems(events);
+    return shouldContinue() ? built : null;
   }
-  // Process via repeated sync slices by calling the full converter only when
-  // small; for large arrays, yield between chunked state-machine steps by
-  // converting in one go after yielding once so UI can paint selection first,
-  // then check cancel again. True chunked SM would duplicate logic — instead
-  // yield heavily around the sync convert.
-  await new Promise<void>((r) => setTimeout(r, 0));
+
+  // Large: paint the last windowTurns first (Codex/Claude-style windowing),
+  // then full convert after another yield so the sidebar click isn't frozen.
+  const start = lastUserTurnEventStart(events, windowTurns);
+  if (start > 0 && opts?.onPartial) {
+    const partial = eventsToChatItems(events.slice(start));
+    if (!shouldContinue()) return null;
+    opts.onPartial(partial);
+  }
+
+  await yieldToMain();
   if (!shouldContinue()) return null;
   await new Promise<void>((r) =>
     typeof requestAnimationFrame === "function"
@@ -484,6 +533,8 @@ export async function eventsToChatItemsAsync(
       : setTimeout(r, 0)
   );
   if (!shouldContinue()) return null;
+
+  // Full convert — still sync, but selection + partial chat already painted.
   const built = eventsToChatItems(events);
   if (!shouldContinue()) return null;
   return built;

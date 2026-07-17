@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  startTransition,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import type {
   ClientCommand,
   DiffFileMeta,
@@ -33,6 +39,8 @@ import {
  * after repeated clicking. "Load earlier" expands from the full cached array.
  */
 const HISTORY_WINDOW_TURNS = 40;
+/** Keep more sessions warm — thrashing at 4 made every 5th click cold again. */
+const SESSION_CHAT_CACHE_MAX = 10;
 
 export type { ChatItem, TurnLogLine } from "./chatFromEvents";
 export {
@@ -196,8 +204,11 @@ export function useBridge() {
       full,
       HISTORY_WINDOW_TURNS
     );
-    setMessages(visible);
-    setHiddenHistoryCount(hiddenCount);
+    // Keep sidebar highlight / pointer handlers responsive while markdown mounts.
+    startTransition(() => {
+      setMessages(visible);
+      setHiddenHistoryCount(hiddenCount);
+    });
   }, []);
   const loadEarlierHistory = useCallback(() => {
     const sid = sessionIdRef.current;
@@ -275,7 +286,7 @@ export function useBridge() {
           at: Date.now(),
           contextUsage: prevUsage,
         });
-        while (cache.size > 4) {
+        while (cache.size > SESSION_CHAT_CACHE_MAX) {
           let oldestId: string | null = null;
           let oldestAt = Infinity;
           for (const [k, v] of cache) {
@@ -295,7 +306,7 @@ export function useBridge() {
       at: Date.now(),
       contextUsage: prevUsage,
     });
-    while (cache.size > 4) {
+    while (cache.size > SESSION_CHAT_CACHE_MAX) {
       let oldestId: string | null = null;
       let oldestAt = Infinity;
       for (const [k, v] of cache) {
@@ -1807,10 +1818,29 @@ export function useBridge() {
       histCwd: string,
       signal?: AbortSignal
     ): Promise<{ scrubbed?: boolean } | void> => {
+      const prevId = sessionIdRef.current;
+      const cachedHit = sessionChatCacheRef.current.get(histSessionId);
+
+      // Already showing this session with a warm cache — skip full reopen.
+      // (Re-click / pointerdown+click after open finished used to re-fetch.)
+      if (
+        prevId === histSessionId &&
+        cachedHit?.messages?.length &&
+        !signal?.aborted
+      ) {
+        setCwd(histCwd);
+        localStorage.setItem("agent-pane-cwd", histCwd);
+        const stillLive =
+          liveSessionIdsRef.current.includes(histSessionId) ||
+          !!busyBySessionRef.current[histSessionId];
+        setHistoryOnly(!stillLive);
+        setBusy(!!busyBySessionRef.current[histSessionId]);
+        return;
+      }
+
       const gen = ++openHistGenRef.current;
       const stillCurrent = () =>
         gen === openHistGenRef.current && !signal?.aborted;
-      const prevId = sessionIdRef.current;
 
       // Stash leaving session so A↔B rapid switches don't re-parse multi‑MB jsonl
       if (prevId && prevId !== histSessionId) {
@@ -1881,8 +1911,11 @@ export function useBridge() {
           // History-only: skip multi‑MB re-parse; usage already refreshing.
           return;
         }
-        // Live: paint cache now. Debounced catch-up — rapid A↔B must not
-        // stack concurrent full-history converts (felt like a memory leak).
+        // Live catch-up only when busy or cache is stale — not every hop.
+        const cacheAge = Date.now() - (cached.at || 0);
+        const needsCatchUp =
+          !!busyBySessionRef.current[histSessionId] || cacheAge > 30_000;
+        if (!needsCatchUp) return;
         const catchGen = gen;
         window.setTimeout(() => {
           if (openHistGenRef.current !== catchGen || signal?.aborted) return;
@@ -1898,6 +1931,7 @@ export function useBridge() {
               if (!stillCurrent()) return;
               const built = await eventsToChatItemsAsync(events, {
                 shouldContinue: stillCurrent,
+                windowTurns: HISTORY_WINDOW_TURNS,
               });
               if (!built || !stillCurrent()) return;
               const prevU =
@@ -1958,8 +1992,28 @@ export function useBridge() {
           return { scrubbed: true };
         }
 
+        setCwd(histCwd);
+        localStorage.setItem("agent-pane-cwd", histCwd);
+
         const built = await eventsToChatItemsAsync(events, {
           shouldContinue: stillCurrent,
+          windowTurns: HISTORY_WINDOW_TURNS,
+          onPartial: (partial) => {
+            if (!stillCurrent()) return;
+            // First paint: tail window only — selection already snappy.
+            suppressPaintRef.current = null;
+            paintedOk = true;
+            paintWindowed(partial);
+            setTasks([]);
+            setDiffs([]);
+            setPermissions([]);
+            const stillLivePartial =
+              liveSessionIdsRef.current.includes(histSessionId) ||
+              !!busyBySessionRef.current[histSessionId];
+            setHistoryOnly(!stillLivePartial);
+            setBusy(!!busyBySessionRef.current[histSessionId]);
+            turnDoneRef.current = !busyBySessionRef.current[histSessionId];
+          },
         });
         if (!built || !stillCurrent()) return;
         // Re-check immediately before mutating UI — avoids TOCTOU where a newer
@@ -1974,8 +2028,6 @@ export function useBridge() {
         postToolsAssistantId.current = null;
         turnDoneRef.current = true;
         seenSeq.current.clear();
-        setCwd(histCwd);
-        localStorage.setItem("agent-pane-cwd", histCwd);
         // Fill seenSeq only — provider id for usage comes from bridge live→meta
         // (do not key off last ContextUsage event alone; that is archaeology).
         for (let i = 0; i < events.length; i++) {
@@ -1996,6 +2048,20 @@ export function useBridge() {
             sessionChatCacheRef.current.get(histSessionId)?.contextUsage ??
             null,
         });
+        // Evict old cache entries
+        const cacheMap = sessionChatCacheRef.current;
+        while (cacheMap.size > SESSION_CHAT_CACHE_MAX) {
+          let oldestId: string | null = null;
+          let oldestAt = Infinity;
+          for (const [k, v] of cacheMap) {
+            if (v.at < oldestAt) {
+              oldestAt = v.at;
+              oldestId = k;
+            }
+          }
+          if (oldestId) cacheMap.delete(oldestId);
+          else break;
+        }
         paintWindowed(built);
 
         // Paint chat first — usage fetch must NOT retain the events array
@@ -2036,7 +2102,7 @@ export function useBridge() {
         }
       }
     },
-    [stashSessionChat, refreshContextUsage]
+    [stashSessionChat, refreshContextUsage, paintWindowed]
   );
 
   const prompt = useCallback(
