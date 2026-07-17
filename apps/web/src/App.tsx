@@ -17,7 +17,11 @@ import { AgentBrowserPanel } from "./AgentBrowserPanel";
 import { CustomizePanel } from "./CustomizePanel";
 import { TerminalPanel } from "./TerminalPanel";
 import { SessionWorkingDots } from "./SessionWorkingDots";
-import { AgentActivityStrip } from "./AgentActivityStrip";
+import {
+  AgentActivityStrip,
+  RunningDock,
+  type RunningProcessItem,
+} from "./AgentActivityStrip";
 import { WorkspacePicker } from "./WorkspacePicker";
 import {
   buildContextBreakdown,
@@ -30,8 +34,11 @@ import {
   getEffortFor,
 } from "./modelEffort";
 import { ToolTimeline } from "./ToolTimeline";
-import { renderLiveTurnBody } from "./LiveProcessStack";
-import { groupChatIntoTurns, WorkedForFold } from "./TurnBlocks";
+import {
+  renderLiveTurnBody,
+  renderSettledTurnBody,
+} from "./LiveProcessStack";
+import { groupChatIntoTurns, thoughtLabel } from "./TurnBlocks";
 import type { ChatItem } from "./chatFromEvents";
 import {
   deleteSessionApi,
@@ -191,6 +198,58 @@ function activityOutline(
   return "Working…";
 }
 
+/**
+ * Live running tools / scripts / subagents for the particle strip expand list.
+ */
+function collectRunningProcessItems(
+  messages: ChatItem[],
+  subagentModel: string | null | undefined,
+  statusMsg: string | null
+): RunningProcessItem[] {
+  const items: RunningProcessItem[] = [];
+  const seen = new Set<string>();
+
+  if (subagentModel?.trim()) {
+    const id = `subagent-${subagentModel.trim()}`;
+    seen.add(id);
+    items.push({
+      id,
+      kind: "subagent",
+      label: subagentModel.trim(),
+      detail: statusMsg?.trim() || undefined,
+    });
+  }
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.kind !== "tools") continue;
+    for (const t of m.tools) {
+      if (t.status !== "running") continue;
+      if (seen.has(t.toolId)) continue;
+      seen.add(t.toolId);
+      const kind =
+        t.kind === "execute"
+          ? "script"
+          : t.kind === "search"
+            ? "search"
+            : t.kind === "read"
+              ? "read"
+              : t.kind === "edit"
+                ? "edit"
+                : "tool";
+      items.push({
+        id: t.toolId,
+        kind,
+        label: (t.label || t.name || "tool").replace(/^Ran\s+/i, "").trim(),
+        detail: t.path || t.detailLines?.[0],
+      });
+    }
+  }
+
+  // Newest first in messages walk was reverse tools groups; keep stable list order
+  return items;
+}
+
 /** Line-2 concrete action from tool activity / statusMsg. */
 function activityDetail(
   statusMsg: string | null,
@@ -230,16 +289,9 @@ function activityStatusLine(
     phase === "thinking" ||
     (statusMsg != null && /^Thinking/i.test(statusMsg));
   if (thinking) {
-    // Mirror timeline "Thought briefly" for short streams
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i]!;
-      if (m.kind === "thought" && m.text.trim()) {
-        return m.text.trim().length < 40
-          ? "Thought briefly"
-          : "Thinking…";
-      }
-    }
-    return "Thought briefly";
+    // Timeline already owns the Thought bubble — strip only says Thinking…
+    // (was double "Thought briefly" one above one below).
+    return "Thinking…";
   }
   if (phase === "compact" || (statusMsg != null && /compact/i.test(statusMsg))) {
     return "Compacting…";
@@ -1671,12 +1723,40 @@ export function App() {
     return { add, del, files: b.diffs.length };
   }, [b.diffs]);
 
+  const runningProcessItems = collectRunningProcessItems(
+    b.messages,
+    b.activitySubagentModel,
+    b.statusMsg
+  );
+  const showRunningDock = hasExternalProcess(
+    b.messages,
+    b.activityPhase,
+    b.statusMsg,
+    b.activitySubagentModel
+  );
+
   const composer = (
     <div
       className={`composer-stack ${showHome ? "hero" : "followup"} ${
         composerCrowded ? "crowded" : "compact"
       }`}
     >
+      {showRunningDock ? (
+        <RunningDock
+          outline={activityOutline(
+            b.messages,
+            b.tasks,
+            b.activitySubagentModel
+          )}
+          secondary={b.activitySubagentModel || null}
+          detail={activityDetail(
+            b.statusMsg,
+            b.activityPhase,
+            b.messages
+          )}
+          runningItems={runningProcessItems}
+        />
+      ) : null}
       <div
         ref={composerShellRef}
         className={`composer-shell ${showHome ? "hero" : "followup"} ${
@@ -2682,14 +2762,16 @@ export function App() {
                   setRespMenuOpen(true);
                 };
 
-                const renderProcessItem = (m: ChatItem) => {
+                const renderProcessItem = (
+                  m: ChatItem,
+                  ctx?: { embeddedInPack?: boolean }
+                ) => {
                   if (m.kind === "thought") {
                     const preview = m.text.trim();
                     if (!preview) return null;
-                    const label =
-                      preview.length < 40
-                        ? "Thought briefly"
-                        : `Thought for ${Math.max(1, Math.round(preview.length / 48))}s`;
+                    // Live stack: labeled fold. L1 pack embeds body only via
+                    // ProcessPackFold (skips this branch for thoughts).
+                    const label = thoughtLabel(preview);
                     return (
                       <details className="tl-thought" key={m.id}>
                         <summary>
@@ -2708,27 +2790,16 @@ export function App() {
                     );
                   }
                   if (m.kind === "tools") {
-                    // Activity strip owns live tool UI. Hide the old tl block
-                    // whenever a process is active — don't rely on turn.isLive
-                    // alone (busy can be false while statusMsg still says Running).
-                    const processLive =
-                      turn.isLive ||
-                      b.busy ||
-                      Boolean(b.activitySubagentModel) ||
-                      b.activityPhase === "tool" ||
-                      b.activityPhase === "sleeping" ||
-                      b.activityPhase === "permission" ||
-                      m.tools.some((t) => t.status === "running") ||
-                      (b.statusMsg != null &&
-                        /^(Running|Using|Calling|Permission|Queued:)/i.test(
-                          b.statusMsg
-                        ));
-                    if (processLive) return null;
+                    // L1 pack already owns "Explored…" — nested rows only.
+                    // Live open segment: keep group summary + window.
+                    const liveTools = turn.isLive && !ctx?.embeddedInPack;
                     return (
                       <ToolTimeline
                         key={m.id}
                         tools={m.tools}
                         defaultOpen={false}
+                        liveMaxRows={liveTools ? 4 : undefined}
+                        embedded={Boolean(ctx?.embeddedInPack)}
                       />
                     );
                   }
@@ -2861,7 +2932,11 @@ export function App() {
                         )}
                       </div>
                     )}
-                    {/* Live: preserve interleaved stream order */}
+                    {/* Multi-layer process fold:
+                        Live: mid assistants full; sealed process → L1 pack;
+                              open trailing process → LiveProcessStack.
+                        Settled: L0 Worked for (L1 packs + mid assistants);
+                                 final assistant outside only. */}
                     {turn.isLive ? (
                       <div className="worked-live">
                         {renderLiveTurnBody(
@@ -2871,19 +2946,14 @@ export function App() {
                         )}
                       </div>
                     ) : (
-                      <>
-                        {/* Process only under Worked for — never the reply */}
-                        <WorkedForFold
-                          workedMs={turn.workedMs}
-                          isLive={false}
-                        >
-                          {turn.process.map((item) =>
-                            renderProcessItem(item)
-                          )}
-                        </WorkedForFold>
-                        {/* Assistant body always visible */}
-                        {turn.replies.map((item) => renderReply(item))}
-                      </>
+                      <div className="settled-turn-body">
+                        {renderSettledTurnBody(
+                          turn.body,
+                          renderProcessItem,
+                          renderReply,
+                          turn.workedMs
+                        )}
+                      </div>
                     )}
                   </div>
                 );
@@ -2997,36 +3067,27 @@ export function App() {
                 </div>
               )}
 
-              {/* Process rows only for tools/subagents; sister-only → status line */}
+              {/* Soft status only (Thinking…); process outline → RunningDock @ composer */}
               {(b.busy || Boolean(b.statusMsg) || Boolean(b.activityPhase)) && (
                 <AgentActivityStrip
-                  showProcess={hasExternalProcess(
-                    b.messages,
-                    b.activityPhase,
-                    b.statusMsg,
-                    b.activitySubagentModel
-                  )}
-                  outline={activityOutline(
-                    b.messages,
-                    b.tasks,
-                    b.activitySubagentModel
-                  )}
-                  secondary={b.activitySubagentModel || null}
-                  detail={activityDetail(
-                    b.statusMsg,
-                    b.activityPhase,
-                    b.messages
-                  )}
                   busy={b.busy}
-                  statusForElapsed={(elapsed) =>
-                    activityStatusLine(
+                  statusForElapsed={(elapsed) => {
+                    const line = activityStatusLine(
                       b.activityPhase,
                       b.statusMsg,
                       b.messages,
                       b.busy,
                       elapsed
-                    )
-                  }
+                    );
+                    // Dock already shows external work — skip redundant soft filler
+                    if (
+                      showRunningDock &&
+                      /^(Working…|Planning next moves)$/i.test(line)
+                    ) {
+                      return "";
+                    }
+                    return line;
+                  }}
                 />
               )}
 

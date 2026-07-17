@@ -110,22 +110,20 @@ function collapseDuplicateAssistants(messages: ChatItem[]): ChatItem[] {
   return out;
 }
 
-/** Pre-tool chatter → status line (or drop if empty). */
-function sealAsStatus(
+/**
+ * Seal in-flight assistant prose as a finished assistant bubble (never demote
+ * to muted status — intermediate speech stays a full reply).
+ */
+function sealAsAssistant(
   messages: ChatItem[],
   buf: string,
   liveId: string
 ): ChatItem[] {
   const text = buf.trim();
-  const without = messages.filter((m) => m.id !== liveId);
-  if (!text) return without;
-  // Very short tool preambles only — long text stays assistant
-  if (text.length > 280 || text.includes("\n\n")) {
-    without.push({ kind: "assistant", text, id: `${liveId}-pre` });
-  } else {
-    without.push({ kind: "status", text, id: `${liveId}-status` });
+  if (!text) {
+    return messages.filter((m) => !(m.kind === "assistant" && m.id === liveId));
   }
-  return without;
+  return upsertAssistant(messages, text, liveId);
 }
 
 export function useBridge() {
@@ -453,13 +451,17 @@ export function useBridge() {
     (event: DomainEvent) => {
       const id = event.sessionId;
       if (!id) return;
+      const active = sessionIdRef.current;
+      // Turn already sealed for the painted session — never re-arm busy from
+      // residual tools/activity (was sticky Stop + "Waiting for response").
+      const sealedHere =
+        id === active && turnDoneRef.current && !replayingRef.current;
       // Only user/tool start a "working" turn — not every residual chunk,
       // or busy sticks forever after MessageDone (sidebar particles).
-      if (
-        event.type === "UserMessageAppended" ||
-        event.type === "ToolStarted"
-      ) {
+      if (event.type === "UserMessageAppended") {
         busyBySessionRef.current[id] = true;
+      } else if (event.type === "ToolStarted") {
+        if (!sealedHere) busyBySessionRef.current[id] = true;
       } else if (
         event.type === "MessageDone" ||
         event.type === "SessionEnded" ||
@@ -782,6 +784,7 @@ export function useBridge() {
         turnDoneRef.current = true;
         setActivityPhase(null);
         setActivitySubagentModel(null);
+        setStatusMsg(null);
         // Keep fully-done To-dos visible with ✅ until the *next* user turn.
         // noteSessionBusy already cleared the map — sync, don't blanket setBusy(false)
         // (that used to clear busy while viewing another live session after a gate miss).
@@ -799,14 +802,15 @@ export function useBridge() {
         thoughtBufMap.current.delete(thoughtLiveId.current);
         thoughtLiveId.current = `t-${event.sessionId}-pretool-${event.seq ?? Date.now()}`;
         thoughtStartRef.current = null;
-        // Pre-tool agent chatter → muted status, not a full reply bubble
+        // Pre-tool speech stays a full assistant bubble (linear timeline).
+        // Next MessageChunks after tools open a new bubble.
         const sealedBuf = assistantBuf.current;
         const liveId = assistantLiveId.current;
         if (sealedBuf.trim()) {
           assistantBuf.current = "";
-          setMessages((m) => sealAsStatus(m, sealedBuf, liveId));
+          setMessages((m) => sealAsAssistant(m, sealedBuf, liveId));
+          assistantLiveId.current = `a-${event.sessionId}-mid-${event.seq ?? Date.now()}`;
         }
-        // Next message chunks after tools get a dedicated bubble
         postToolsAssistantId.current = null;
 
         const row = formatToolStarted({
@@ -883,6 +887,10 @@ export function useBridge() {
         break;
 
       case "AgentActivity": {
+        // Residual activity after the turn sealed must not re-open Stop / busy
+        if (turnDoneRef.current && !replayingRef.current) {
+          break;
+        }
         const text = event.text?.trim() || null;
         setStatusMsg(text);
         const phase = event.phase ?? (text ? "working" : null);
@@ -897,6 +905,7 @@ export function useBridge() {
         // Keep busy/isLive aligned while a tool process is reporting
         if (
           event.sessionId &&
+          !turnDoneRef.current &&
           (phase === "tool" ||
             phase === "sleeping" ||
             phase === "permission" ||
@@ -1039,19 +1048,20 @@ export function useBridge() {
         setResuming(false);
         setActivityPhase(null);
         setActivitySubagentModel(null);
+        setStatusMsg(null);
+        // Seal residual stream like cancel — timeout must not leave busy re-armable
+        turnDoneRef.current = true;
         // Idle agent exit is expected — don't flash a red error, just mark resumable
         if (
           /exited|disconnect|not alive|EPIPE/i.test(event.message) &&
           !/fail|无法|error|崩溃/i.test(event.message)
         ) {
           syncBusyFromMap();
-          setStatusMsg(null);
           setHistoryOnly(true);
           break;
         }
         setError(event.message);
         syncBusyFromMap();
-        setStatusMsg(null);
         // agent 挂了 / 断线：标 historyOnly，下次 Send 会 resume 同一 session
         if (
           /exited|disconnect|Unknown session|not started|ECONN|not running|not alive|resume|timed out|Authentication|认证/i.test(

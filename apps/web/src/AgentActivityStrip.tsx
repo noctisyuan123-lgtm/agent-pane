@@ -92,80 +92,136 @@ function useBusyElapsed(busy: boolean): number {
   return elapsed;
 }
 
-export type AgentActivityStripProps = {
-  /**
-   * External process block (tools / subagents) — NOT the sister herself.
-   * When false/omitted with empty outline, only the status row shows.
-   */
-  showProcess?: boolean;
-  /** Line 1 — process / task outline */
-  outline?: string | null;
+export type RunningProcessItem = {
+  id: string;
+  /** One-line label: subagent model, script, tool name */
+  label: string;
+  /** Optional kind chip: subagent | script | tool | search */
+  kind?: string;
+  detail?: string;
+};
+
+export type RunningDockProps = {
+  /** Line 1 — process / task outline (required for display) */
+  outline: string;
   /** Line 2 — concrete tool / step detail */
   detail?: string | null;
+  /** Muted secondary — subagent model only */
+  secondary?: string | null;
   /**
-   * Line 3 status. Prefer `statusForElapsed` so the 200ms timer stays inside
-   * this component and does not re-render the whole App/sidebar.
+   * Live running subagents / scripts / tools — click the particle outline
+   * to expand and inspect.
+   */
+  runningItems?: RunningProcessItem[];
+};
+
+/**
+ * Compact running shell/subagent bar — sits above the composer, left-aligned.
+ * Particles + outline (+ optional expand list). Hidden by parent when idle.
+ */
+export function RunningDock({
+  outline,
+  detail,
+  secondary,
+  runningItems = [],
+}: RunningDockProps) {
+  const [listOpen, setListOpen] = useState(false);
+  const title = outline.trim();
+  if (!title) return null;
+
+  const canExpand = runningItems.length > 0;
+
+  return (
+    <div
+      className={`running-dock${listOpen ? " running-dock--expanded" : ""}`}
+      aria-live="polite"
+    >
+      <SessionWorkingDots className="running-dock-dots" />
+      <div className="running-dock-lines">
+        <div className="running-dock-outline-row">
+          {canExpand ? (
+            <button
+              type="button"
+              className="running-dock-outline-btn"
+              onClick={() => setListOpen((v) => !v)}
+              aria-expanded={listOpen}
+              title={
+                listOpen
+                  ? "Hide running processes"
+                  : "Show running subagents / scripts"
+              }
+            >
+              <SlideLine text={title} className="running-dock-outline" />
+              <span
+                className={`running-dock-expand-chev ${listOpen ? "open" : ""}`}
+              >
+                ▾
+              </span>
+            </button>
+          ) : (
+            <SlideLine text={title} className="running-dock-outline" />
+          )}
+          {secondary ? (
+            <span className="running-dock-secondary">{secondary}</span>
+          ) : null}
+        </div>
+        {detail?.trim() ? (
+          <div className="running-dock-detail-row">
+            <SlideLine text={detail.trim()} className="running-dock-detail" />
+          </div>
+        ) : null}
+        {listOpen && canExpand ? (
+          <ul className="running-dock-list">
+            {runningItems.map((item) => (
+              <li key={item.id} className="running-dock-item">
+                {item.kind ? (
+                  <span className="running-dock-kind">{item.kind}</span>
+                ) : null}
+                <span className="running-dock-label">{item.label}</span>
+                {item.detail?.trim() ? (
+                  <span className="running-dock-item-detail">
+                    {item.detail.trim()}
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+export type AgentActivityStripProps = {
+  /**
+   * Soft status only (Thinking… / Waiting…). Process outline lives in
+   * {@link RunningDock} above the composer.
    */
   status?: string | null;
   statusForElapsed?: (elapsedMs: number) => string;
   busy?: boolean;
-  /** Line 1 muted secondary — subagent model only */
-  secondary?: string | null;
 };
 
 /**
- * Cursor-style activity:
- *   (dots) bold outline …  [subagent model]
- *          fine detail …
- *   status …
- *
- * Process rows (dots + outline + detail) only when an external process is
- * running. Sister-only thinking → status line alone.
+ * Chat-bottom soft status strip (Thinking… / Waiting for model…).
+ * External process outline is rendered by RunningDock at the composer.
  */
 export function AgentActivityStrip({
-  showProcess = false,
-  outline,
-  detail,
   status,
   statusForElapsed,
   busy = false,
-  secondary,
 }: AgentActivityStripProps) {
   const elapsed = useBusyElapsed(Boolean(busy && statusForElapsed));
-  const processOn = Boolean(showProcess && outline?.trim());
   const statusText = (
     statusForElapsed ? statusForElapsed(elapsed) : status ?? ""
   ).trim();
-  if (!processOn && !statusText) return null;
+  if (!statusText) return null;
 
   return (
-    <div
-      className={`agent-activity${processOn ? "" : " agent-activity--status-only"}`}
-      aria-live="polite"
-    >
-      {processOn ? (
-        <div className="agent-activity-process">
-          <SessionWorkingDots className="agent-activity-dots" />
-          <div className="agent-activity-process-lines">
-            <div className="agent-activity-outline-row">
-              <SlideLine text={outline!.trim()} className="agent-activity-outline" />
-              {secondary ? (
-                <span className="agent-activity-secondary">{secondary}</span>
-              ) : null}
-            </div>
-            {detail?.trim() ? (
-              <div className="agent-activity-detail-row">
-                <SlideLine text={detail.trim()} className="agent-activity-detail" />
-              </div>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-      {statusText ? (
-        <div className="agent-activity-status-row">
-          <SlideLine text={statusText} className="agent-activity-status" />
-        </div>
-      ) : null}
+    <div className="agent-activity agent-activity--status-only" aria-live="polite">
+      <div className="agent-activity-status-row">
+        <SlideLine text={statusText} className="agent-activity-status" />
+      </div>
     </div>
   );
 }

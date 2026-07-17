@@ -1286,11 +1286,19 @@ export class GrokAcpAdapter implements AgentProvider {
       this.emitActivity("Waiting for model…", "working");
     }
 
+    // Long multi-tool turns routinely exceed the default 120s RPC timeout.
+    // Idle-extend: transport still uses an absolute cap, but we pass a higher
+    // limit so legitimate work is not treated as a dead session.
+    const PROMPT_TIMEOUT_MS = 30 * 60_000;
     try {
-      const result = (await this.send("session/prompt", {
-        sessionId: this.providerSessionId,
-        prompt: blocks,
-      })) as { stopReason?: string } | undefined;
+      const result = (await this.send(
+        "session/prompt",
+        {
+          sessionId: this.providerSessionId,
+          prompt: blocks,
+        },
+        PROMPT_TIMEOUT_MS
+      )) as { stopReason?: string } | undefined;
 
       this.promptInFlight = false;
       this.emitActivity(null);
@@ -1319,6 +1327,7 @@ export class GrokAcpAdapter implements AgentProvider {
       setTimeout(() => this.signalsWatcher?.refresh(), 1200);
     } catch (e) {
       this.promptInFlight = false;
+      this.emitActivity(null);
       if (this.turnCancelled) {
         this.emit({
           type: "MessageDone",
@@ -1329,12 +1338,25 @@ export class GrokAcpAdapter implements AgentProvider {
         this.signalsWatcher?.refresh();
         return;
       }
+      // Timeout / transport error: surface the error but still seal the turn so
+      // the UI does not stick on "Waiting for response" / Stop forever. The
+      // Core may still finish; residual chunks are dropped once MessageDone
+      // lands (frontend turnDoneRef).
       this.emit({
         type: "SessionError",
         sessionId: this.domainSessionId,
         message: e instanceof Error ? e.message : String(e),
         at: nowIso(),
       });
+      this.emit({
+        type: "MessageDone",
+        sessionId: this.domainSessionId,
+        role: "assistant",
+        at: nowIso(),
+      });
+      this.ingestSessionInfoText(this.turnAssistantText);
+      this.turnAssistantText = "";
+      this.signalsWatcher?.refresh();
     }
   }
 

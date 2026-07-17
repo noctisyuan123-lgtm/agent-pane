@@ -93,14 +93,20 @@ export function ToolTimeline({
   defaultOpen = false,
   /** Live: keep summary + at most last N tool rows visible */
   liveMaxRows,
+  /**
+   * Nested under L1 ProcessPackFold — skip the outer "Explored…" summary
+   * (parent already owns that title) and show rows directly.
+   */
+  embedded = false,
 }: {
   tools: ToolRow[];
   defaultOpen?: boolean;
   liveMaxRows?: number;
+  embedded?: boolean;
 }) {
   // Summary always visible; step list folds (Cursor "Explored N files…")
   const [groupOpen, setGroupOpen] = useState(
-    defaultOpen || liveMaxRows != null
+    defaultOpen || liveMaxRows != null || embedded
   );
   if (!tools.length) return null;
 
@@ -114,6 +120,19 @@ export function ToolTimeline({
     liveMaxRows != null && groupOpen
       ? tools.slice(-liveMaxRows)
       : tools;
+
+  // L2 inside process pack: rows only (L1 already has Explored/Edited title)
+  if (embedded) {
+    return (
+      <div className="tl tl-embedded">
+        <div className="tl-list">
+          {listTools.map((t) => (
+            <ToolRowView key={t.toolId} tool={t} />
+          ))}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={`tl${liveMaxRows != null ? " tl-live" : ""}`}>

@@ -414,6 +414,42 @@ export function aggregateToolDiffStats(tools: ToolRow[]): {
 
 /** Collapse tool list into Cursor-style summary for the group header. */
 export function summarizeToolGroup(tools: ToolRow[]): string {
+  if (!tools.length) return "Process";
+
+  // Single tool with a path → "Explored history-index.ts" / "Edited foo.ts"
+  if (tools.length === 1) {
+    const t = tools[0]!;
+    const base = t.path ? basename(t.path) : "";
+    const isEdit =
+      t.kind === "edit" ||
+      t.name.includes("write") ||
+      t.name.includes("edit") ||
+      t.label.startsWith("Edited");
+    const isRead =
+      t.kind === "read" ||
+      t.name.includes("read") ||
+      t.label.startsWith("Read") ||
+      t.label.startsWith("Reading");
+    const isSearch =
+      t.kind === "search" ||
+      t.name.includes("grep") ||
+      t.name.includes("search") ||
+      t.label.startsWith("Search");
+    const isRun =
+      t.kind === "execute" ||
+      t.name.includes("run") ||
+      t.name.includes("shell") ||
+      t.label.startsWith("Ran ");
+
+    if (base) {
+      if (isEdit) return `Edited ${base}`;
+      if (isRead) return `Explored ${base}`;
+      if (isSearch) return `Searched ${base}`;
+    }
+    if (isRun && t.label) return t.label;
+    if (t.label) return t.label;
+  }
+
   const reads = tools.filter(
     (t) => t.kind === "read" || t.name.includes("read")
   ).length;

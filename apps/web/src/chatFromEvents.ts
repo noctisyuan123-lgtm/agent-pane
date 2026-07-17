@@ -308,15 +308,13 @@ export function eventsToChatItems(events: DomainEvent[]): ChatItem[] {
         flushThought();
         // New thought id after tools — reuse would stack duplicate React keys
         thoughtId = `t-${event.sessionId}-t${turn}-${tag}`;
+        // Intermediate speech stays a full assistant bubble (never demote to status)
         if (assistantBuf.trim()) {
           const text = assistantBuf.trim();
-          const liveId = assistantId;
-          if (text.length > 280 || text.includes("\n\n")) {
-            messages.push({ kind: "assistant", text, id: `${liveId}-pre` });
-          } else {
-            messages.push({ kind: "status", text, id: `${liveId}-status` });
-          }
+          const liveId = assistantId || `a-${event.sessionId}-t${turn}-${tag}`;
+          messages.push({ kind: "assistant", text, id: `${liveId}-mid` });
           assistantBuf = "";
+          assistantId = `a-${event.sessionId}-after-t${turn}-${tag}`;
         }
         postToolsId = null;
         if (!toolsId) toolsId = `tools-${event.sessionId}-t${turn}-${tag}`;

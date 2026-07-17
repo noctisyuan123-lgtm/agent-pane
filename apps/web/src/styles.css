@@ -1763,6 +1763,155 @@ html.is-tauri {
   max-width: var(--content-max);
 }
 
+/* Running shell / subagent — above composer, left-aligned (not chat todos) */
+.running-dock {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  align-self: flex-start;
+  max-width: min(100%, 420px);
+  min-width: 0;
+  padding: 2px 2px 0;
+  margin: 0 0 2px;
+  user-select: none;
+  background: transparent;
+  border: none;
+}
+
+.running-dock-dots {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+
+.running-dock-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.running-dock-outline-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.running-dock-outline-btn {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.running-dock-outline-btn:hover .running-dock-outline {
+  color: rgba(255, 255, 255, 0.96);
+}
+
+.running-dock-expand-chev {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.4);
+  transform: rotate(-90deg);
+  transition: transform 0.12s ease;
+  line-height: 1;
+}
+
+.running-dock-expand-chev.open {
+  transform: rotate(0deg);
+}
+
+.running-dock-outline {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.86);
+  letter-spacing: 0.01em;
+}
+
+.running-dock-outline.agent-activity-slide-wrap {
+  flex: 1;
+  min-width: 0;
+}
+
+.running-dock-secondary {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.36);
+  letter-spacing: 0.01em;
+}
+
+.running-dock-detail-row {
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.running-dock-detail {
+  font-size: 11.5px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.4);
+  letter-spacing: 0.01em;
+}
+
+.running-dock-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+}
+
+.running-dock-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 8px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.running-dock-kind {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+  color: rgba(255, 255, 255, 0.32);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  padding: 0 5px;
+  line-height: 1.5;
+}
+
+.running-dock-label {
+  color: rgba(255, 255, 255, 0.72);
+  min-width: 0;
+  word-break: break-word;
+}
+
+.running-dock-item-detail {
+  flex: 1 1 100%;
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, 0.34);
+  word-break: break-word;
+}
+
 .composer-shell.hero {
   width: 100%;
   border-radius: 16px;
@@ -2690,11 +2839,89 @@ html.is-tauri {
   line-height: 1.35;
 }
 
+.agent-activity-outline-btn {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-activity-outline-btn:hover .agent-activity-outline {
+  color: rgba(255, 255, 255, 0.96);
+}
+
+.agent-activity-expand-chev {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.4);
+  transform: rotate(-90deg);
+  transition: transform 0.12s ease;
+  line-height: 1;
+}
+
+.agent-activity-expand-chev.open {
+  transform: rotate(0deg);
+}
+
 .agent-activity-outline {
   font-size: 13px;
   font-weight: 600;
   color: rgba(255, 255, 255, 0.88);
   letter-spacing: 0.01em;
+}
+
+.agent-activity-running-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-activity-running-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 8px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.agent-activity-running-kind {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 500;
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+  color: rgba(255, 255, 255, 0.32);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  padding: 0 5px;
+  line-height: 1.5;
+}
+
+.agent-activity-running-label {
+  color: rgba(255, 255, 255, 0.72);
+  min-width: 0;
+  word-break: break-word;
+}
+
+.agent-activity-running-detail {
+  flex: 1 1 100%;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.34);
+  word-break: break-word;
 }
 
 .agent-activity-secondary {
@@ -3643,6 +3870,97 @@ html.is-tauri {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.settled-turn-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settled-process-seg {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.worked-for-duration {
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text-dim);
+  padding: 2px 0 4px;
+  user-select: none;
+}
+
+/* L1 process pack between assistant bubbles (Thought / Explored / Edited) */
+.process-pack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+}
+
+.process-pack-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 400;
+  padding: 1px 0;
+  cursor: pointer;
+  text-align: left;
+  width: fit-content;
+  line-height: 1.35;
+}
+
+.process-pack-summary:hover {
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.process-pack-summary .tl-meta-label {
+  color: inherit;
+}
+
+.process-pack-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 0 4px 2px;
+  margin-left: 1px;
+  border-left: 1px solid rgba(255, 255, 255, 0.05);
+  padding-left: 10px;
+}
+
+.process-pack-item {
+  min-width: 0;
+}
+
+.process-pack-thought {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  line-height: 1.45;
+  margin: 0;
+  padding: 2px 0;
+}
+
+/* Mid assistant replies inside expanded Worked-for */
+.worked-for-mid-reply {
+  margin: 4px 0;
+}
+
+.worked-for-mid-reply > .msg.assistant {
+  /* slightly quieter than the final outside reply */
+  opacity: 0.92;
+}
+
+/* Nested ToolTimeline summary inside a pack should not re-shout */
+.process-pack-body .tl-summary {
+  font-size: 12px;
+  opacity: 0.9;
 }
 
 /* Live process window — at most 2 cards, slide up on change */
