@@ -133,7 +133,7 @@ Only acceptable if resume uses **load/attach same UUID**, not digest-new-session
 
 ## 11. Approval
 
-- [ ] Product name `grodex` confirmed  
-- [ ] Structure (Core / CLI / Desktop / API) confirmed  
-- [ ] agent-pane = materials only confirmed  
-- [ ] Ready for G0 (create fork + README) via subagents after this spec is accepted  
+- [x] Product name `grodex` confirmed  
+- [x] Structure (Core / CLI / Desktop / API) confirmed  
+- [x] agent-pane = materials only confirmed  
+- [x] G0 done — fork + README: https://github.com/noctisyuan123-lgtm/grodex (local: `~/projects/grodex`)  
