@@ -4566,7 +4566,7 @@ html.is-tauri {
   max-width: none;
   border-collapse: collapse;
   font-size: 13px;
-  line-height: 1.55;
+  line-height: 1.5;
   table-layout: auto;
   border: none;
   background: transparent;
@@ -4574,7 +4574,8 @@ html.is-tauri {
 
 .assistant-text th,
 .assistant-text td {
-  padding: 14px 18px;
+  /* Between original 10×14 and loose 14×18 */
+  padding: 11px 15px;
   text-align: left;
   border: none;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
