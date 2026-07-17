@@ -3656,11 +3656,14 @@ html.is-tauri {
   background: var(--bg-active);
   border: 1px solid var(--glass-border);
   border-radius: 12px;
-  padding: 9px 13px;
+  padding: 11px 14px;
   white-space: pre-wrap;
   max-width: 100%;
   overflow-wrap: anywhere;
   word-break: break-word;
+  /* Roomier line gaps — matches assistant prose */
+  line-height: 1.68;
+  letter-spacing: 0.01em;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
     "Hiragino Sans GB", system-ui, sans-serif;
   font-weight: 400;
@@ -3719,7 +3722,8 @@ html.is-tauri {
 }
 
 .msg.assistant .bubble {
-  line-height: 1.55;
+  line-height: 1.68;
+  letter-spacing: 0.01em;
   white-space: pre-wrap;
   max-width: 100%;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
@@ -3729,7 +3733,7 @@ html.is-tauri {
 }
 
 .msg.assistant .bubble p {
-  margin: 0.4em 0;
+  margin: 0.55em 0;
 }
 
 .thought {
@@ -4358,12 +4362,12 @@ html.is-tauri {
   font-size: 11.5px;
   color: rgba(255, 255, 255, 0.32);
   font-style: italic;
-}
   opacity: 0.9;
 }
 
 .assistant-text {
-  line-height: 1.52;
+  line-height: 1.7;
+  letter-spacing: 0.01em;
   color: var(--text);
   max-width: 100%;
   min-width: 0;
@@ -4377,7 +4381,7 @@ html.is-tauri {
 }
 
 .assistant-text p {
-  margin: 0.32em 0;
+  margin: 0.55em 0;
 }
 
 .assistant-text p:first-child {
@@ -4392,9 +4396,9 @@ html.is-tauri {
 .assistant-text h2,
 .assistant-text h3,
 .assistant-text h4 {
-  margin: 0.9em 0 0.4em;
+  margin: 1em 0 0.5em;
   font-weight: 600;
-  line-height: 1.3;
+  line-height: 1.35;
   color: var(--text);
 }
 
@@ -4410,12 +4414,12 @@ html.is-tauri {
 
 .assistant-text ul,
 .assistant-text ol {
-  margin: 0.4em 0;
-  padding-left: 1.35em;
+  margin: 0.55em 0;
+  padding-left: 1.4em;
 }
 
 .assistant-text li {
-  margin: 0.2em 0;
+  margin: 0.35em 0;
 }
 
 .assistant-text code {
@@ -4561,7 +4565,7 @@ html.is-tauri {
   max-width: none;
   border-collapse: collapse;
   font-size: 13px;
-  line-height: 1.45;
+  line-height: 1.55;
   table-layout: auto;
   border: none;
   background: transparent;
@@ -4569,7 +4573,7 @@ html.is-tauri {
 
 .assistant-text th,
 .assistant-text td {
-  padding: 10px 14px;
+  padding: 14px 18px;
   text-align: left;
   border: none;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
@@ -4638,24 +4642,29 @@ html.is-tauri {
 /*
  * Blockquotes — ChatGPT: only a soft left hairline, no fill / radius box.
  * Nested quotes keep their own left bar + indent (image #2).
+ * Looser line + letter spacing — felt cramped vs body.
  */
 .assistant-text blockquote {
-  margin: 0.45em 0;
-  padding: 0 0 0 0.85em;
+  margin: 0.65em 0;
+  padding: 0.15em 0 0.15em 1em;
   border: none;
   border-left: 2px solid rgba(255, 255, 255, 0.22);
   color: var(--text);
   background: transparent;
   border-radius: 0;
+  line-height: 1.75;
+  letter-spacing: 0.02em;
 }
 
 .assistant-text blockquote blockquote {
-  margin: 0.35em 0;
+  margin: 0.5em 0;
   /* Nested levels: same thin marker, extra indent from padding */
 }
 
 .assistant-text blockquote p {
-  margin: 0.2em 0;
+  margin: 0.4em 0;
+  line-height: inherit;
+  letter-spacing: inherit;
 }
 
 .assistant-text blockquote > :first-child {
