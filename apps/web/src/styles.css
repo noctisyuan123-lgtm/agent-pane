@@ -74,7 +74,7 @@
   --sidebar-w: 248px;
   --right-rail-w: 248px;
   /* Chat / composer column — stays capped when left sidebar collapses */
-  --content-max: 720px;
+  --content-max: 880px;
   /* New Agent (home) composer — narrower than in-session follow-up */
   --home-composer-max: 580px;
   --right-rail-w: 248px;
